@@ -35,8 +35,10 @@ target/
 
 # ---- 前端 ----
 node_modules/
-desktop/app/dist/
+desktop/crates/gui/frontend/dist/
 *.tsbuildinfo
+# Tauri 每次 build 都会重生成的 ACL schema（capabilities/*.json 的 $schema 指向这里）
+desktop/crates/gui/gen/
 .pnpm-store/
 npm-debug.log*
 yarn-error.log*
@@ -68,3 +70,6 @@ venv/
 desktop/third_party/
 # 录音样本与测试 WAV 只留在本机；需要长期留存的样本另建 assets 目录并单独说明
 *.wav
+
+# ---- 本机临时 cargo 镜像配置（不提交）----
+desktop/.cargo/
