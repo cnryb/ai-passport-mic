@@ -206,6 +206,40 @@ void apm_adpcm_decode_block(const uint8_t *block, int16_t *pcm, size_t samples)
 }
 
 // ---------------------------------------------------------------------------
+// 采集端病态检测
+// ---------------------------------------------------------------------------
+bool apm_pcm_is_corrupt(const int16_t *pcm, size_t samples)
+{
+    if (!pcm) return false;
+
+    int run = 0;
+    int prev_sign = 0;
+    for (size_t i = 0; i < samples; i++) {
+        int16_t x = pcm[i];
+        int sign = 0;
+        bool sat = false;
+        if (x >= APM_PCM_SATURATION) {
+            sat = true;
+            sign = 1;
+        } else if (x <= -APM_PCM_SATURATION) {
+            sat = true;
+            sign = -1;
+        }
+
+        if (sat) {
+            run = (prev_sign != 0 && sign != prev_sign) ? run + 1 : 1;
+            prev_sign = sign;
+        } else {
+            run = 0;
+            prev_sign = 0;
+        }
+
+        if (run >= APM_PCM_CORRUPT_RUN) return true;
+    }
+    return false;
+}
+
+// ---------------------------------------------------------------------------
 // 载荷组装
 // ---------------------------------------------------------------------------
 size_t apm_build_status(uint8_t *payload, size_t cap, apm_state_t state, uint8_t flags,

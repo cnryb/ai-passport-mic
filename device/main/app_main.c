@@ -45,6 +45,7 @@ static volatile bool s_ptt_held;
 static volatile bool s_forced_capture;
 static volatile uint32_t s_blocks_sent;
 static volatile uint16_t s_blocks_dropped;
+static volatile uint32_t s_blocks_muted;
 static volatile bool s_audio_error;
 
 static bool capture_on(void) { return s_forced_capture || s_ptt_held; }
@@ -122,6 +123,23 @@ static void audio_task(void *arg)
             // PTT 重新按下：中间样本没编码，跨块预测状态已经断开，必须复位。
             apm_adpcm_reset(&adpcm);
             was_capturing = true;
+        }
+
+        // 采集端病态数据：满量程且逐样本变号，这不是声音，是 I2S/ES8311 的瞬态
+        // 读出（复现见 desktop/crates/protocol/tests/glitch_repro.rs）。
+        // 直接编码出去就是对面听到的 0.8 s 爆音，所以在这里截住，压成静音。
+        if (apm_pcm_is_corrupt(pcm, APM_AUDIO_BLOCK_SAMPLES)) {
+            memset(pcm, 0, sizeof(int16_t) * APM_AUDIO_BLOCK_SAMPLES);
+            // 病态状态不能带进后续块，否则解码端会跟着抖一段。
+            apm_adpcm_reset(&adpcm);
+            s_blocks_muted++;
+            uint32_t now_ms = (uint32_t)(xTaskGetTickCount() * portTICK_PERIOD_MS);
+            static uint32_t last_log_ms;
+            if (now_ms - last_log_ms >= 1000) {
+                last_log_ms = now_ms;
+                ESP_LOGW(TAG, "采集端病态块已压静音（累计 %lu 块）",
+                         (unsigned long)s_blocks_muted);
+            }
         }
 
         if (apm_adpcm_encode_block(&adpcm, pcm, APM_AUDIO_BLOCK_SAMPLES, block) !=

@@ -4,6 +4,7 @@ use anyhow::{anyhow, bail, Context, Result};
 use apm_link::{Notification, AUDIO_BLOCK_LEN};
 use apm_protocol::adpcm;
 use apm_protocol::frame;
+use apm_protocol::glitch;
 use apm_protocol::metrics;
 use apm_protocol::wav;
 use apm_protocol::{AUDIO_BLOCK_SAMPLES, AUDIO_SAMPLE_RATE};
@@ -32,7 +33,12 @@ pub fn analyze(path: &Path, as_json: bool) -> Result<()> {
 
     let m = metrics::analyze(&samples, file.sample_rate);
     let checks = metrics::evaluate(&m);
-    let pass = metrics::software_pass(&checks);
+    let mut pass = metrics::software_pass(&checks);
+    // 满量程毛刺是链路/采集问题，不是文件格式问题：出现了就不能算通过。
+    let g = glitch::scan(&samples);
+    if g.events > 0 {
+        pass = false;
+    }
 
     if as_json {
         let report = json!({
@@ -54,6 +60,9 @@ pub fn analyze(path: &Path, as_json: bool) -> Result<()> {
                 "clipping_pct": round3(m.clipping_pct),
                 "dc_offset_pct": round3(m.dc_offset_pct),
                 "zero_crossing_pct": round2(m.zero_crossing_pct),
+                // 满量程毛刺（采集端瞬态），口径见 docs/SOUND_QUALITY.md。
+                "glitch_events": g.events,
+                "glitch_ms": round2(g.duration_ms(file.sample_rate)),
                 // 下面三项只能从链路日志得到，WAV 里没有。
                 "lost_chunks": Value::Null,
                 "startup_latency_p95_ms": Value::Null,
@@ -92,6 +101,15 @@ pub fn analyze(path: &Path, as_json: bool) -> Result<()> {
             mark,
             check.expected
         );
+    }
+    if g.events > 0 {
+        println!(
+            "毛刺: {} 段满量程变号噪声，合计 {:.0} ms（采集端瞬态，非编解码问题）",
+            g.events,
+            g.duration_ms(file.sample_rate)
+        );
+    } else {
+        println!("毛刺: 未检测到满量程变号噪声");
     }
     println!();
     println!(
@@ -370,6 +388,8 @@ pub async fn record(path: &Path, seconds: u64, device: Option<&str>) -> Result<(
     let mut last_seq: Option<u16> = None;
     // 设备侧在发送阶段丢的块 PC 端看不见（序号根本没发出来），只能靠 STATUS 上报
     let mut dev_dropped: u16 = 0;
+    // 采集端偶发满量程变号噪声：先抹掉再落盘，否则 analyze 会被这段噪声带跑。
+    let mut sup = glitch::Suppressor::new();
 
     while tokio::time::Instant::now() < deadline {
         match link.next_notification(Duration::from_millis(500)).await {
@@ -400,6 +420,7 @@ pub async fn record(path: &Path, seconds: u64, device: Option<&str>) -> Result<(
                 }
                 let mut pcm = vec![0i16; AUDIO_BLOCK_SAMPLES];
                 adpcm::decode_into(&block, &mut pcm);
+                sup.process(&mut pcm);
                 samples.extend_from_slice(&pcm);
                 blocks += 1;
             }
@@ -435,6 +456,14 @@ pub async fn record(path: &Path, seconds: u64, device: Option<&str>) -> Result<(
         println!(
             "设备侧丢弃: {} 块（发送阶段丢的，序号没发出来，PC 端统计不到）",
             dev_dropped
+        );
+    }
+    if sup.events > 0 {
+        println!(
+            "采集端毛刺: {} 段，已静音 {} 帧（≈{:.0} ms）",
+            sup.events,
+            sup.muted_samples,
+            sup.muted_samples as f64 * 1000.0 / AUDIO_SAMPLE_RATE as f64
         );
     }
     println!(
@@ -510,6 +539,7 @@ pub async fn sink(
     let mut next_report = tokio::time::Instant::now() + Duration::from_secs(1);
     let mut elapsed_s = 0u64;
     let mut dev_dropped: u16 = 0;
+    let mut sup = glitch::Suppressor::new();
 
     while tokio::time::Instant::now() < deadline {
         match link.next_notification(Duration::from_millis(500)).await {
@@ -536,6 +566,7 @@ pub async fn sink(
                 }
                 let mut pcm = vec![0i16; AUDIO_BLOCK_SAMPLES];
                 adpcm::decode_into(&block, &mut pcm);
+                sup.process(&mut pcm);
                 out.push(&pcm);
                 blocks += 1;
             }
@@ -555,14 +586,17 @@ pub async fn sink(
             elapsed_s += 1;
             let st = out.stats();
             println!(
-                "  [{:>3}s] 块={} 缓冲={:.0} ms 已播={:.1} s 欠载={} 静音帧={} 丢弃={}",
+                "  [{:>3}s] 块={} 缓冲={:.0} ms 已播={:.1} s 欠载={} 静音帧={} 丢弃={} 漂移={:+.0} ppm 补/丢={}/{}",
                 elapsed_s,
                 blocks,
                 out.fill_ms(),
                 st.frames_consumed as f64 / AUDIO_SAMPLE_RATE as f64,
                 st.underruns,
                 st.frames_silenced,
-                st.frames_dropped
+                st.frames_dropped,
+                out.ppm(),
+                st.frames_inserted,
+                st.frames_skipped
             );
         }
     }
@@ -587,6 +621,20 @@ pub async fn sink(
         st.frames_silenced as f64 * 1000.0 / AUDIO_SAMPLE_RATE as f64,
         st.frames_dropped
     );
+    println!(
+        "漂移: 补偿 {:.0} ppm（补样本 {} / 丢样本 {}）；这四个数加起来应当约等于设备与声卡的时钟差",
+        out.ppm(),
+        st.frames_inserted,
+        st.frames_skipped
+    );
+    if sup.events > 0 {
+        println!(
+            "采集端毛刺: {} 段，已静音 {} 帧（≈{:.0} ms）—— 已压掉，会议里不会听到",
+            sup.events,
+            sup.muted_samples,
+            sup.muted_samples as f64 * 1000.0 / AUDIO_SAMPLE_RATE as f64
+        );
+    }
     println!(
         "缓冲: 目标 {} → {} ms（欠载抬高 {} 次 / 稳定收回 {} 次），回调抢锁失败 {} 次",
         target_start,

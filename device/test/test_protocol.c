@@ -213,6 +213,44 @@ static void test_adpcm_lost_block(void)
           "丢块后第 3 块解码结果与顺序解码逐采样一致（块头自同步）");
 }
 
+static void test_pcm_corrupt(void)
+{
+    printf("[pcm-corrupt]\n");
+    static int16_t pcm[APM_AUDIO_BLOCK_SAMPLES];
+
+    // 1) 正常语音：不能误判
+    fill_sine(pcm, APM_AUDIO_BLOCK_SAMPLES, 300.0, 0.5, 0);
+    CHECK(!apm_pcm_is_corrupt(pcm, APM_AUDIO_BLOCK_SAMPLES), "正常正弦不算病态");
+
+    // 2) 麦克风削波：平顶、同号连续 —— 是真实声音，不能误判
+    for (int i = 0; i < APM_AUDIO_BLOCK_SAMPLES; i++) {
+        pcm[i] = (i / 40) % 2 ? -32768 : 32767;
+    }
+    CHECK(!apm_pcm_is_corrupt(pcm, APM_AUDIO_BLOCK_SAMPLES), "平顶削波不算病态");
+
+    // 3) 真机观察到的形态：满量程且逐样本变号
+    for (int i = 0; i < APM_AUDIO_BLOCK_SAMPLES; i++) {
+        pcm[i] = (i % 2) ? -32768 : 32767;
+    }
+    CHECK(apm_pcm_is_corrupt(pcm, APM_AUDIO_BLOCK_SAMPLES), "满量程逐样本变号判为病态");
+
+    // 4) 阈值边界：刚好 APM_PCM_CORRUPT_RUN 个才触发
+    memset(pcm, 0, sizeof pcm);
+    for (int i = 0; i < APM_PCM_CORRUPT_RUN - 1; i++) {
+        pcm[i] = (i % 2) ? -32768 : 32767;
+    }
+    CHECK(!apm_pcm_is_corrupt(pcm, APM_AUDIO_BLOCK_SAMPLES), "%d 个样本还不够触发",
+          APM_PCM_CORRUPT_RUN - 1);
+    pcm[APM_PCM_CORRUPT_RUN - 1] =
+        ((APM_PCM_CORRUPT_RUN - 1) % 2) ? -32768 : 32767;
+    CHECK(apm_pcm_is_corrupt(pcm, APM_AUDIO_BLOCK_SAMPLES), "%d 个样本触发",
+          APM_PCM_CORRUPT_RUN);
+
+    // 5) 静音不能误判
+    memset(pcm, 0, sizeof pcm);
+    CHECK(!apm_pcm_is_corrupt(pcm, APM_AUDIO_BLOCK_SAMPLES), "静音不算病态");
+}
+
 int main(void)
 {
     printf("protocol host tests\n");
@@ -221,6 +259,7 @@ int main(void)
     test_frame_errors();
     test_adpcm();
     test_adpcm_lost_block();
+    test_pcm_corrupt();
     printf("\n%d passed, %d failed\n", g_pass, g_fail);
     return g_fail == 0 ? 0 : 1;
 }

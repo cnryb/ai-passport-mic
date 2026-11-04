@@ -118,6 +118,17 @@ size_t apm_adpcm_encode_block(apm_adpcm_state_t *st, const int16_t *pcm, size_t 
 // 从块解出 samples 个采样；块头的 predictor/index 覆盖解码状态。
 void apm_adpcm_decode_block(const uint8_t *block, int16_t *pcm, size_t samples);
 
+// ---- 采集端病态检测 ----
+// 真机上偶发 ±32767 逐样本变号的噪声，来自 I2S/ES8311 的瞬态读出，不是编解码算错
+// （复现见 desktop/crates/protocol/tests/glitch_repro.rs）。
+// 判据：连续 APM_PCM_CORRUPT_RUN 个样本 |x| >= APM_PCM_SATURATION 且逐样本变号。
+// 人声与麦克风削波都是平顶、同号连续，不会命中。
+#define APM_PCM_SATURATION 32000
+#define APM_PCM_CORRUPT_RUN 8
+
+// 返回 true 表示这段 PCM 是采集端病态数据，调用方必须丢弃而不是编码上链路。
+bool apm_pcm_is_corrupt(const int16_t *pcm, size_t samples);
+
 // ---- 状态帧组装（固件侧用，主机单测也覆盖）----
 size_t apm_build_status(uint8_t *payload, size_t cap, apm_state_t state, uint8_t flags,
                         uint16_t block_drops, uint32_t blocks_sent);

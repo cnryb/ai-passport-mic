@@ -9,6 +9,7 @@
 pub mod adpcm;
 pub mod crc;
 pub mod frame;
+pub mod glitch;
 pub mod keymap;
 pub mod metrics;
 pub mod wav;
