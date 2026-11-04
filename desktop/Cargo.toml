@@ -6,7 +6,11 @@ members = [
   "crates/sink",
   "crates/cli",
   "crates/app",
+  "crates/gui",
 ]
+# GUI 依赖 tauri（400+ crate，冷编译 5–8 分钟）。默认成员不含它：
+# `cargo test` / `./scripts/verify.sh` 仍只跑轻量 crate，构建 GUI 显式用
+# `cargo build -p apm-gui` 或 `./scripts/build-gui.sh`。
 default-members = [
   "crates/protocol",
   "crates/link",

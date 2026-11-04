@@ -1,0 +1,23 @@
+[package]
+name = "apm-gui"
+description = "AI Passport Mic 的桌面界面（Tauri 2 + Vue 3）"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+# 注意：本 crate **不在** workspace 的 default-members 里。tauri 会拉 400+ 依赖，
+# 放进默认成员会让 `cargo test` 与 verify.sh 每次都冷编译一遍。
+[build-dependencies]
+tauri-build = { version = "2", features = [] }
+
+[dependencies]
+apm-app = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+# 不需要 tray / dialog 等插件：G0 只用窗口 + 自定义命令 + 事件。
+tauri = { version = "2", features = [] }
+tokio = { version = "1", features = ["time", "sync"] }
+
+[[bin]]
+name = "apm-gui"
+path = "src/main.rs"

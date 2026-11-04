@@ -1,0 +1,18 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<!--
+  用途声明。这两个键是 macOS TCC 的硬门槛，缺了不是"没权限"而是直接 abort：
+  裸 CLI 调用 CoreBluetooth 时会报 "This app has crashed because it attempted to
+  access privacy-sensitive data without a usage description"。
+
+  NSMicrophoneUsageDescription 只用于回环验证（读回虚拟声卡的电平），
+  不参与正常的音频输出路径——写声卡不需要麦克风权限。
+-->
+<plist version="1.0">
+<dict>
+  <key>NSBluetoothAlwaysUsageDescription</key>
+  <string>需要蓝牙连接 AI Passport 设备，接收音频与按键事件。不连接任何其他蓝牙设备。</string>
+  <key>NSMicrophoneUsageDescription</key>
+  <string>仅在你主动运行“回环验证”时读取输入电平，用来确认音频确实写进了虚拟声卡。</string>
+</dict>
+</plist>

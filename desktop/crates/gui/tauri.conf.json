@@ -1,0 +1,41 @@
+{
+  "$schema": "https://schema.tauri.app/config/2",
+  "productName": "AI Passport Mic",
+  "version": "0.1.0",
+  "identifier": "com.cnryb.ai-passport-mic",
+  "build": {
+    "devUrl": "http://localhost:1420",
+    "frontendDist": "frontend/dist"
+  },
+  "app": {
+    "windows": [
+      {
+        "label": "main",
+        "title": "AI Passport Mic",
+        "width": 900,
+        "height": 620,
+        "minWidth": 780,
+        "minHeight": 520,
+        "resizable": true,
+        "theme": "Dark",
+        "center": true
+      }
+    ],
+    "security": {
+      "csp": null
+    }
+  },
+  "bundle": {
+    "active": true,
+    "targets": ["app"],
+    "icon": ["icons/icon.icns"],
+    "category": "Utility",
+    "shortDescription": "把 AI Passport 当成一台可靠的无线麦克风",
+    "copyright": "MIT License",
+    "macOS": {
+      "minimumSystemVersion": "11.0",
+      "infoPlist": "Info.plist",
+      "signingIdentity": "-"
+    }
+  }
+}
