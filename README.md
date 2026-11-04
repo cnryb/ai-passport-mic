@@ -13,7 +13,8 @@
 > 真机已验证：烧录、ES8311 16 kHz 采集、MTU 247、scan / status / record / sink，
 > 以及**会议软件里当麦克风用**（虚拟声卡输出已实现并实测）。
 > 仍未验证：按键手势逐项核对、端到端延迟（缺 PING/PONG）、长时间（>10 分钟）稳定性、
-> GUI 首次蓝牙授权。已知未解：20 s 约 84 ms 时钟漂移、偶发满量程毛刺。
+> GUI 首次蓝牙授权。已拦但待真机复测：时钟漂移（单样本插删补偿）、满量程毛刺（固件压静音
+> + PC 端静音替换）。
 > 注意 macOS 上 BLE 必须走 .app bundle 拿权限，见 [`desktop/README.md`](desktop/README.md)。
 >
 > 上游的 FoloToy AI Passport 固件、以及既有的 VibeMic 桌面实现只作为**设计参考**，

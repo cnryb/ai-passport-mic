@@ -17,7 +17,7 @@ macOS 上蓝牙**必须走 .app bundle 才能拿到权限**，见文末「macOS 
 | 语言 / 工具链 | Rust，`rust-toolchain.toml` 钉 1.95.0 | 已用 |
 | 结构 | Cargo workspace（protocol / link / sink / app / cli / gui） | 已用 |
 | BLE | `btleplug` 0.11 | 已用（真机 scan / status / record / sink 均通过） |
-| 音频输出 | `cpal` 0.15 → 系统虚拟声卡（macOS BlackHole / Windows VB-CABLE） | 已实现 `crates/sink`，40–80 ms 抖动缓冲 |
+| 音频输出 | `cpal` 0.15 → 系统虚拟声卡（macOS BlackHole / Windows VB-CABLE） | 已实现 `crates/sink`：40–80 ms 抖动缓冲 + 单样本漂移补偿 |
 | GUI | Tauri 2 + Vue 3 + Vite + TS | 已落地 G0（骨架 + 权限 + 设备发现） |
 
 ## 目录
@@ -129,7 +129,9 @@ apmctl analyze test.wav --json      # 输出 ai-passport-mic-quality-report-1
    落地——`Sink::open` 打不开就失败并列出可用设备，GUI 侧的提示语留到 G3。）
 3. 序号跳变计数并上报。
 4. 按键注入失败或异常退出时，释放所有按下的修饰键（M3）。
-5. 不实现烧录、ASR、文字注入。
+5. 长期时钟漂移用单样本插删补偿，**不允许**靠周期性欠载或整帧丢弃兜底。
+6. 满量程毛刺必须被静音替换后才推进声卡，不允许把 ±32767 交替噪声直接放出去。
+7. 不实现烧录、ASR、文字注入。
 
 ## 已知限制
 
@@ -140,16 +142,21 @@ apmctl analyze test.wav --json      # 输出 ai-passport-mic-quality-report-1
 - **`--verify` 在本机不可用**：探针要读输入，而本机给 WorkBuddy 启动的任何进程都不给
   麦克风权限（同一台机器上用 ffmpeg 录默认麦克风也是全静音）。当前靠人工看系统声音面板
   的电平条验收；等 GUI 用正规 bundle 申请权限后，`--verify` 才能回到自动验收。
-- **时钟漂移没有被补偿**：设备 16 kHz 与主机 16 kHz 不同源，20 秒里累计约 84 ms 静音帧。
-  自适应缓冲能保住不抖到断流，但根治要加漂移补偿（微调输出速率或按需插删采样）。
+- **时钟漂移已补偿，但只在仿真里验过**：`crates/sink/src/playout.rs` 用单样本插删吸收长期
+  漂移（比例控制，上限 1%）。仿真里 15933 Hz 生产 / 16000 Hz 消费跑 60 s 零欠载、零超容量
+  丢弃；真机上"20 s 差 84 ms"这个数还没用新代码复测。
 - **GUI 只到 G0**：界面能做设备扫描与连接，没有电平表、没有推流按钮、没有按键映射编辑。
 - **编排还没全部进 `apm-app`**：`detect_adapter` / `scan` / `connect` 已在 `apm-app`，
   但 `record` / `sink` 的编排仍在 `crates/cli/src/cmd.rs`，`apm-app` 也还没依赖 `apm-sink`。
   这是 G2 的前置——不迁，GUI 和 CLI 会各长一套编排（见 `../docs/GUI.md` 决定 D1）。
 - **裸二进制不能用蓝牙**：macOS TCC 要求 bundle + 用途声明，直接 `./target/release/apmctl record`
   会被系统 abort，见上文「macOS 上的蓝牙权限」。
-- **一处偶发满量程毛刺**：6 次真机录音里有 2 次在 7.7–8.5 s 出现 ±32767 交替噪声（约 0.8 s），
-  同一次里 `序号跳变丢失=0`，说明不是丢块，疑似 ADPCM 状态失配或 codec 侧瞬态。**未定位。**
+- **满量程毛刺：已定位到采集端并做了双重拦截，未真机复测**。6 次真机录音里 2 次在
+  7.7–8.5 s 出现约 0.8 s 的 ±32767 交替噪声，同一次 `序号跳变丢失=0`（不是丢块）。
+  用编码→解码复现证明编解码自身最多污染一两块就恢复（`tests/glitch_repro.rs`），所以垃圾
+  来自 I2S / ES8311 的瞬态读出。现在固件编码前压成静音（`apm_pcm_is_corrupt`），PC 端
+  解码后再兜一层（`apm_protocol::glitch`）。**"为什么 codec 会读出这种数据"仍未定**，
+  只是不再让它进会议软件。固件被压掉的块数只在串口日志里，没有进 STATUS 载荷。
 
 ## 验证状态
 
@@ -165,6 +172,9 @@ apmctl analyze test.wav --json      # 输出 ai-passport-mic-quality-report-1
 | `sink`（默认目标 80 ms） | 真机 20 s：999 块 / 0 丢块 / 设备侧 0 丢弃 / **0 欠载、0 静音帧**，缓冲稳在 68–76 ms |
 | `sink`（60 s 长稳） | 2998 块 / 0 丢块；修复前的收尾欠载（停止时仍在消费）已改为「先停写再断链」 |
 | 会议软件端到端 | **通过**（用户实测：会议软件选 `BlackHole 2ch`，说话时麦克风电平跟随） |
+| 毛刺抑制（单测 + 合成 WAV） | 通过：`crates/protocol` 5 项单测 + `analyze` 正确识别 1 段 / 799.6 ms 并判 fail |
+| 漂移补偿（仿真 60 s） | 通过：±5000 ppm 两个方向均 0 欠载 / 0 超容量丢弃，ppm 估计误差 < 400 |
+| 上述两项的**真机复测** | **未做**（需要重新烧录固件 + 跑 60 s `sink`） |
 | `sink --tone` | 声卡流正常消费（480000 帧写入）；**用户在「系统设置 → 声音 → 输入」看到电平条随信号跳动**，证明进程→声卡这一段通了 |
 | `probe` | 内置麦克风与 BlackHole 输入端都读到 -120 dBFS（1 LSB 抖动）→ 麦克风权限被拒，探针不可用 |
 | GUI 构建（`scripts/build-gui.sh`） | **通过**：`.app` 28.3 MiB，ad-hoc 签名有效，Info.plist 内含 `NSBluetooth*` / `NSMicrophone*`，bundle id `com.cnryb.ai-passport-mic` |
