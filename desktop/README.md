@@ -3,7 +3,7 @@
 把设备送上来的 BLE 音频解码后写入系统虚拟声卡，让会议软件把它当麦克风用。
 
 **已实现**：协议层、BLE 链路、虚拟声卡输出（抖动缓冲）、`apmctl` CLI
-（scan / status / record / sink / probe / analyze / selftest）、`apm-gui` 的 G0
+（scan / status / record / sink / ping / probe / analyze / selftest）、`apm-gui` 的 G0
 （Tauri 骨架 + 蓝牙权限 + 设备扫描）。
 **未实现**：GUI 的电平表与推流界面（G2）、按键注入、按键映射/音质报告界面（G4/G5）。
 链路与声卡输出都在真机上跑通，并**在会议软件里实测可用**（用户确认：选中 BlackHole 2ch
@@ -101,6 +101,7 @@ open "desktop/target/debug/bundle/macos/AI Passport Mic.app"   # 必须经 Launc
 ./scripts/apmctl-macos.sh scan --timeout 6             # 扫附近的设备
 ./scripts/apmctl-macos.sh status --timeout 10          # 连接并打印 STATUS / 按键事件
 ./scripts/apmctl-macos.sh record test.wav --seconds 10 # 录 10 秒到 WAV，打印丢块与电平
+./scripts/apmctl-macos.sh ping --count 20              # 链路往返时延（PING/PONG）
 ./scripts/apmctl-macos.sh sink --to "BlackHole 2ch" --seconds 30  # 实时推进虚拟声卡
 ./scripts/apmctl-macos.sh sink --to "BlackHole 2ch" --tone --verify # 推正弦并回读
 ./scripts/apmctl-macos.sh probe --device 麦克风 --seconds 4        # 只读输入电平
@@ -110,6 +111,11 @@ apmctl analyze test.wav --json      # 输出 ai-passport-mic-quality-report-1
 
 `record` 会发 CTRL START 强制采集（不依赖 OK 键），结束时发 STOP。
 序号跳变累计成"丢失块数"单独报出来 —— 不用"能听到声音"掩盖链路质量。
+
+`ping` 发 `0x04 PING`（递增 seq u32），设备原样回 `0x83 PONG`，输出 RTT 的
+min / 中位 / p95 / max 与抖动（`--json` 出 `ai-passport-mic-ping-report-1`）。
+它测的是**链路往返**：含两端协议栈、连接间隔（实测 30 ms）与设备事件任务调度，
+音频单程 ≈ RTT/2 只能当上界估计，**不能**当端到端声学延迟用（见 KI-003）。
 
 ## 与固件的对齐方式
 
@@ -151,18 +157,22 @@ apmctl analyze test.wav --json      # 输出 ai-passport-mic-quality-report-1
   这是 G2 的前置——不迁，GUI 和 CLI 会各长一套编排（见 `../docs/GUI.md` 决定 D1）。
 - **裸二进制不能用蓝牙**：macOS TCC 要求 bundle + 用途声明，直接 `./target/release/apmctl record`
   会被系统 abort，见上文「macOS 上的蓝牙权限」。
-- **满量程毛刺：已定位到采集端并做了双重拦截，未真机复测**。6 次真机录音里 2 次在
-  7.7–8.5 s 出现约 0.8 s 的 ±32767 交替噪声，同一次 `序号跳变丢失=0`（不是丢块）。
-  用编码→解码复现证明编解码自身最多污染一两块就恢复（`tests/glitch_repro.rs`），所以垃圾
-  来自 I2S / ES8311 的瞬态读出。现在固件编码前压成静音（`apm_pcm_is_corrupt`），PC 端
-  解码后再兜一层（`apm_protocol::glitch`）。**"为什么 codec 会读出这种数据"仍未定**，
-  只是不再让它进会议软件。固件被压掉的块数只在串口日志里，没有进 STATUS 载荷。
+- **满量程毛刺：根因未定位，只做了两端拦截**（`../docs/KNOWN_ISSUES.md` KI-001）。
+  6 次真机录音里 2 次在 7.7–8.5 s 出现约 0.8 s 的 ±32767 交替噪声，同一次
+  `序号跳变丢失=0`（不是丢块）。用编码→解码复现证明编解码自身最多污染一两块就恢复
+  （`tests/glitch_repro.rs`），所以垃圾**在进 ADPCM 之前**就产生了。现在固件编码前压成
+  静音（`apm_pcm_is_corrupt`），PC 端解码后再兜一层（`apm_protocol::glitch`）。
+  **"为什么 I2S/ES8311 会读出这种数据"仍未定**，只是不再让它进会议软件；固件被压掉的
+  块数只在串口日志里，没进 STATUS 载荷。
+- **只有链路 RTT，没有端到端声学延迟**：`apmctl ping` 覆盖 BLE + 两端协议栈；
+  codec 采集、20 ms 分块、抖动缓冲、声卡播放这几段还没进测量，卡在宿主麦克风权限
+  （KI-003）。
 
 ## 验证状态
 
 | 项 | 状态 |
 | --- | --- |
-| `cargo test`（protocol，31 项） | 通过；含 5 项与 C 实现的逐字节对拍 |
+| `cargo test`（workspace，63 项） | 通过；protocol 31 + 向量对拍 5 + 毛刺复现 3 + link 3 + sink 5 + app 13 + cli 4；无 warning |
 | `cargo build`（workspace） | 通过 |
 | `apmctl selftest` | 通过（同一份向量，15 项） |
 | `apmctl analyze` | 用合成 WAV 与真机 WAV 都跑过 |
@@ -174,7 +184,8 @@ apmctl analyze test.wav --json      # 输出 ai-passport-mic-quality-report-1
 | 会议软件端到端 | **通过**（用户实测：会议软件选 `BlackHole 2ch`，说话时麦克风电平跟随） |
 | 毛刺抑制（单测 + 合成 WAV） | 通过：`crates/protocol` 5 项单测 + `analyze` 正确识别 1 段 / 799.6 ms 并判 fail |
 | 漂移补偿（仿真 60 s） | 通过：±5000 ppm 两个方向均 0 欠载 / 0 超容量丢弃，ppm 估计误差 < 400 |
-| 上述两项的**真机复测** | **未做**（需要重新烧录固件 + 跑 60 s `sink`） |
+| 上述两项的**真机复测** | **未做**（需要重新烧录固件 + 跑 60 s `sink`），见 KI-002 |
+| `ping`（单测 + 统计口径） | 代码通过：4 项统计单测（最近秩 p95 / 抖动按发送顺序 / 单样本）；**真机未测**，需烧新固件 |
 | `sink --tone` | 声卡流正常消费（480000 帧写入）；**用户在「系统设置 → 声音 → 输入」看到电平条随信号跳动**，证明进程→声卡这一段通了 |
 | `probe` | 内置麦克风与 BlackHole 输入端都读到 -120 dBFS（1 LSB 抖动）→ 麦克风权限被拒，探针不可用 |
 | GUI 构建（`scripts/build-gui.sh`） | **通过**：`.app` 28.3 MiB，ad-hoc 签名有效，Info.plist 内含 `NSBluetooth*` / `NSMicrophone*`，bundle id `com.cnryb.ai-passport-mic` |

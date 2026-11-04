@@ -97,15 +97,17 @@ OK 按下/抬起 ──► PTT 开关 ──────────────
 
 | 项 | 状态 |
 | --- | --- |
-| `idf.py build`（esp32c3 / IDF 5.5.3） | 通过，0 warning；app 636,800 B，DRAM 静态占用 30.5% |
-| `idf.py merge-bin` | 通过，合并镜像 702,336 B |
-| 协议主机单测（27 项） | 通过；稳态 ADPCM 往返 SNR 32.89 dB |
+| `idf.py build`（esp32c3 / IDF 5.5.3） | 通过，0 warning；app 637,440 B |
+| `idf.py merge-bin` | 通过，合并镜像 702,976 B |
+| 协议主机单测（44 项） | 通过；稳态 ADPCM 往返 SNR 32.89 dB；含毛刺判据与 PING/PONG 长度校验 |
 | 真机烧录（esptool / 460800） | 通过，hash 校验通过，复位后 app 名 `ai-passport-mic` |
 | 按键 ADC 初始化 | 通过（curve fitting 校准）。曾因 `APM_BTN_ADC_UNIT` 写成 1 命中 `ADC_UNIT_2` 而失败，已修为 0 |
 | 按键手势判定 | **未逐项验证**（未在真机上依次按 UP/DOWN/OK 核对事件） |
 | ES8311 采集出声 | 通过：真机 15 s 连续录音 748 块、0 丢块、长度异常 0 |
 | BLE 连接 / MTU / 通知 | 通过：MTU 247（需求 ≥168），音频/状态/事件三路订阅均建立 |
 | 连接间隔 | 实测由主机决定：macOS 落到 **30 ms**；固件请求常被拒（host 554，疑似与主机自身参数更新冲突），压到 15–20 ms 也被拒 |
-| 端到端延迟 | **未测量**（虚拟声卡输出已实现，但控制帧 `0x83 PONG` 两端都没落地，缺测量手段） |
+| PING/PONG 回包 | 代码已落地（`0x04 PING` → `0x83 PONG`，4 字节原样回显），**真机未测**；PC 端 `apmctl ping` 已在同一批提交里实现 |
+| 链路往返时延 | **未测量**（需要烧新固件后跑 `apmctl ping`） |
+| 端到端声学延迟 | **未测量**：ping 只覆盖链路，声学回环卡在宿主麦克风权限（见 `../docs/KNOWN_ISSUES.md` KI-003） |
 
 真机验证顺序见 [`../docs/ROADMAP.md`](../docs/ROADMAP.md) 的 M1，测完再往这张表里填数字。

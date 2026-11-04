@@ -9,12 +9,14 @@
 > `device/` 是完整的 ESP-IDF 工程：ES8311 采集、IMA-ADPCM 编码、自定义 GATT 传输、
 > 单 ADC 三键手势判定。能编译、能烧录、能在真机上连续采集。
 > `desktop/` 有协议层、BLE 链路、虚拟声卡输出和 `apmctl` CLI（scan / status / record /
-> sink / probe / analyze / selftest），协议与固件用同一份共享向量逐字节对拍。
+> sink / ping / probe / analyze / selftest），协议与固件用同一份共享向量逐字节对拍。
 > 真机已验证：烧录、ES8311 16 kHz 采集、MTU 247、scan / status / record / sink，
 > 以及**会议软件里当麦克风用**（虚拟声卡输出已实现并实测）。
-> 仍未验证：按键手势逐项核对、端到端延迟（缺 PING/PONG）、长时间（>10 分钟）稳定性、
-> GUI 首次蓝牙授权。已拦但待真机复测：时钟漂移（单样本插删补偿）、满量程毛刺（固件压静音
-> + PC 端静音替换）。
+> 仍未验证：按键手势逐项核对、链路往返时延（`apmctl ping` 已实现，未烧新固件实测）、
+> 端到端声学延迟、长时间（>10 分钟）稳定性、GUI 首次蓝牙授权。已拦但待真机复测：时钟漂移
+> （单样本插删补偿）、满量程毛刺（固件压静音 + PC 端静音替换）。
+> **未解决的问题**（毛刺根因、待复测项、缺失的声学回环）集中在
+> [`docs/KNOWN_ISSUES.md`](docs/KNOWN_ISSUES.md)，不散落在各处。
 > 注意 macOS 上 BLE 必须走 .app bundle 拿权限，见 [`desktop/README.md`](desktop/README.md)。
 >
 > 上游的 FoloToy AI Passport 固件、以及既有的 VibeMic 桌面实现只作为**设计参考**，
@@ -40,7 +42,7 @@
 | [`device/`](device/) | 固件工作区（ESP-IDF 5.5.3 / ESP32-C3 / 8 MB Flash / 无 PSRAM） | M1 已实现并真机跑通（按键手势未逐项核对）；见 `device/README.md` |
 | [`desktop/`](desktop/) | PC 软件工作区（Rust workspace：protocol / link / sink / app / cli / gui） | 协议 + 链路 + 声卡输出 + CLI 已实现；GUI 到 G0，见 `desktop/README.md` |
 | [`config/`](config/) | 按键映射样例、字段说明、跨端协议向量 | 样例 + 说明 + `protocol-vectors.json`（由 C 实现导出） |
-| [`docs/`](docs/) | [产品](docs/PRODUCT.md)、[架构](docs/ARCHITECTURE.md)、[环境](docs/ENVIRONMENT.md)、[音质](docs/SOUND_QUALITY.md)、[路线图](docs/ROADMAP.md)、[参考实现](docs/REFERENCES.md)、[GUI 方案](docs/GUI.md) | 已就绪 |
+| [`docs/`](docs/) | [产品](docs/PRODUCT.md)、[架构](docs/ARCHITECTURE.md)、[环境](docs/ENVIRONMENT.md)、[音质](docs/SOUND_QUALITY.md)、[路线图](docs/ROADMAP.md)、[参考实现](docs/REFERENCES.md)、[GUI 方案](docs/GUI.md)、[已知问题](docs/KNOWN_ISSUES.md) | 已就绪；未解决项集中在新加的 `KNOWN_ISSUES.md` |
 | [`scripts/`](scripts/) | 环境体检、IDF 激活、基线自检、协议单测与向量导出、固件构建、GUI 打包、macOS app-bundle 运行器 | 可用 |
 
 ## 环境

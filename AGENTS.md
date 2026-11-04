@@ -49,7 +49,7 @@ device/   固件（ESP-IDF 5.5.3、ESP32-C3）。落地后在此目录内自带 
 desktop/  PC 软件（Rust workspace：protocol / link / sink / app / cli / gui；
           GUI = Tauri 2 + Vue 3，当前只到 G0）。
 config/   按键映射 schema 与样例。
-docs/     产品、架构、环境、音质、路线图、参考实现、GUI 方案。
+docs/     产品、架构、环境、音质、路线图、参考实现、GUI 方案、已知问题（KNOWN_ISSUES.md）。
 scripts/  环境与校验入口。
 ```
 
@@ -70,6 +70,7 @@ source ./scripts/activate-idf.sh # 当前 shell 激活 ESP-IDF
 ./scripts/build-firmware.sh      # 固件编译 + 合并镜像（需要 ESP-IDF，约 1-2 分钟）
 ./scripts/build-gui.sh           # 前端构建 + 打包 .app + 校验 Info.plist 用途声明
 ./scripts/apmctl-macos.sh scan   # macOS 上跑 apmctl 的唯一正道（bundle + 蓝牙权限）
+./scripts/apmctl-macos.sh ping --count 20  # 链路往返时延（PING/PONG），不是端到端声学延迟
 cd desktop && cargo test         # 桌面端测试，含与 C 实现的逐字节对拍
 ```
 
@@ -85,5 +86,6 @@ GUI build (.app + Info.plist): PASS / FAIL / SKIP
 GUI (G0-G6): PASS / FAIL / SKIP（写当前真实到哪一期，不要写"GUI 好了"）
 Firmware build: PASS / FAIL / SKIP（IDF 不可用时写 SKIP，不要写成 PASS）
 Env: PASS / FAIL（缺失项列出）
-Unverified: 尚未验证的能力（按键手势逐项核对、延迟、GUI 首次授权与推流）
+Unverified: 尚未验证的能力（按键手势逐项核对、链路 RTT、端到端声学延迟、GUI 首次授权与推流；
+            毛刺根因未定位见 docs/KNOWN_ISSUES.md KI-001，不要写成已验证）
 ```
