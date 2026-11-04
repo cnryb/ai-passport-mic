@@ -1,0 +1,14 @@
+[package]
+name = "apm-link"
+description = "AI Passport Mic 的 BLE 链路：扫描、连接、订阅、通知解析"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+apm-protocol = { workspace = true }
+anyhow = "1"
+btleplug = "0.11"
+futures = "0.3"
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "time", "sync"] }
+uuid = "1"

@@ -1,0 +1,5 @@
+[toolchain]
+# 钉死版本：固件侧固定 ESP-IDF 5.5.3，PC 侧也固定 rustc，避免"你那边能编"。
+# 升级前先跑 ./scripts/test-protocol.sh 与 cargo test，两端一起动。
+channel = "1.95.0"
+components = ["rustfmt", "clippy"]

@@ -1,0 +1,16 @@
+[package]
+name = "apm-app"
+description = "AI Passport Mic 的无 UI 应用内核：状态机、编排、事件与诊断日志"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+# 硬约束：本 crate 不允许依赖 tauri / 任何 GUI 框架。
+# CLI 与 GUI 共用这里的逻辑，一旦引了 GUI 类型，CLI 就被绑死了。
+[dependencies]
+apm-protocol = { workspace = true }
+apm-link = { workspace = true }
+anyhow = "1"
+serde = { workspace = true }
+serde_json = { workspace = true }
+tokio = { version = "1", features = ["rt-multi-thread", "time", "sync"] }

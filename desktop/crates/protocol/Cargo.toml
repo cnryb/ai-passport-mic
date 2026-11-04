@@ -1,0 +1,12 @@
+[package]
+name = "apm-protocol"
+description = "AI Passport Mic 跨端协议：帧、CRC16-CCITT、IMA-ADPCM、按键映射、WAV 与音质指标"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+serde_json = "1"
+
+[dev-dependencies]
+# 测试会读 device/test 生成的共享向量，路径见 tests/c_vectors.rs

@@ -1,0 +1,13 @@
+[package]
+name = "apm-sink"
+description = "把解码后的 PCM 写进系统虚拟声卡：抖动缓冲、欠载计数、断连停写"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+apm-protocol = { workspace = true }
+anyhow = "1"
+# 钉 0.15：0.16+ 改了 Device::name / SupportedStreamConfig 的接口，
+# 0.15 仍是主流用法（name() + with_sample_rate()），少踩一次迁移。
+cpal = "0.15"
