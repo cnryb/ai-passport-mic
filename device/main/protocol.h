@@ -40,10 +40,11 @@ typedef enum {
     APM_MSG_START    = 0x01,  // payload: 空。强制开始采集（不依赖 PTT）
     APM_MSG_STOP     = 0x02,  // payload: 空。强制停止采集
     APM_MSG_SET_GAIN = 0x03,  // payload: int8 麦克风 PGA 增益(dB, 0..42)
+    APM_MSG_PING     = 0x04,  // payload: seq u32-LE。必须原样回 PONG，长度不是 4 就丢弃
 
     APM_MSG_STATUS   = 0x81,  // payload: state u8, flags u8, block_drops u16, blocks_sent u32
     APM_MSG_EVENT    = 0x82,  // payload: button u8, event u8, flags u8
-    APM_MSG_PONG     = 0x83,  // payload: 4 字节序号原样回传，用于延迟测量
+    APM_MSG_PONG     = 0x83,  // payload: seq u32-LE 原样回传，用于延迟测量（走 EVENT 特征值）
 } apm_msg_type_t;
 
 // STATUS.payload[0]
@@ -134,3 +135,6 @@ size_t apm_build_status(uint8_t *payload, size_t cap, apm_state_t state, uint8_t
                         uint16_t block_drops, uint32_t blocks_sent);
 size_t apm_build_event(uint8_t *payload, size_t cap, apm_btn_t btn, apm_btn_ev_t ev,
                        uint8_t flags);
+// PONG 载荷 = PING 载荷原样回显。ping_len 必须为 4，否则返回 0（设备不做任意长度透传）。
+size_t apm_build_pong(uint8_t *payload, size_t cap, const uint8_t *ping_payload,
+                      size_t ping_len);

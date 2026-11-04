@@ -266,3 +266,12 @@ size_t apm_build_event(uint8_t *payload, size_t cap, apm_btn_t btn, apm_btn_ev_t
     payload[2] = flags;
     return 3;
 }
+
+size_t apm_build_pong(uint8_t *payload, size_t cap, const uint8_t *ping_payload,
+                      size_t ping_len)
+{
+    // 只认 4 字节：设备不做任意长度透传，避免被当成数据反射器。
+    if (!payload || !ping_payload || cap < 4 || ping_len != 4) return 0;
+    memcpy(payload, ping_payload, 4);
+    return 4;
+}

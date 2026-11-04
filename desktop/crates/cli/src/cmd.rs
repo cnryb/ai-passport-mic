@@ -352,6 +352,9 @@ pub async fn status(device: Option<&str>, timeout_s: u64) -> Result<()> {
             Ok(Some(Notification::Audio(block))) => {
                 println!("收到音频块 {} 字节（未订阅录音，忽略）", block.len());
             }
+            Ok(Some(Notification::Pong(seq))) => {
+                println!("PONG seq={seq}（本命令不测延迟，用 `apmctl ping`）");
+            }
             Ok(None) => {}
             Err(e) => {
                 println!("通知流出错: {e}");
@@ -754,4 +757,226 @@ pub fn probe(name: &str, seconds: u64) -> Result<()> {
         p.peak_dbfs().map(|v| format!("{v:.2} dBFS")).unwrap_or_else(|| "-".into())
     );
     Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// ping
+// ---------------------------------------------------------------------------
+
+/// 链路往返时延：PING 带递增 seq，设备原样回 PONG。
+///
+/// 只测链路，**不**声称端到端：真正的话筒延迟还要过 codec 采集、20 ms 分块和
+/// 抖动缓冲，那需要声学回环（见 docs/KNOWN_ISSUES.md 的 KI-003）。
+pub async fn ping(
+    device: Option<&str>,
+    count: u32,
+    interval_ms: u64,
+    timeout_ms: u64,
+    as_json: bool,
+) -> Result<()> {
+    if count == 0 {
+        bail!("--count 至少为 1");
+    }
+    if timeout_ms == 0 {
+        bail!("--timeout-ms 至少为 1");
+    }
+
+    let mut link = apm_link::connect(device, Duration::from_secs(15))
+        .await
+        .map_err(|e| anyhow!("{e}\n提示: {}", apm_link::device::hint_for_error(&e)))?;
+
+    if !as_json {
+        println!("已连接。PING {count} 次（间隔 {interval_ms} ms，单次超时 {timeout_ms} ms）。");
+        println!("口径: 这是链路往返（含连接间隔与设备任务调度），音频单程 ≈ RTT/2；");
+        println!("      不等于端到端声学延迟 —— 后者还要过 codec 采集、20 ms 分块与抖动缓冲。");
+        println!();
+    }
+
+    let mut samples: Vec<f64> = Vec::new();
+    let mut timeouts = 0u32;
+    let mut send_error: Option<String> = None;
+
+    for i in 0..count {
+        let seq = i + 1;
+        match link.ping(seq, Duration::from_millis(timeout_ms)).await {
+            Ok(Some(rtt)) => {
+                let ms = rtt.as_secs_f64() * 1000.0;
+                samples.push(ms);
+                if !as_json {
+                    println!("  #{seq:<3} {ms:8.1} ms");
+                }
+            }
+            Ok(None) => {
+                timeouts += 1;
+                if !as_json {
+                    println!("  #{seq:<3}   超时（> {timeout_ms} ms）");
+                }
+            }
+            Err(e) => {
+                // 链路断了不是"超时一次"，直接停手并如实报告，别把断线混进延迟统计。
+                send_error = Some(format!("{e:#}"));
+                break;
+            }
+        }
+        if i + 1 < count && interval_ms > 0 {
+            tokio::time::sleep(Duration::from_millis(interval_ms)).await;
+        }
+    }
+
+    link.disconnect().await.ok();
+
+    if let Some(err) = send_error {
+        bail!("链路中断：{err}（已收到 {} 次回包）", samples.len());
+    }
+    if samples.is_empty() {
+        bail!("{count} 次 PING 全部超时。可能是链路不通，或设备还在跑未实现 PONG 的旧固件");
+    }
+
+    let stats = PingStats::from_samples(&samples).expect("samples 已确认非空");
+    let n = stats.n;
+    let (min, median, p95, max, mean, jitter, one_way) = (
+        stats.min,
+        stats.median,
+        stats.p95,
+        stats.max,
+        stats.mean,
+        stats.jitter,
+        stats.one_way_estimate,
+    );
+
+    if as_json {
+        let report = json!({
+            "schema": "ai-passport-mic-ping-report-1",
+            "sent": count,
+            "received": n,
+            "timeouts": timeouts,
+            "rtt_ms": {
+                "min": round2(min),
+                "median": round2(median),
+                "p95": round2(p95),
+                "max": round2(max),
+                "mean": round2(mean),
+            },
+            "jitter_ms": round2(jitter),
+            "one_way_estimate_ms": round2(one_way),
+            "samples_ms": samples.iter().map(|v| round2(*v)).collect::<Vec<_>>(),
+            "note": "链路往返，不含 codec 采集、20 ms 分块与抖动缓冲；one_way_estimate 只是 RTT/2",
+        });
+        println!("{}", serde_json::to_string_pretty(&report)?);
+        return Ok(());
+    }
+
+    println!();
+    println!(
+        "往返: 最小 {:.1} / 中位 {:.1} / p95 {:.1} / 最大 {:.1} ms（发出 {}，收到 {}，超时 {}）",
+        min, median, p95, max, count, n, timeouts
+    );
+    println!("抖动: 相邻两次 RTT 的平均绝对差 {:.1} ms", jitter);
+    println!(
+        "音频单程估计: ≈ {:.1} ms（中位 RTT/2，仅链路，不含 codec 与缓冲）",
+        one_way
+    );
+    if n < count as usize {
+        println!("注意: 有 {} 次没回包，延迟统计只覆盖回包的那几次", count as usize - n);
+    }
+    Ok(())
+}
+
+/// 延迟统计。抽成不依赖蓝牙的纯结构，是为了能单测 —— 现场只有一台设备，
+/// 统计口径写错了没人能发现。
+#[derive(Debug, Clone, Copy, PartialEq)]
+struct PingStats {
+    n: usize,
+    min: f64,
+    median: f64,
+    p95: f64,
+    max: f64,
+    mean: f64,
+    /// 相邻两次 RTT 的平均绝对差。不用标准差：这里要回答的是"会不会忽然抖一下"。
+    jitter: f64,
+    /// 中位 RTT 的一半。**只是链路单程估计**，不含 codec 采集与抖动缓冲。
+    one_way_estimate: f64,
+}
+
+impl PingStats {
+    fn from_samples(samples: &[f64]) -> Option<Self> {
+        if samples.is_empty() {
+            return None;
+        }
+        let mut sorted = samples.to_vec();
+        sorted.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+        let n = sorted.len();
+
+        let median = if n % 2 == 1 {
+            sorted[n / 2]
+        } else {
+            (sorted[n / 2 - 1] + sorted[n / 2]) / 2.0
+        };
+        // 最近秩法：p95 取"至少 95% 的样本不超过它"的实测值，不插值 ——
+        // 报告里每个数都应该是真的测到过的数。
+        let p95 = sorted[((n as f64 * 0.95).ceil() as usize).clamp(1, n) - 1];
+        let mean = samples.iter().sum::<f64>() / n as f64;
+        let jitter = if n > 1 {
+            samples.windows(2).map(|w| (w[1] - w[0]).abs()).sum::<f64>() / (n - 1) as f64
+        } else {
+            0.0
+        };
+
+        Some(Self {
+            n,
+            min: sorted[0],
+            median,
+            p95,
+            max: sorted[n - 1],
+            mean,
+            jitter,
+            one_way_estimate: median / 2.0,
+        })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::PingStats;
+
+    #[test]
+    fn ping_stats_rejects_empty() {
+        assert!(PingStats::from_samples(&[]).is_none());
+    }
+
+    #[test]
+    fn ping_stats_single_sample_has_zero_jitter() {
+        let s = PingStats::from_samples(&[12.0]).unwrap();
+        assert_eq!(s.n, 1);
+        assert_eq!(s.min, 12.0);
+        assert_eq!(s.median, 12.0);
+        assert_eq!(s.p95, 12.0);
+        assert_eq!(s.max, 12.0);
+        assert_eq!(s.jitter, 0.0);
+        assert_eq!(s.one_way_estimate, 6.0);
+    }
+
+    #[test]
+    fn ping_stats_uses_nearest_rank_p95() {
+        // 1..=20：20 个样本的 p95 是第 19 个值（19.0），不是插值出来的 19.05。
+        let v: Vec<f64> = (1..=20).map(|x| x as f64).collect();
+        let s = PingStats::from_samples(&v).unwrap();
+        assert_eq!(s.min, 1.0);
+        assert_eq!(s.max, 20.0);
+        assert_eq!(s.median, 10.5);
+        assert_eq!(s.p95, 19.0);
+        assert_eq!(s.mean, 10.5);
+        assert_eq!(s.jitter, 1.0);
+        assert_eq!(s.one_way_estimate, 5.25);
+    }
+
+    #[test]
+    fn ping_stats_jitter_tracks_order_not_just_spread() {
+        // 同样一组数，顺序不同抖动不同 —— 抖动必须按原始发送顺序算。
+        let steady = PingStats::from_samples(&[10.0, 10.0, 10.0]).unwrap();
+        let spiky = PingStats::from_samples(&[10.0, 40.0, 10.0]).unwrap();
+        assert_eq!(steady.jitter, 0.0);
+        assert_eq!(spiky.jitter, 30.0);
+        assert_eq!(steady.median, spiky.median);
+    }
 }

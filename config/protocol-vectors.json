@@ -10,6 +10,7 @@
     {"name": "start_empty", "msg": 1, "payload_hex": "", "frame_hex": "564d0101000044c5"},
     {"name": "status_capturing", "msg": 129, "payload_hex": "0203070040e20100", "frame_hex": "564d018108000203070040e20100bd90"},
     {"name": "event_ok_double", "msg": 130, "payload_hex": "020204", "frame_hex": "564d018203000202049bb0"},
+    {"name": "ping_seq_12345678", "msg": 4, "payload_hex": "78563412", "frame_hex": "564d01040400785634127061"},
     {"name": "status_idle", "msg": 129, "payload_hex": "0000000000000000", "frame_hex": "564d018108000000000000000000249c"}
   ],
   "adpcm": [

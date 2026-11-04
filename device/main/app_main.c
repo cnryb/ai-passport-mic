@@ -209,6 +209,16 @@ static void handle_event(const apm_evt_t *e)
         s_forced_capture = false;
         ESP_LOGI(TAG, "CTRL STOP");
         break;
+    case APM_MSG_PING:
+        // 延迟探针：原样回包，且只认 4 字节（不做任意长度透传）。
+        if (e->ctrl_len == 4) {
+            int rc = apm_link_notify_pong(e->ctrl_payload, e->ctrl_len);
+            // 每个 PING 一行日志会把串口刷满，降到 DEBUG。
+            ESP_LOGD(TAG, "CTRL PING -> PONG rc=%d", rc);
+        } else {
+            ESP_LOGW(TAG, "CTRL PING 载荷长度非法: %u（期望 4）", e->ctrl_len);
+        }
+        break;
     case APM_MSG_SET_GAIN:
         if (e->ctrl_len >= 1) {
             int gain = (int)(int8_t)e->ctrl_payload[0];

@@ -87,6 +87,19 @@ int main(void)
     print_hex(frame, n);
     printf("\"},\n");
 
+    // PING：4 字节 seq，设备原样回显成 PONG
+    payload[0] = 0x78;
+    payload[1] = 0x56;
+    payload[2] = 0x34;
+    payload[3] = 0x12;
+    n = apm_frame_encode(APM_MSG_PING, payload, 4, frame, sizeof frame);
+    printf("    {\"name\": \"ping_seq_12345678\", \"msg\": %u, \"payload_hex\": \"",
+           (unsigned)APM_MSG_PING);
+    print_hex(payload, 4);
+    printf("\", \"frame_hex\": \"");
+    print_hex(frame, n);
+    printf("\"},\n");
+
     plen = apm_build_status(payload, sizeof payload, APM_STATE_IDLE, 0, 0, 0);
     n = apm_frame_encode(APM_MSG_STATUS, payload, plen, frame, sizeof frame);
     printf("    {\"name\": \"status_idle\", \"msg\": %u, \"payload_hex\": \"",

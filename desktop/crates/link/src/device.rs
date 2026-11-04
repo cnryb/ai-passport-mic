@@ -41,6 +41,8 @@ pub enum Notification {
     Audio(Vec<u8>),
     Status(Status),
     Event(Event),
+    /// PONG 回显的 seq。PONG 与 EVENT 共用特征值，靠 `frame.msg` 区分。
+    Pong(u32),
 }
 
 pub struct Link {
@@ -322,14 +324,51 @@ impl Link {
             return Ok(None);
         }
         if item.uuid == self.event.uuid {
+            // EVENT 与 PONG 共用这个特征值，必须按 msg 分派，不能按特征值猜类型。
             if let Ok((f, _)) = frame::decode(&item.value) {
-                if let Some(event) = Event::decode(f.payload) {
-                    return Ok(Some(Notification::Event(event)));
+                match f.msg {
+                    msg::EVENT => {
+                        if let Some(event) = Event::decode(f.payload) {
+                            return Ok(Some(Notification::Event(event)));
+                        }
+                    }
+                    msg::PONG => {
+                        if let Some(seq) = pong_seq(f.payload) {
+                            return Ok(Some(Notification::Pong(seq)));
+                        }
+                    }
+                    _ => {}
                 }
             }
             return Ok(None);
         }
         Ok(None)
+    }
+
+    /// 发一次 PING 并等**匹配 seq** 的 PONG，返回往返时延。
+    ///
+    /// - 超时返回 `Ok(None)`，链路断开返回 `Err`。
+    /// - 期间到达的 STATUS / EVENT / AUDIO 通知会被跳过（不计入时延，也不丢给调用方）：
+    ///   `apmctl ping` 不录音，这里丢掉的只可能是 1 s 心跳。
+    /// - 测到的是**链路往返**（含连接间隔与设备任务调度），音频单程 ≈ RTT/2，
+    ///   不等于端到端声学延迟。
+    pub async fn ping(&mut self, seq: u32, timeout: Duration) -> Result<Option<Duration>> {
+        let start = std::time::Instant::now();
+        self.send_ctrl(msg::PING, &seq.to_le_bytes()).await?;
+        let deadline = start + timeout;
+
+        loop {
+            let now = std::time::Instant::now();
+            if now >= deadline {
+                return Ok(None);
+            }
+            match self.next_notification(deadline - now).await? {
+                Some(Notification::Pong(got)) if got == seq => return Ok(Some(start.elapsed())),
+                Some(_) => continue,
+                // 通知流在这一轮窗口里安静地没东西：交给上面的 deadline 判断。
+                None => continue,
+            }
+        }
     }
 
     pub async fn disconnect(self) -> Result<()> {
@@ -338,6 +377,15 @@ impl Link {
         }
         self.peripheral.disconnect().await.context("断开失败")
     }
+}
+
+/// PONG 载荷就是 PING 的 4 字节 seq（小端）。长度不对返回 `None` ——
+/// 与设备侧 `apm_build_pong` 的要求一致，两端都不做任意长度透传。
+fn pong_seq(payload: &[u8]) -> Option<u32> {
+    if payload.len() != 4 {
+        return None;
+    }
+    Some(u32::from_le_bytes([payload[0], payload[1], payload[2], payload[3]]))
 }
 
 /// 连接时分不清"设备没起来"和"权限没给"，这里统一给出可执行的提示。
@@ -362,5 +410,25 @@ mod tests {
             assert!(Uuid::parse_str(text).is_ok(), "{text} 不是合法 UUID");
         }
         assert_eq!(service_uuid(), Uuid::parse_str(SERVICE_UUID).unwrap());
+    }
+
+    #[test]
+    fn pong_payload_must_be_four_bytes() {
+        assert_eq!(pong_seq(&[0x78, 0x56, 0x34, 0x12]), Some(0x1234_5678));
+        assert_eq!(pong_seq(&[]), None);
+        assert_eq!(pong_seq(&[1, 2, 3]), None);
+        assert_eq!(pong_seq(&[1, 2, 3, 4, 5]), None);
+    }
+
+    #[test]
+    fn ping_and_pong_are_distinguishable_frames() {
+        // 设备只回 4 字节：帧层必须能区分 PING / PONG / EVENT 三种 type。
+        let seq = 0x1234_5678u32;
+        let bytes = frame::encode(msg::PING, &seq.to_le_bytes()).unwrap();
+        let (f, _) = frame::decode(&bytes).unwrap();
+        assert_eq!(f.msg, msg::PING);
+        assert_ne!(msg::PING, msg::EVENT);
+        assert_ne!(msg::PING, msg::PONG);
+        assert_eq!(pong_seq(f.payload), Some(seq));
     }
 }

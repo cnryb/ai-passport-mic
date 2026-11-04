@@ -48,6 +48,23 @@ enum Command {
         #[arg(long)]
         device: Option<String>,
     },
+    /// 测链路往返时延（PING/PONG），不是端到端声学延迟
+    Ping {
+        #[arg(long)]
+        device: Option<String>,
+        /// 发送次数
+        #[arg(long, default_value_t = 20)]
+        count: u32,
+        /// 两次之间的间隔（毫秒）
+        #[arg(long, default_value_t = 200)]
+        interval_ms: u64,
+        /// 单次等待 PONG 的超时（毫秒）
+        #[arg(long, default_value_t = 2000)]
+        timeout_ms: u64,
+        /// 输出 JSON 报告（schema: ai-passport-mic-ping-report-1）
+        #[arg(long)]
+        json: bool,
+    },
     /// 把实时音频写进系统虚拟声卡（让会议软件把它当麦克风）
     Sink {
         /// 目标输出设备名子串，例如 "BlackHole 2ch"
@@ -116,6 +133,9 @@ fn main() -> anyhow::Result<()> {
                     }
                     Command::Record { file, seconds, device } => {
                         cmd::record(&file, seconds, device.as_deref()).await
+                    }
+                    Command::Ping { device, count, interval_ms, timeout_ms, json } => {
+                        cmd::ping(device.as_deref(), count, interval_ms, timeout_ms, json).await
                     }
                     Command::Sink { to, seconds, target_ms, verify, tone, device } => {
                         cmd::sink(&to, seconds, target_ms, verify, tone, device.as_deref()).await

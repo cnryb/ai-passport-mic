@@ -4,7 +4,8 @@
 //   ./scripts/test-protocol.sh
 //
 // 覆盖：CRC 已知向量、控制帧往返与四类错误、ADPCM 编解码往返 SNR、
-// 静音块收敛、丢块自同步（解码只依赖块头）、块长常量。
+// 静音块收敛、丢块自同步（解码只依赖块头）、块长常量、采集端病态检测、
+// PING/PONG 的 4 字节回显与长度校验。
 #include "protocol.h"
 
 #include <math.h>
@@ -251,6 +252,41 @@ static void test_pcm_corrupt(void)
     CHECK(!apm_pcm_is_corrupt(pcm, APM_AUDIO_BLOCK_SAMPLES), "静音不算病态");
 }
 
+// PING/PONG：设备只做 4 字节回显，长度不对就丢弃（不做任意长度透传）。
+static void test_ping_pong(void)
+{
+    printf("[ping/pong]\n");
+
+    const uint8_t seq[4] = { 0x78, 0x56, 0x34, 0x12 };
+    uint8_t payload[8];
+    memset(payload, 0xA5, sizeof payload);
+
+    size_t n = apm_build_pong(payload, sizeof payload, seq, sizeof seq);
+    CHECK(n == 4, "4 字节 PING 回 4 字节 PONG（实际 %zu）", n);
+    CHECK(memcmp(payload, seq, 4) == 0, "PONG 载荷是原样回显");
+
+    // 帧层：PING 带的载荷能被对端解出来，PONG 在同一通道上可区分
+    uint8_t frame[APM_FRAME_MAX_LEN];
+    size_t flen = apm_frame_encode(APM_MSG_PING, seq, sizeof seq, frame, sizeof frame);
+    CHECK(flen > 0, "PING 帧编码成功（%zu 字节）", flen);
+    apm_frame_t f;
+    CHECK(apm_frame_decode(frame, flen, &f) == (int)flen && f.type == APM_MSG_PING &&
+              f.payload_len == 4 && memcmp(f.payload, seq, 4) == 0,
+          "PING 帧往返一致");
+
+    flen = apm_frame_encode(APM_MSG_PONG, payload, n, frame, sizeof frame);
+    CHECK(apm_frame_decode(frame, flen, &f) == (int)flen && f.type == APM_MSG_PONG,
+          "PONG 帧类型与 PING 可区分");
+
+    // 长度校验：0 / 3 / 5 / 8 都不回
+    CHECK(apm_build_pong(payload, sizeof payload, seq, 0) == 0, "长度 0 丢弃");
+    CHECK(apm_build_pong(payload, sizeof payload, seq, 3) == 0, "长度 3 丢弃");
+    CHECK(apm_build_pong(payload, sizeof payload, seq, 5) == 0, "长度 5 丢弃");
+    CHECK(apm_build_pong(payload, 3, seq, 4) == 0, "输出容量不足丢弃");
+    CHECK(apm_build_pong(NULL, sizeof payload, seq, 4) == 0, "空输出指针丢弃");
+    CHECK(apm_build_pong(payload, sizeof payload, NULL, 4) == 0, "空载荷指针丢弃");
+}
+
 int main(void)
 {
     printf("protocol host tests\n");
@@ -260,6 +296,7 @@ int main(void)
     test_adpcm();
     test_adpcm_lost_block();
     test_pcm_corrupt();
+    test_ping_pong();
     printf("\n%d passed, %d failed\n", g_pass, g_fail);
     return g_fail == 0 ? 0 : 1;
 }

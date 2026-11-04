@@ -19,6 +19,8 @@ pub mod msg {
     pub const START: u8 = 0x01;
     pub const STOP: u8 = 0x02;
     pub const SET_GAIN: u8 = 0x03;
+    /// 载荷 `seq u32-LE`；设备原样回 [`PONG`]。
+    pub const PING: u8 = 0x04;
     pub const STATUS: u8 = 0x81;
     pub const EVENT: u8 = 0x82;
     pub const PONG: u8 = 0x83;
@@ -28,6 +30,7 @@ pub mod msg {
             START => "START",
             STOP => "STOP",
             SET_GAIN => "SET_GAIN",
+            PING => "PING",
             STATUS => "STATUS",
             EVENT => "EVENT",
             PONG => "PONG",

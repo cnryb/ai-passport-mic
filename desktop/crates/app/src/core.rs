@@ -508,6 +508,12 @@ impl AppCore {
                     "audio",
                     format!("收到音频块 {} 字节但未在推流（G2 前正常）", block.len()),
                 ),
+                // G0 的循环不发 PING；真收到说明外部（诊断）打了探针。
+                Ok(Some(Notification::Pong(seq))) => self.record(
+                    LogLevel::Debug,
+                    "ping",
+                    format!("PONG seq={seq}"),
+                ),
                 Ok(None) => {}
                 Err(err) => {
                     self.record(LogLevel::Error, "ble", format!("链路中断：{err}"));

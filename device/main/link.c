@@ -344,6 +344,21 @@ int apm_link_notify_event(apm_btn_t btn, apm_btn_ev_t ev, uint8_t flags)
     return notify(s_h_evt, frame, flen);
 }
 
+int apm_link_notify_pong(const uint8_t *seq, size_t len)
+{
+    // 与 EVENT 共用特征值：PONG 是控制面回包，不新开特征值（见 ARCHITECTURE.md）。
+    if (!s_sub_event) return -1;
+
+    uint8_t payload[4];
+    size_t plen = apm_build_pong(payload, sizeof payload, seq, len);
+    if (plen == 0) return -2;
+
+    uint8_t frame[APM_FRAME_MAX_LEN];
+    size_t flen = apm_frame_encode(APM_MSG_PONG, payload, plen, frame, sizeof frame);
+    if (flen == 0) return -2;
+    return notify(s_h_evt, frame, flen);
+}
+
 int apm_link_notify_status(apm_state_t state, uint8_t flags, uint16_t drops, uint32_t sent)
 {
     s_status_len = (uint16_t)apm_build_status(s_status_payload, sizeof s_status_payload,
