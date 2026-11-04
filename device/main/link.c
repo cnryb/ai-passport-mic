@@ -1,0 +1,434 @@
+// device/main/link.c
+// NimBLE peripheral：单连接、自定义 GATT（CTRL / PROFILE / STATUS / EVENT / AUDIO）。
+//
+// 参考: FoloToy ai-passport main/demo_ble.c (MIT) —— 借用 NimBLE 在 C3 上的
+//       初始化与广播/重广播的结构；GATT 服务、MTU 协商与音频通知是本项目自写。
+#include "link.h"
+
+#include "audio.h"
+#include "board.h"
+
+#include "esp_log.h"
+#include "host/ble_hs.h"
+#include "host/util/util.h"
+#include "nimble/nimble_port.h"
+#include "nimble/nimble_port_freertos.h"
+#include "services/gap/ble_svc_gap.h"
+#include "services/gatt/ble_svc_gatt.h"
+
+#include <string.h>
+
+static const char *TAG = "apm_link";
+
+// 单包含下 165 字节音频块：MTU 至少 168。取 247 留出 STATUS/EVENT 的余量。
+#define APM_BLE_MTU            247
+#define APM_BLE_MIN_AUDIO_MTU  (APM_AUDIO_BLOCK_LEN + 3)
+
+// a7c52e00-31d4-4d2a-8f6b-5e9c1b3f7aNN（文本序）；BLE 侧按 LSB-first 存 16 字节。
+// 展开成裸字节列表，才能直接喂给 BLE_UUID128_INIT（多一对花括号会变成标量初始化）。
+#define APM_UUID128_BYTES(low) (low), 0x7a, 0x3f, 0x1b, 0x9c, 0x5e, 0x6b, 0x8f, \
+                               0x2a, 0x4d, 0xd4, 0x31, 0x00, 0x2e, 0xc5, 0xa7
+
+static const ble_uuid128_t s_svc_uuid  = BLE_UUID128_INIT(APM_UUID128_BYTES(0x00));
+static const ble_uuid128_t s_ctrl_uuid = BLE_UUID128_INIT(APM_UUID128_BYTES(0x01));
+static const ble_uuid128_t s_prof_uuid = BLE_UUID128_INIT(APM_UUID128_BYTES(0x02));
+static const ble_uuid128_t s_stat_uuid = BLE_UUID128_INIT(APM_UUID128_BYTES(0x03));
+static const ble_uuid128_t s_evt_uuid  = BLE_UUID128_INIT(APM_UUID128_BYTES(0x04));
+static const ble_uuid128_t s_aud_uuid  = BLE_UUID128_INIT(APM_UUID128_BYTES(0x05));
+
+static uint16_t s_h_ctrl;
+static uint16_t s_h_prof;
+static uint16_t s_h_stat;
+static uint16_t s_h_evt;
+static uint16_t s_h_aud;
+
+static uint16_t s_conn = BLE_HS_CONN_HANDLE_NONE;
+static uint16_t s_mtu;
+static uint8_t  s_own_addr_type;
+static bool     s_sub_audio;
+static bool     s_sub_status;
+static bool     s_sub_event;
+static const char *s_name = APM_DEVICE_NAME;
+
+static apm_ctrl_cb_t s_ctrl_cb;
+
+static uint8_t  s_status_payload[8];
+static uint16_t s_status_len;
+
+static int gatt_access(uint16_t conn_handle, uint16_t attr_handle,
+                       struct ble_gatt_access_ctxt *ctxt, void *arg);
+static int gap_event(struct ble_gap_event *event, void *arg);
+
+// ---------------------------------------------------------------------------
+// GATT
+// ---------------------------------------------------------------------------
+static const struct ble_gatt_chr_def s_chrs[] = {
+    {
+        .uuid       = &s_ctrl_uuid.u,
+        .access_cb  = gatt_access,
+        .arg        = (void *)1,  // CTRL
+        .flags      = BLE_GATT_CHR_F_WRITE | BLE_GATT_CHR_F_WRITE_NO_RSP,
+        .val_handle = &s_h_ctrl,
+    },
+    {
+        .uuid       = &s_prof_uuid.u,
+        .access_cb  = gatt_access,
+        .arg        = (void *)2,  // PROFILE
+        .flags      = BLE_GATT_CHR_F_READ,
+        .val_handle = &s_h_prof,
+    },
+    {
+        .uuid       = &s_stat_uuid.u,
+        .access_cb  = gatt_access,
+        .arg        = (void *)3,  // STATUS
+        .flags      = BLE_GATT_CHR_F_READ | BLE_GATT_CHR_F_NOTIFY,
+        .val_handle = &s_h_stat,
+    },
+    {
+        .uuid       = &s_evt_uuid.u,
+        .access_cb  = gatt_access,
+        .arg        = (void *)4,  // EVENT
+        .flags      = BLE_GATT_CHR_F_NOTIFY,
+        .val_handle = &s_h_evt,
+    },
+    {
+        .uuid       = &s_aud_uuid.u,
+        .access_cb  = gatt_access,
+        .arg        = (void *)5,  // AUDIO
+        .flags      = BLE_GATT_CHR_F_NOTIFY,
+        .val_handle = &s_h_aud,
+    },
+    { 0 },
+};
+
+static const struct ble_gatt_svc_def s_svcs[] = {
+    {
+        .type            = BLE_GATT_SVC_TYPE_PRIMARY,
+        .uuid            = &s_svc_uuid.u,
+        .characteristics = s_chrs,
+    },
+    { 0 },
+};
+
+static int gatt_access(uint16_t conn_handle, uint16_t attr_handle,
+                       struct ble_gatt_access_ctxt *ctxt, void *arg)
+{
+    (void)conn_handle;
+    (void)attr_handle;
+    int which = (int)(intptr_t)arg;
+
+    if (ctxt->op == BLE_GATT_ACCESS_OP_WRITE_CHR) {
+        if (which != 1) return BLE_ATT_ERR_UNLIKELY;
+
+        uint16_t len = OS_MBUF_PKTLEN(ctxt->om);
+        if (len == 0 || len > APM_FRAME_MAX_LEN) {
+            ESP_LOGW(TAG, "CTRL 写入长度非法: %u", len);
+            return BLE_ATT_ERR_INVALID_ATTR_VALUE_LEN;
+        }
+
+        uint8_t frame[APM_FRAME_MAX_LEN];
+        uint16_t copied = 0;
+        if (os_mbuf_copydata(ctxt->om, 0, len, frame) != 0) {
+            return BLE_ATT_ERR_UNLIKELY;
+        }
+        copied = len;
+
+        apm_frame_t f;
+        int rc = apm_frame_decode(frame, copied, &f);
+        if (rc < 0) {
+            ESP_LOGW(TAG, "CTRL 帧解码失败: %d", rc);
+            return BLE_ATT_ERR_INVALID_ATTR_VALUE_LEN;
+        }
+        ESP_LOGD(TAG, "CTRL type=0x%02X len=%u", f.type, f.payload_len);
+        if (s_ctrl_cb) s_ctrl_cb(f.type, f.payload, f.payload_len);
+        return 0;
+    }
+
+    if (ctxt->op == BLE_GATT_ACCESS_OP_READ_CHR) {
+        if (which == 2) {
+            // PROFILE 第一版只读：协议版本、当前增益、采样率档位、保留。
+            uint8_t prof[4] = { APM_PROTO_VERSION, (uint8_t)apm_audio_gain(), 0, 0 };
+            return os_mbuf_append(ctxt->om, prof, sizeof prof) == 0
+                       ? 0 : BLE_ATT_ERR_INSUFFICIENT_RES;
+        }
+        if (which == 3) {
+            // 读 STATUS 必须回**完整帧**：通知路径是 apm_frame_encode 包过的，
+            // 而 s_status_payload 只有 payload。之前直接回 payload，PC 端按帧解析
+            // 就会报 "magic 不匹配"，每次连接第一次读都失败。
+            uint16_t plen = s_status_len;
+            if (plen == 0) {
+                // 还没跑过 status_task：现造一个合法帧，别让对端拿 ATT 错误
+                plen = (uint16_t)apm_build_status(s_status_payload, sizeof s_status_payload,
+                                                  APM_STATE_IDLE, 0, 0, 0);
+            }
+            uint8_t frame[APM_FRAME_MAX_LEN];
+            size_t flen = apm_frame_encode(APM_MSG_STATUS, s_status_payload, plen,
+                                           frame, sizeof frame);
+            if (flen == 0) return BLE_ATT_ERR_UNLIKELY;
+            return os_mbuf_append(ctxt->om, frame, flen) == 0
+                       ? 0 : BLE_ATT_ERR_INSUFFICIENT_RES;
+        }
+        return BLE_ATT_ERR_UNLIKELY;
+    }
+
+    return BLE_ATT_ERR_UNLIKELY;
+}
+
+// ---------------------------------------------------------------------------
+// 广播
+// ---------------------------------------------------------------------------
+static int advertise(void)
+{
+    struct ble_hs_adv_fields fields = { 0 };
+    fields.flags = BLE_HS_ADV_F_DISC_GEN | BLE_HS_ADV_F_BREDR_UNSUP;
+    fields.name = (const uint8_t *)s_name;
+    fields.name_len = (uint8_t)strlen(s_name);
+    fields.name_is_complete = 1;
+
+    int rc = ble_gap_adv_set_fields(&fields);
+    if (rc != 0) {
+        ESP_LOGE(TAG, "广播数据设置失败: %d", rc);
+        return rc;
+    }
+
+    // 128 位服务 UUID 放扫描响应，避免广播包 31 字节放不下。
+    struct ble_hs_adv_fields rsp = { 0 };
+    rsp.uuids128 = &s_svc_uuid;
+    rsp.num_uuids128 = 1;
+    rsp.uuids128_is_complete = 1;
+    rc = ble_gap_adv_rsp_set_fields(&rsp);
+    if (rc != 0) {
+        ESP_LOGE(TAG, "扫描响应设置失败: %d", rc);
+        return rc;
+    }
+
+    struct ble_gap_adv_params params = { 0 };
+    params.conn_mode = BLE_GAP_CONN_MODE_UND;
+    params.disc_mode = BLE_GAP_DISC_MODE_GEN;
+    params.itvl_min  = BLE_GAP_ADV_ITVL_MS(100);
+    params.itvl_max  = BLE_GAP_ADV_ITVL_MS(150);
+
+    rc = ble_gap_adv_start(s_own_addr_type, NULL, BLE_HS_FOREVER, &params, gap_event, NULL);
+    if (rc == 0) {
+        ESP_LOGI(TAG, "开始广播: %s", s_name);
+    } else {
+        ESP_LOGE(TAG, "广播启动失败: %d", rc);
+    }
+    return rc;
+}
+
+// ---------------------------------------------------------------------------
+// GAP
+// ---------------------------------------------------------------------------
+static int gap_event(struct ble_gap_event *event, void *arg)
+{
+    (void)arg;
+
+    switch (event->type) {
+    case BLE_GAP_EVENT_CONNECT:
+        if (event->connect.status == 0) {
+            s_conn = event->connect.conn_handle;
+            ESP_LOGI(TAG, "已连接 conn=%u", s_conn);
+
+            // 低延迟参数：15–30 ms 间隔、无 slave latency。
+            // 实测（macOS 15.3.1）：请求 15–30 时主机接受并落到 30 ms；
+            // 改成 15–20 会被主机拒绝（host 返回 554），因此上限别随手压。
+            struct ble_gap_upd_params up = {
+                .itvl_min = BLE_GAP_CONN_ITVL_MS(15),
+                .itvl_max = BLE_GAP_CONN_ITVL_MS(30),
+                .latency  = 0,
+                .supervision_timeout = 400,  // 4 s
+            };
+            int rc = ble_gap_update_params(s_conn, &up);
+            if (rc != 0) ESP_LOGW(TAG, "连接参数更新请求失败: %d", rc);
+        } else {
+            ESP_LOGW(TAG, "连接失败 status=%d，重新广播", event->connect.status);
+            advertise();
+        }
+        return 0;
+
+    case BLE_GAP_EVENT_DISCONNECT:
+        ESP_LOGI(TAG, "断开 reason=0x%02X", event->disconnect.reason);
+        s_conn = BLE_HS_CONN_HANDLE_NONE;
+        s_mtu = 0;
+        s_sub_audio = s_sub_status = s_sub_event = false;
+        advertise();
+        return 0;
+
+    case BLE_GAP_EVENT_ADV_COMPLETE:
+        ESP_LOGI(TAG, "广播结束，重新开始");
+        advertise();
+        return 0;
+
+    case BLE_GAP_EVENT_SUBSCRIBE:
+        if (event->subscribe.attr_handle == s_h_aud) {
+            s_sub_audio = event->subscribe.cur_notify;
+        } else if (event->subscribe.attr_handle == s_h_stat) {
+            s_sub_status = event->subscribe.cur_notify;
+        } else if (event->subscribe.attr_handle == s_h_evt) {
+            s_sub_event = event->subscribe.cur_notify;
+        }
+        ESP_LOGI(TAG, "订阅: audio=%d status=%d event=%d", s_sub_audio, s_sub_status,
+                 s_sub_event);
+        return 0;
+
+    case BLE_GAP_EVENT_MTU:
+        s_mtu = event->mtu.value;
+        ESP_LOGI(TAG, "MTU = %u（音频块需要 >= %d）", s_mtu, APM_BLE_MIN_AUDIO_MTU);
+        if (s_mtu < APM_BLE_MIN_AUDIO_MTU) {
+            ESP_LOGW(TAG, "MTU 不足，音频块会被拆包，延迟与丢块都会变差");
+        }
+        return 0;
+
+    case BLE_GAP_EVENT_CONN_UPDATE: {
+        if (event->conn_update.status == 0) {
+            struct ble_gap_conn_desc desc;
+            if (ble_gap_conn_find(event->conn_update.conn_handle, &desc) == 0) {
+                ESP_LOGI(TAG, "连接参数已更新 itvl=%.1f ms latency=%u timeout=%u ms",
+                         desc.conn_itvl * 1.25, desc.conn_latency,
+                         (unsigned)desc.supervision_timeout * 10);
+            }
+        } else {
+            ESP_LOGW(TAG, "连接参数更新被拒: %d", event->conn_update.status);
+        }
+        return 0;
+    }
+
+    case BLE_GAP_EVENT_REPEAT_PAIRING: {
+        // 对端丢了绑定信息又要求重新配对：删掉旧绑定，允许重配。
+        struct ble_gap_conn_desc desc;
+        if (ble_gap_conn_find(event->repeat_pairing.conn_handle, &desc) == 0) {
+            ble_store_util_delete_peer(&desc.peer_id_addr);
+        }
+        return BLE_GAP_REPEAT_PAIRING_RETRY;
+    }
+
+    default:
+        return 0;
+    }
+}
+
+// ---------------------------------------------------------------------------
+// 通知
+// ---------------------------------------------------------------------------
+static int notify(uint16_t attr, const uint8_t *data, size_t len)
+{
+    if (s_conn == BLE_HS_CONN_HANDLE_NONE || attr == 0) return -1;
+
+    struct os_mbuf *om = ble_hs_mbuf_from_flat(data, (uint16_t)len);
+    if (!om) return -2;
+
+    // ble_gatts_notify_custom 无论成败都接管 om，失败不要重复释放。
+    int rc = ble_gatts_notify_custom(s_conn, attr, om);
+    if (rc != 0) return -3;
+    return 0;
+}
+
+int apm_link_notify_audio(const uint8_t *block, size_t len)
+{
+    if (!s_sub_audio) return -1;
+    if (s_mtu && s_mtu < APM_BLE_MIN_AUDIO_MTU) return -4;
+    return notify(s_h_aud, block, len);
+}
+
+int apm_link_notify_event(apm_btn_t btn, apm_btn_ev_t ev, uint8_t flags)
+{
+    if (!s_sub_event) return -1;
+    uint8_t payload[3];
+    size_t plen = apm_build_event(payload, sizeof payload, btn, ev, flags);
+    if (plen == 0) return -2;
+
+    uint8_t frame[APM_FRAME_MAX_LEN];
+    size_t flen = apm_frame_encode(APM_MSG_EVENT, payload, plen, frame, sizeof frame);
+    if (flen == 0) return -2;
+    return notify(s_h_evt, frame, flen);
+}
+
+int apm_link_notify_status(apm_state_t state, uint8_t flags, uint16_t drops, uint32_t sent)
+{
+    s_status_len = (uint16_t)apm_build_status(s_status_payload, sizeof s_status_payload,
+                                              state, flags, drops, sent);
+    if (!s_sub_status) return -1;
+
+    uint8_t frame[APM_FRAME_MAX_LEN];
+    size_t flen = apm_frame_encode(APM_MSG_STATUS, s_status_payload, s_status_len,
+                                   frame, sizeof frame);
+    if (flen == 0) return -2;
+    return notify(s_h_stat, frame, flen);
+}
+
+// ---------------------------------------------------------------------------
+// 生命周期
+// ---------------------------------------------------------------------------
+static void on_sync(void)
+{
+    int rc = ble_hs_util_ensure_addr(0);
+    if (rc == 0) rc = ble_hs_id_infer_auto(0, &s_own_addr_type);
+    if (rc != 0) {
+        ESP_LOGE(TAG, "地址推断失败: %d", rc);
+        return;
+    }
+    rc = ble_att_set_preferred_mtu(APM_BLE_MTU);
+    if (rc != 0) ESP_LOGW(TAG, "设置首选 MTU 失败: %d", rc);
+
+    advertise();
+}
+
+static void on_reset(int reason)
+{
+    ESP_LOGE(TAG, "NimBLE host 复位 reason=%d", reason);
+    s_conn = BLE_HS_CONN_HANDLE_NONE;
+    s_sub_audio = s_sub_status = s_sub_event = false;
+}
+
+static void host_task(void *param)
+{
+    (void)param;
+    nimble_port_run();
+    nimble_port_freertos_deinit();
+}
+
+esp_err_t apm_link_start(const char *device_name)
+{
+    if (device_name) s_name = device_name;
+
+    esp_err_t err = nimble_port_init();
+    if (err != ESP_OK) {
+        ESP_LOGE(TAG, "nimble_port_init 失败: %s", esp_err_to_name(err));
+        return err;
+    }
+
+    ble_hs_cfg.sync_cb  = on_sync;
+    ble_hs_cfg.reset_cb = on_reset;
+    // 第一版不强制配对：音频链路本身不承载隐私内容，先保证可用性。
+    ble_hs_cfg.store_status_cb = ble_store_util_status_rr;
+
+    ble_svc_gap_init();
+    ble_svc_gatt_init();
+
+    int rc = ble_svc_gap_device_name_set(s_name);
+    if (rc != 0) {
+        ESP_LOGE(TAG, "设置设备名失败: %d", rc);
+        return ESP_FAIL;
+    }
+
+    rc = ble_gatts_count_cfg(s_svcs);
+    if (rc != 0) return ESP_FAIL;
+    rc = ble_gatts_add_svcs(s_svcs);
+    if (rc != 0) return ESP_FAIL;
+
+    nimble_port_freertos_init(host_task);
+    ESP_LOGI(TAG, "NimBLE 已启动");
+    return ESP_OK;
+}
+
+void apm_link_set_ctrl_cb(apm_ctrl_cb_t cb) { s_ctrl_cb = cb; }
+
+bool apm_link_connected(void) { return s_conn != BLE_HS_CONN_HANDLE_NONE; }
+
+bool apm_link_audio_ready(void)
+{
+    return apm_link_connected() && s_sub_audio && s_mtu >= APM_BLE_MIN_AUDIO_MTU;
+}
+
+uint16_t apm_link_mtu(void) { return s_mtu; }

@@ -1,0 +1,18 @@
+idf_component_register(
+    SRCS "app_main.c"
+         "protocol.c"
+         "audio.c"
+         "link.c"
+         "buttons.c"
+    INCLUDE_DIRS "."
+    REQUIRES driver
+             esp_driver_i2s
+             esp_driver_i2c
+             esp_driver_gpio
+             esp_driver_usb_serial_jtag
+             esp_adc
+             esp_timer
+             bt
+             nvs_flash
+             esp_codec_dev
+)

@@ -1,50 +1,110 @@
-# device/ —— 固件（待落地）
+# device/ —— 固件（M1 已实现，未真机验证）
 
-ESP32-C3 上的采集与 BLE 传输固件。**当前目录是空的**：只有这份计划，没有任何代码，
-也没有上游 fork 的残留。
+ESP32-C3 上的采集与 BLE 传输固件。**代码已落地，能编译、能产出合并镜像**，
+但还没有在真机上跑过 —— 见文末「验证状态」，不要把它当成"已通过"。
 
-## 计划技术栈
+## 技术栈
 
 | 项 | 值 |
 | --- | --- |
 | 框架 | ESP-IDF **v5.5.3**（固定版本） |
-| 语言 | C（遵循 IDF 组件化写法） |
+| 语言 | C |
 | 目标 | ESP32-C3，8 MB Flash，无 PSRAM |
-| BLE | NimBLE，单连接 peripheral：HID 键盘 + 自定义 GATT 服务 |
-| 控制台 | USB-Serial-JTAG（C3 原生 USB），避免占用 UART0 引脚 |
+| BLE | NimBLE，单连接 peripheral，自定义 GATT（CTRL / PROFILE / STATUS / EVENT / AUDIO） |
+| 控制台 | USB-Serial-JTAG（C3 原生 USB）；UART0 的 TX=GPIO21 与本板背光冲突所以不用 |
 
-## 计划目录
+## 目录
 
 ```text
 device/
   CMakeLists.txt
-  partitions.csv          # nvs + phy_init + factory
-  sdkconfig.defaults      # 目标芯片、Flash、NimBLE、LVGL 等基线配置
+  partitions.csv          # nvs + phy_init + factory（无 OTA）
+  sdkconfig.defaults      # 目标芯片、8MB Flash、USB-Serial-JTAG、NimBLE 基线
   main/
-    app.c                 # 应用入口与状态机
-    audio.c               # ES8311 采集 + IMA-ADPCM 编码
-    link.c                # GATT 服务与通知
-    buttons.c             # 按键消抖、单击/双击/长按判定
-    protocol.c            # 帧编解码（与 PC 端同一组测试向量）
-  components/
-    bsp/                  # 板级：引脚、I2S、显示、电源
+    idf_component.yml     # esp_codec_dev 1.6.2
+    CMakeLists.txt
+    app_main.c            # 任务编排：采集 / 事件 / STATUS 心跳
+    protocol.c/.h         # 帧、CRC16-CCITT、IMA-ADPCM（纯 C，可在主机单测）
+    audio.c/.h            # ES8311 + I2S 全双工，16 kHz / 16-bit / mono
+    link.c/.h             # NimBLE GATT、广播、MTU 协商、通知
+    buttons.c/.h          # 单 ADC 三键手势判定（去抖 / 单击 / 双击 / 长按 / PTT）
+    board.h               # 引脚与硬件常量（唯一事实来源）
+  test/
+    test_protocol.c       # 主机侧单测，不依赖 ESP-IDF
 ```
 
-## 落地顺序（对应路线图 M1）
+## 构建
 
-1. 工程骨架 + 分区表 + 控制台能打印。
-2. ES8311 采集出声（先落 WAV 到串口/内存，不做 BLE）。
-3. ADPCM 编码 + 序号，与 PC 端测试向量对齐。
-4. GATT 服务与通知，MTU ≥ 168 才能单包发 165 字节音频块。
-5. 按键事件：本地 HID + GATT 事件双路径。
+```bash
+export IDF_PYTHON_ENV_PATH="$HOME/.espressif/python_env/idf5.5_py3.11_env"  # 见 docs/ENVIRONMENT.md 方案 A
+source ../scripts/activate-idf.sh
+idf.py set-target esp32c3     # 只需一次
+idf.py build
+idf.py merge-bin -o "$PWD/build/ai-passport-mic-merged.bin"   # -o 相对 build/ 解析，必须给绝对路径
+```
+
+`-o` 的路径是相对 `build/` 目录解析的，写相对路径会报 `No such file or directory`。
+
+协议层不用装 ESP-IDF 也能单独验证：
+
+```bash
+../scripts/test-protocol.sh
+```
+
+## 数据通路
+
+```text
+ES8311 ──I2S──► 320 samples ──IMA-ADPCM──► [seq][predictor][index][nibbles] ──► AUDIO notify
+                                                    ▲
+OK 按下/抬起 ──► PTT 开关 ──────────────────────────┘
+按键事件 ──► EVENT notify（press/click/double/long/release）
+1 s 心跳 ──► STATUS notify（state + flags + 丢块数 + 已发块数）
+```
+
+三条实现约束（都有对应的日志或状态位，不要静默退化）：
+
+1. 采集任务**始终**读 I2S，即使没在采集也读后丢弃 —— 停读会让 DMA 溢出，恢复时先听到旧数据。
+2. 未连接 / 未订阅 / MTU 不足时块直接丢弃并计入 `dropped`，`seq` 仍然递增，
+   PC 端据此区分"没说话"和"丢了块"。
+3. 音频初始化失败不阻断 BLE 启动：设备仍然广播，STATUS 上报 `ERROR` 且带 `AUDIO_ERROR` 位。
+
+## 硬件事实（来自上游 BSP，勿凭记忆改）
+
+| 用途 | 引脚 / 值 |
+| --- | --- |
+| I2C SDA / SCL | GPIO10 / GPIO7 |
+| ES8311 地址 | `0x18`（7 位；`audio_codec_new_i2c_ctrl` 要 8 位形式） |
+| I2S MCLK / BCLK / WS | GPIO6 / GPIO5 / GPIO3 |
+| I2S DOUT / DIN | GPIO2 / GPIO4 |
+| 按键（三键共用） | GPIO0 / ADC1_CH0；窗口 `≤150` UP、`≤447` DOWN、`≤1900` OK、`>1900` 松开 |
+| 背光 | GPIO21（所以控制台走 USB-Serial-JTAG） |
+
+来源：`gitee.com/FoloToy/ai-passport` 的 `components/bsp/include/bsp_pins.h`（MIT）。
+换板只改 `main/board.h`，改完用 `apm_buttons_read_mv()` 重新标定按键窗口。
 
 ## 硬约束
 
-1. **不要整份 fork 上游仓库。** 需要引脚定义、Codec 初始化、BLE HID 描述符这类
-   基础设施时，按本项目结构重写，并在文件头注明来源与 MIT 许可（见
-   [`../docs/REFERENCES.md`](../docs/REFERENCES.md)）。
-2. 协议改动先改 [`../docs/ARCHITECTURE.md`](../docs/ARCHITECTURE.md)，两端同步。
-3. LVGL 不是线程安全的；非 LVGL 任务访问 UI 对象必须加锁。
-4. 按键回调里不许做阻塞操作（音频、存储、网络都放到 worker task）。
-5. 烧录会改动设备上的数据（绑定、配置）；动手前先跟用户确认，不要默认执行。
-6. 中文 UI 文本要单独确认字体覆盖，UTF-8 + 编译通过不等于能显示。
+1. **不要整份 fork 上游仓库。** 需要引脚、codec 初始化这类基础设施时按本项目结构重写，
+   并在文件头注明来源与 MIT 许可（见 [`../docs/REFERENCES.md`](../docs/REFERENCES.md)）。
+2. 协议改动先改 [`../docs/ARCHITECTURE.md`](../docs/ARCHITECTURE.md)，两端同步，
+   并让 `test_protocol.c` 覆盖到。
+3. 按键回调里不许阻塞（BLE 通知、音频都放别的任务）；回调只入队。
+4. 烧录会改动设备上的数据（绑定、配置）；动手前先跟用户确认，不要默认执行。
+5. 没有真机证据时，不许在文档或提交里写"音质合格""按键可用"。
+
+## 验证状态
+
+| 项 | 状态 |
+| --- | --- |
+| `idf.py build`（esp32c3 / IDF 5.5.3） | 通过，0 warning；app 636,800 B，DRAM 静态占用 30.5% |
+| `idf.py merge-bin` | 通过，合并镜像 702,336 B |
+| 协议主机单测（27 项） | 通过；稳态 ADPCM 往返 SNR 32.89 dB |
+| 真机烧录（esptool / 460800） | 通过，hash 校验通过，复位后 app 名 `ai-passport-mic` |
+| 按键 ADC 初始化 | 通过（curve fitting 校准）。曾因 `APM_BTN_ADC_UNIT` 写成 1 命中 `ADC_UNIT_2` 而失败，已修为 0 |
+| 按键手势判定 | **未逐项验证**（未在真机上依次按 UP/DOWN/OK 核对事件） |
+| ES8311 采集出声 | 通过：真机 15 s 连续录音 748 块、0 丢块、长度异常 0 |
+| BLE 连接 / MTU / 通知 | 通过：MTU 247（需求 ≥168），音频/状态/事件三路订阅均建立 |
+| 连接间隔 | 实测由主机决定：macOS 落到 **30 ms**；固件请求常被拒（host 554，疑似与主机自身参数更新冲突），压到 15–20 ms 也被拒 |
+| 端到端延迟 | **未测量**（虚拟声卡输出未实现，只能测到 WAV） |
+
+真机验证顺序见 [`../docs/ROADMAP.md`](../docs/ROADMAP.md) 的 M1，测完再往这张表里填数字。
