@@ -79,15 +79,21 @@ source ./scripts/activate-idf.sh # 只改当前 shell，不写 .zshrc，不替�
 cd device && idf.py --version   # 必须包含 v5.5.3
 ```
 
-## 初始化基线自检
+## 基线自检
 
 ```bash
-./scripts/verify.sh
+./scripts/verify.sh        # 结构 + 文档内链 + 脚本权限 + 协议单测 + 环境快照
+./scripts/test-protocol.sh # 只跑协议单测（CRC / 帧 / ADPCM，不需要 ESP-IDF）
+./scripts/build-firmware.sh # 固件编译 + 合并镜像（要 ESP-IDF，约 1-2 分钟）
 ```
 
-当前阶段（还没有代码）它检查：必需目录与文件、文档内链、脚本可执行位、环境快照。
-落地代码后再往里加 `cargo test` / `idf.py build` / 前端 typecheck，**不要**在没有代码时
-假装这些检查已经通过。
+`verify.sh` 现在检查：必需目录与文件、文档内链、脚本可执行位、**协议单测**、环境快照。
+`idf.py build` 故意不放进 verify（要完整 IDF 环境且耗时），改固件后单独跑
+`build-firmware.sh`，并在交付里如实报告。
+
+`check-env.sh` 和 `build-firmware.sh` 都会在「默认 venv 不存在」时，把
+`IDF_PYTHON_ENV_PATH` 只读地指到磁盘上已有的 `idf5.5_py3.*_env`（对应上面的方案 A），
+并在输出里标注 `venv 回退: ...`。这不会写任何文件；想长期生效仍然要自己 export。
 
 ## 虚拟声卡（PC 端落地时需要）
 
