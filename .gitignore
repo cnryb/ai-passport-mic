@@ -1,0 +1,70 @@
+# =====================================================================
+# AI Passport Mic 仓库级忽略规则
+#   只忽略「本机生成、不该进版本库」的东西。当前仓库是初始化基线，
+#   device/ 与 desktop/ 还没有代码，下面的构建产物规则是为落地后预留的。
+# =====================================================================
+
+# ---- 通用 ----
+.DS_Store
+Thumbs.db
+*.log
+logs/
+*.tmp
+*.part
+# 编辑器备份/交换文件
+*~
+*.swp
+*.swo
+# Office 打开文档时生成的锁文件
+~$*
+# Windows 重定向误建的保留名文件
+nul
+
+# ---- 编辑器 / IDE / AI 会话 ----
+.vscode/
+.idea/
+.workbuddy/
+
+# ---- Rust / Tauri ----
+# 无前导斜杠 = 任意层级的 target/ 都匹配
+target/
+*.rs.bk
+*.pdb
+*.ilk
+*.exp
+
+# ---- 前端 ----
+node_modules/
+desktop/app/dist/
+*.tsbuildinfo
+.pnpm-store/
+npm-debug.log*
+yarn-error.log*
+pnpm-debug.log*
+
+# ---- ESP-IDF ----
+device/build/
+device/sdkconfig
+device/sdkconfig.old
+device/managed_components/
+device/compile_commands.json
+device/*.obj
+device/*.exe
+# 注意：device/dependencies.lock 是要提交的，不要加进来
+
+# ---- Python（tools / tests 脚本）----
+__pycache__/
+*.py[cod]
+*.pyo
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.venv/
+venv/
+
+# ---- 运行时产物 ----
+# 语音模型与离线引擎归档体积大，按需下载，不入库
+*.onnx
+desktop/third_party/
+# 录音样本与测试 WAV 只留在本机；需要长期留存的样本另建 assets 目录并单独说明
+*.wav

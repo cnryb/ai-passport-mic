@@ -1,0 +1,11 @@
+{
+  "schema": "ai-passport-mic-keymap-1",
+  "bindings": {
+    "up.short": { "modifiers": ["ctrl"], "key": "enter" },
+    "up.long": { "modifiers": [], "key": "esc" },
+    "down.short": { "modifiers": [], "key": "esc" },
+    "down.double": { "modifiers": [], "key": "esc", "repeat": 2 },
+    "ok.press": { "modifiers": [], "key": "ptt-start" },
+    "ok.release": { "modifiers": [], "key": "ptt-stop" }
+  }
+}

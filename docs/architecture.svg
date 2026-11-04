@@ -1,0 +1,117 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 680 636" width="680" height="636" role="img" aria-labelledby="title desc">
+  <title id="title">AI Passport Mic 技术架构</title>
+  <desc id="desc">设备端 ESP32-C3 采集音频并编码为 IMA-ADPCM，经 BLE 自定义 GATT 传输到 PC 端，PC 端解码后写入虚拟声卡，供会议软件作为麦克风使用；设备按键事件经 keymap engine 映射为系统快捷键，并旁路保存 WAV 与音质指标。</desc>
+
+  <style>
+    svg { --panel: #F6F7F9; --card: #FFFFFF; --text: #1B1B1B; --sub: #5F5E5A; --border: rgba(0,0,0,0.22); --line: #8F8F8B; }
+    @media (prefers-color-scheme: dark) {
+      svg { --panel: #1C1E22; --card: #26292E; --text: #E9E9E7; --sub: #A5A5A1; --border: rgba(255,255,255,0.24); --line: #9A9A96; }
+    }
+    .th { font: 500 14px "PingFang SC", "Hiragino Sans GB", "Microsoft YaHei", -apple-system, system-ui, sans-serif; fill: var(--text, #1B1B1B); }
+    .ts { font: 400 12px "PingFang SC", "Hiragino Sans GB", "Microsoft YaHei", -apple-system, system-ui, sans-serif; fill: var(--sub, #5F5E5A); }
+    .box { fill: var(--card, #FFFFFF); stroke: var(--border, rgba(0,0,0,0.22)); stroke-width: 0.5; }
+    .panel { fill: var(--panel, #F6F7F9); stroke-width: 0.5; }
+    .edge { fill: none; stroke: var(--line, #8F8F8B); stroke-width: 1; }
+    .main-edge { fill: none; stroke: var(--line, #8F8F8B); stroke-width: 1.5; }
+    .side-edge { fill: none; stroke: var(--line, #8F8F8B); stroke-width: 1; stroke-dasharray: 3 3; }
+  </style>
+
+  <defs>
+    <marker id="arrow" viewBox="0 0 10 10" refX="8" refY="5" markerWidth="6" markerHeight="6" orient="auto-start-reverse">
+      <path d="M2 1L8 5L2 9" fill="none" stroke="context-stroke" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"/>
+    </marker>
+  </defs>
+
+  <rect x="40" y="24" width="600" height="180" rx="16" class="panel" stroke="#378ADD"/>
+  <circle cx="62" cy="46" r="3.5" fill="#378ADD"/>
+  <text class="th" x="74" y="46" dominant-baseline="central">设备端 · AI Passport（ESP32-C3）</text>
+  <text class="ts" x="620" y="46" text-anchor="end" dominant-baseline="central">固件未实现</text>
+
+  <rect x="60" y="64" width="122" height="48" rx="8" class="box"/>
+  <text class="th" x="121" y="82" text-anchor="middle" dominant-baseline="central">ES8311</text>
+  <text class="ts" x="121" y="99" text-anchor="middle" dominant-baseline="central">麦克风 16 kHz</text>
+
+  <rect x="206" y="64" width="122" height="48" rx="8" class="box"/>
+  <text class="th" x="267" y="82" text-anchor="middle" dominant-baseline="central">PCM 采集</text>
+  <text class="ts" x="267" y="99" text-anchor="middle" dominant-baseline="central">20 ms 一块</text>
+
+  <rect x="352" y="64" width="122" height="48" rx="8" class="box"/>
+  <text class="th" x="413" y="82" text-anchor="middle" dominant-baseline="central">IMA-ADPCM</text>
+  <text class="ts" x="413" y="99" text-anchor="middle" dominant-baseline="central">165 B / 块</text>
+
+  <rect x="498" y="64" width="122" height="48" rx="8" class="box"/>
+  <text class="th" x="559" y="82" text-anchor="middle" dominant-baseline="central">BLE 通知</text>
+  <text class="ts" x="559" y="99" text-anchor="middle" dominant-baseline="central">AUDIO 7a05</text>
+
+  <rect x="60" y="128" width="170" height="48" rx="8" class="box" stroke-dasharray="4 3"/>
+  <text class="th" x="145" y="146" text-anchor="middle" dominant-baseline="central">UP · DOWN · OK</text>
+  <text class="ts" x="145" y="163" text-anchor="middle" dominant-baseline="central">短按 双击 长按</text>
+
+  <rect x="255" y="128" width="170" height="48" rx="8" class="box" stroke-dasharray="4 3"/>
+  <text class="th" x="340" y="146" text-anchor="middle" dominant-baseline="central">事件队列</text>
+  <text class="ts" x="340" y="163" text-anchor="middle" dominant-baseline="central">按下 / 抬起 配对</text>
+
+  <rect x="450" y="128" width="170" height="48" rx="8" class="box" stroke-dasharray="4 3"/>
+  <text class="th" x="535" y="146" text-anchor="middle" dominant-baseline="central">HID + EVENT</text>
+  <text class="ts" x="535" y="163" text-anchor="middle" dominant-baseline="central">键盘注入 · 7a04</text>
+
+  <path class="edge" d="M182 88H206" marker-end="url(#arrow)"/>
+  <path class="edge" d="M328 88H352" marker-end="url(#arrow)"/>
+  <path class="edge" d="M474 88H498" marker-end="url(#arrow)"/>
+  <path class="edge" d="M230 152H255" marker-end="url(#arrow)"/>
+  <path class="edge" d="M425 152H450" marker-end="url(#arrow)"/>
+
+  <path class="main-edge" d="M340 204V240" marker-end="url(#arrow)"/>
+
+  <rect x="40" y="240" width="600" height="48" rx="12" class="panel" stroke="#BA7517"/>
+  <text class="ts" x="340" y="264" text-anchor="middle" dominant-baseline="central">BLE 自定义 GATT · 音频 7a05 · 事件 7a04 · 20 ms 块 / 约 66 kbps</text>
+
+  <path class="main-edge" d="M340 288V328" marker-end="url(#arrow)"/>
+
+  <rect x="40" y="328" width="600" height="200" rx="16" class="panel" stroke="#1D9E75"/>
+  <circle cx="62" cy="352" r="3.5" fill="#1D9E75"/>
+  <text class="th" x="74" y="352" dominant-baseline="central">PC 端 · Rust workspace + Tauri 2</text>
+  <text class="ts" x="620" y="352" text-anchor="end" dominant-baseline="central">模块待实现</text>
+
+  <rect x="60" y="368" width="122" height="48" rx="8" class="box"/>
+  <text class="th" x="121" y="386" text-anchor="middle" dominant-baseline="central">link</text>
+  <text class="ts" x="121" y="403" text-anchor="middle" dominant-baseline="central">连接 · 订阅</text>
+
+  <rect x="206" y="368" width="122" height="48" rx="8" class="box"/>
+  <text class="th" x="267" y="386" text-anchor="middle" dominant-baseline="central">protocol</text>
+  <text class="ts" x="267" y="403" text-anchor="middle" dominant-baseline="central">帧校验 · 解码</text>
+
+  <rect x="352" y="368" width="122" height="48" rx="8" class="box"/>
+  <text class="th" x="413" y="386" text-anchor="middle" dominant-baseline="central">抖动缓冲</text>
+  <text class="ts" x="413" y="403" text-anchor="middle" dominant-baseline="central">40–80 ms</text>
+
+  <rect x="498" y="368" width="122" height="48" rx="8" class="box"/>
+  <text class="th" x="559" y="386" text-anchor="middle" dominant-baseline="central">声卡写入</text>
+  <text class="ts" x="559" y="403" text-anchor="middle" dominant-baseline="central">PCM 连续输出</text>
+
+  <rect x="60" y="444" width="170" height="48" rx="8" class="box" stroke-dasharray="4 3"/>
+  <text class="th" x="145" y="462" text-anchor="middle" dominant-baseline="central">keymap engine</text>
+  <text class="ts" x="145" y="479" text-anchor="middle" dominant-baseline="central">事件 → 快捷键</text>
+
+  <rect x="255" y="444" width="170" height="48" rx="8" class="box" stroke-dasharray="4 3"/>
+  <text class="th" x="340" y="462" text-anchor="middle" dominant-baseline="central">OS 快捷键注入</text>
+  <text class="ts" x="340" y="479" text-anchor="middle" dominant-baseline="central">修饰键必释放</text>
+
+  <rect x="450" y="444" width="170" height="48" rx="8" class="box" stroke-dasharray="4 3"/>
+  <text class="th" x="535" y="462" text-anchor="middle" dominant-baseline="central">WAV + 音质</text>
+  <text class="ts" x="535" y="479" text-anchor="middle" dominant-baseline="central">丢块 · RMS · 削波</text>
+
+  <path class="edge" d="M182 392H206" marker-end="url(#arrow)"/>
+  <path class="edge" d="M328 392H352" marker-end="url(#arrow)"/>
+  <path class="edge" d="M474 392H498" marker-end="url(#arrow)"/>
+  <path class="edge" d="M230 468H255" marker-end="url(#arrow)"/>
+  <path class="side-edge" d="M121 416V444" marker-end="url(#arrow)"/>
+  <path class="side-edge" d="M413 416V430H535V444" marker-end="url(#arrow)"/>
+
+  <path class="main-edge" d="M340 528V568" marker-end="url(#arrow)"/>
+
+  <rect x="40" y="568" width="600" height="48" rx="12" class="panel" stroke="#888780" stroke-dasharray="5 4"/>
+  <text class="th" x="340" y="584" text-anchor="middle" dominant-baseline="central">会议 / 录音 / 直播软件</text>
+  <text class="ts" x="340" y="601" text-anchor="middle" dominant-baseline="central">Zoom · Meet · OBS 选择虚拟声卡作为麦克风</text>
+</svg>
