@@ -40,6 +40,24 @@ else
   #
   # 注意：venv 缺失时 export.sh **仍然返回 0**，只是打印错误不设 PATH。所以判据
   # 不能只看退出码，必须再确认 idf.py 真的进了 PATH。
+  #
+  # 若默认 venv（idf5.5_py3.<当前小版本>_env）不存在，先做一次**只读**回退：把
+  # IDF_PYTHON_ENV_PATH 指到磁盘上已有的 venv（docs/ENVIRONMENT.md 方案 A）。
+  # 不写任何文件。不这么做的话，体检只会报 FAIL，让人误以为固件完全不能编。
+  venv_note=""
+  if [[ -z "${IDF_PYTHON_ENV_PATH:-}" ]]; then
+    py_minor="$(python3 -c 'import sys; print(sys.version_info.minor)' 2>/dev/null || true)"
+    default_venv="$HOME/.espressif/python_env/idf5.5_py3${py_minor:+.$py_minor}_env"
+    if [[ ! -d "$default_venv" ]]; then
+      fallback_venv="$(ls -d "$HOME"/.espressif/python_env/idf5.5_py3.*_env 2>/dev/null | head -1 || true)"
+      if [[ -n "$fallback_venv" ]]; then
+        export IDF_PYTHON_ENV_PATH="$fallback_venv"
+        venv_note=" (venv 回退: $(basename "$fallback_venv"))"
+      fi
+    fi
+    unset py_minor default_venv fallback_venv
+  fi
+
   set +u
   idf_log="${TMPDIR:-/tmp}/ai-passport-mic-idf-export.log"
   # shellcheck disable=SC1091
@@ -59,7 +77,7 @@ else
   else
     idf_version="$(idf.py --version 2>/dev/null || true)"
     if [[ "$idf_version" == *"v5.5.3"* ]]; then
-      printf 'OK   %-14s %s\n' "ESP-IDF" "$idf_version"
+      printf 'OK   %-14s %s%s\n' "ESP-IDF" "$idf_version" "$venv_note"
     else
       printf 'FAIL %-14s expected v5.5.3, got %s\n' "ESP-IDF" "${idf_version:-unknown}"
       fail=1
