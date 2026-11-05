@@ -182,7 +182,7 @@ printf 'Desktop   : %s\n' "$status_desktop"
 printf 'Env       : %s\n' "$status_env"
 printf 'Firmware  : SKIP（idf.py build 不在本脚本内，改固件后跑 ./scripts/build-firmware.sh）\n'
 printf 'GUI build : SKIP（tauri 依赖重，单独跑 ./scripts/build-gui.sh）\n'
-printf 'Unverified: 按键手势逐项核对、链路 RTT（烧新固件后可用 apmctl ping 测）、端到端声学延迟；GUI 首次蓝牙授权与扫描（需人工点授权）\n'
+printf 'Unverified: 按键手势逐项核对、端到端声学延迟、G2 的"0 欠载"（10 min 实测 10 次欠载，KI-006）、GUI 真机验收（G1 断连、G3 对拍）；GUI 扫描的自动路径见 GUI.md §14.5\n'
 printf 'Known issues: docs/KNOWN_ISSUES.md（KI-001 毛刺根因未定位，不要写成已解决）\n'
 
 if (( failed )); then
@@ -195,5 +195,5 @@ if [[ "$status_env" == FAIL ]]; then
   echo "基线自检通过（结构/文档/脚本/协议/向量/桌面端）；环境未就绪，固件编译暂不可用。"
 else
   echo "基线自检通过（结构/文档/脚本/协议/向量/桌面端/环境）。"
-  echo "固件编译请跑 ./scripts/build-firmware.sh；GUI 构建请跑 ./scripts/build-gui.sh；虚拟声卡输出已实现，按键手势、链路 RTT 与端到端声学延迟未验证。"
+  echo "固件编译请跑 ./scripts/build-firmware.sh；GUI 构建请跑 ./scripts/build-gui.sh；虚拟声卡输出与链路 RTT 已真机验证，按键手势与端到端声学延迟未验证。"
 fi

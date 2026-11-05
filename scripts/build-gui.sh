@@ -26,7 +26,14 @@ echo
 # 变量后面紧跟中文全角括号时，某些 locale 下 bash 会把括号字节当成变量名的一部分，
 # 报 "profile: unbound variable"。一律用 ${} 包起来。
 echo "== Tauri 打包: ${profile} =="
-( cd "$gui" && ./frontend/node_modules/.bin/tauri build "$profile" --bundles app ) || {
+# Tauri 2 里 release 是默认行为，没有 --release 这个 flag（传了会被当成位置参数报错）；
+# 只有 --debug 可选。所以这里按 profile 决定要不要加 -d，不能把 profile 原样传进去。
+if [[ "$profile" == "--release" ]]; then
+  tauri_args=(--bundles app)
+else
+  tauri_args=(--debug --bundles app)
+fi
+( cd "$gui" && ./frontend/node_modules/.bin/tauri build "${tauri_args[@]}" ) || {
   echo "打包失败，看上面的 cargo 输出"
   exit 1
 }
