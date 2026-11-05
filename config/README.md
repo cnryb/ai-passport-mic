@@ -1,15 +1,19 @@
 # 按键映射配置
 
-`button-map.example.json` 是**可执行样例**（第一版还没有代码消费它，但字段已经定死，
-实现时按这份说明来，不要静默改名）。
+`button-map.example.json` 是**可执行样例**，由 `apm-protocol` 的单测直接 `include_str!` 吃进去
+（`example_file_parses`），所以它坏掉会当场红。字段已经定死，实现时按这份说明来，不要静默改名。
 
 ```json
 {
-  "schema": "ai-passport-mic-keymap-1",
+  "schema": "ai-passport-mic-keymap-4",
   "bindings": {
-    "up.short":    { "modifiers": ["ctrl"], "key": "enter" },
-    "ok.press":    { "modifiers": [],       "key": "ptt-start" },
-    "ok.release":  { "modifiers": [],       "key": "ptt-stop" }
+    "up":   { "modifiers": ["ctrl"], "key": "enter" },
+    "down": { "modifiers": [],       "key": "esc", "repeat": 2 },
+    "ok":   { "modifiers": [],       "key": "ptt-toggle" }
+  },
+  "hooks": {
+    "capture.start": { "modifiers": [], "key": "f5" },
+    "capture.stop":  { "modifiers": [], "key": "f6" }
   }
 }
 ```
@@ -18,33 +22,94 @@
 
 | 字段 | 类型 | 说明 |
 | --- | --- | --- |
-| `schema` | string | 固定 `ai-passport-mic-keymap-1`。版本号变了就要写迁移说明 |
+| `schema` | string | 固定 `ai-passport-mic-keymap-4`。版本号变了就要写迁移说明（见下） |
 | `bindings` | object | 键是**事件名**，值是动作对象；未出现的事件使用默认值 |
 | `bindings.*.modifiers` | string[] | `ctrl` / `shift` / `alt` / `win`（macOS 上 `win` 即 Command），空数组表示无修饰键 |
-| `bindings.*.key` | string | 目标键名（小写，如 `enter` / `esc` / `a` / `f5`），或保留动作 `ptt-start` / `ptt-stop` |
-| `bindings.*.repeat` | number | 可选，目标键**连发次数**，缺省 1，上限 4。例：`down.double` + `repeat: 2` = 双击时连发两记 Esc |
+| `bindings.*.key` | string | 目标键名（小写，如 `enter` / `esc` / `a` / `f5`），或保留动作 `ptt-toggle`；修饰键本身也能作为目标键：`lalt` / `ralt`（见下） |
+| `bindings.*.repeat` | number | 可选，目标键**连发次数**，缺省 1，上限 4。例：`down` + `repeat: 2` = 按一次发两记 Esc |
 
-## 事件名
+### 修饰键作为目标键（`lalt` / `ralt`）
 
-`up` / `down` / `ok` × `short`（短按）/ `double`（双击）/ `long`（长按）/ `press`（按下）/
-`release`（抬起）。例如 `up.short`、`ok.press`、`ok.release`。
+有些软件的热键是**单按右 Alt**（不与任何键组合），这时把修饰键本身当目标键：
 
-两件事要分清：**事件名描述手势**（`double` = 用户双击了一次），**`repeat` 描述动作**
-（把这个键连发几次）。不要用 `count` 之类的名字表达手势次数——那会和事件名重复，
-产生 "double + count:3" 这种说不清的组合。要支持三连击就新增事件名 `triple`，
-并同步升级 `schema` 版本。
+- `lalt` = 左 Alt / 左 Option（macOS 键码 58）；`ralt` = 右 Alt / 右 Option（macOS 键码 61）；
+- 注入是**点按**（按下 + 弹起），与普通键一致；`modifiers` 里依然只能填 `alt` 这个组合
+  修饰键，左右语义只在目标键 `lalt` / `ralt` 上体现；
+- 仅 macOS 注入层实现（CGEvent）；Windows 侧 SendInput 未实现时同样报"平台未实现"。
+
+## 事件名（按键）
+
+**一个键一个动作，共 3 个事件**：`up`、`down`、`ok`。没有点号、没有手势维度。
+
+版本演进（每一步都是"更少、更好记"）：
+
+| 版本 | 事件数 | 形态 |
+| --- | --- | --- |
+| v1 | 15 | 3 键 × 短按/双击/长按/按下/抬起 |
+| v2 | 6 | 3 键 × 按下/抬起 |
+| v3 | 3 | 3 键，每键一个动作 |
+| **v4（当前）** | 3 + 2 钩子 | 在 v3 上加**采集状态钩子**：开麦/关麦时自动注入快捷键 |
+
+v3 的语义：**按一次 = 一次动作**。OK 键因此从"按住说话、松手停"变成
+**"按一下开、再按一下关"**（`ptt-toggle`）。三个键、三个动作，用户不用记任何手势。
+
+代价要说清楚：**toggle 没有"松手自动停"**。开着麦克风去接杯水，回来还在采。
+所以 M3 的注入层必须补两件事：① 界面上一直能看到"正在采集"；② 一个超时兜底
+（比如连续采集 10 分钟自动关），否则忘记关麦是必然会发生的事。
+
+`repeat` 仍然保留：它描述**动作**（把这个键连发几次），不是手势。
+
+## 采集钩子（`hooks`）
+
+按键管的是"这个键被按下时做什么"；**钩子**管的是"开始/停止采集的那一刻做什么"。
+两者是不同维度的东西，所以分开存放（按键在 `bindings`，钩子在 `hooks`）：
+
+| 钩子 | 触发时机 |
+| --- | --- |
+| `capture.start` | 采集真正起来之后（`start_stream` 成功） |
+| `capture.stop` | 停止采集时——包括手动停止**和链路断开导致的自动停止** |
+
+规则：
+
+- 动作是**点按**（按下 + 弹起），不是按住不放；
+- 未配置 = 不动作，这是默认；
+- **钩子里禁止 `ptt-toggle`**：开麦的瞬间再 toggle 一次，等于自己把自己关掉；
+- 注入需要**辅助功能权限**（系统设置 → 隐私与安全性 → 辅助功能）。没权限时系统会
+  **静默丢弃**注入的按键，应用会把它记成一条 warn 日志，不会让开麦失败。
+
+## 迁移：v1 / v2 / v3 → v4
+
+| 旧写法 | v3 处理 |
+| --- | --- |
+| `up.press` / `down.press` / `ok.press` | 变成 `up` / `down` / `ok` |
+| `up.release` 等抬起绑定 | **按下优先**：同键已有 `press` 就丢弃；只有 `release` 时退而取抬起 |
+| `*.short` / `*.double` / `*.long`（仅 v1） | 直接丢弃 |
+| `ptt-start` / `ptt-stop` | 统一改写成 `ptt-toggle` |
+| v3 → v4 | 纯增量：`hooks` 缺省为空，其余一字不动 |
+
+读旧文件不报错是有意的：用户上次存的映射里有 `up.press`，若整份拒绝，界面会回退到默认值，
+等于把用户的配置无声清空。迁移后一旦保存/导出，落盘就是 v3。
 
 ## 硬约束
 
-1. **`ok.press` / `ok.release` 是 PTT 开关**，默认必须保留。若允许用户改写，必须同时提供
-   一个可靠的"停止采集"通道，否则会出现麦克风停不下来的情况。
+1. **`ok` 必须是 `ptt-toggle`**：它是麦克风唯一的开关，改掉就没有停止采集的办法。
+   钩子里出现 `ptt-toggle` 会被整份拒绝（同一个道理，触发时机不同）。
 2. 注入快捷键时，无论成功或异常，都要释放所有按下的修饰键（Ctrl/Shift/Alt/Win）。
-3. 双击窗口按 **180 ms** 处理（第二下按下落在第一下抬起后的窗口内）；窗口内不再补发单击。
-4. 导入时的校验顺序：`schema` 版本 → 事件名合法 → 键名/修饰键在支持列表内 → PTT 约束。
+3. 导入时的校验顺序：`schema` 版本 → 事件名合法 → 键名/修饰键在支持列表内 → PTT 约束。
    任一步失败整份拒绝，不做"部分生效"。
-5. 导出只写当前生效的绑定，不写注释与未知字段，保证 round-trip 稳定。
+4. 导出只写当前生效的绑定，不写注释与未知字段，保证 round-trip 稳定。
+5. v3 的 `schema` 下出现 `up.press` / `up.release` / `*.short` 一律**报错**（那是旧版写法）。
+   只有 `schema` 本身是 v1/v2 时才走迁移。
 
 ## 与固件的关系
 
-按键的**物理判定**（消抖、双击窗口、长按阈值）在固件；**映射到哪个键**在 PC 端。
-两边都要能独立测试，联调时用固定的按键事件序列做回归。
+按键的**物理判定**（消抖、按下/抬起）在固件；**映射到哪个键**在 PC 端。
+
+固件仍然会为每个键上报 **5 种手势码**（按下 / 抬起 / 短按 / 双击 / 长按，见
+`docs/ARCHITECTURE.md` 的 EVENT 帧），这是**跨端协议，v3 没有改它**——改协议要动帧格式、
+UUID 与共享向量，收益只是省几帧通知，不值得。PC 端只消费 `PRESS`（按下那一瞬），
+`RELEASE` / `CLICK` / `DOUBLE` / `LONG` 全部忽略。
+
+注意一个副作用：**双击会触发两次 PRESS**。PC 端在 PTT 切换窗口（约几百毫秒）内有
+防抖，窗口内的双击只算一次动作；窗口外的双击仍是一次正常的开+关。三键方案的语义
+代价还在——真需要双击时再单独加事件，别指望 toggle 兼容它。

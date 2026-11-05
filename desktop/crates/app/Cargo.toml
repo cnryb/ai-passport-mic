@@ -10,7 +10,15 @@ license.workspace = true
 [dependencies]
 apm-protocol = { workspace = true }
 apm-link = { workspace = true }
+# 推流编排（G2）在这层做：声卡对象 !Send，只能在 session 模块自己的线程里活。
+apm-sink = { workspace = true }
 anyhow = "1"
 serde = { workspace = true }
 serde_json = { workspace = true }
 tokio = { version = "1", features = ["rt-multi-thread", "time", "sync"] }
+
+# 按键注入（M3）只在 macOS 上实现，其他平台由 inject.rs 里的空实现兜住。
+[target.'cfg(target_os = "macos")'.dependencies]
+core-graphics = "0.25"
+# 权限引导要用 AXIsProcessTrustedWithOptions，构造 options 字典需要 CF 类型。
+core-foundation = "0.10"

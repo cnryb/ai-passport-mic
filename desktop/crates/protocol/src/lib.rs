@@ -32,3 +32,8 @@ pub const PROFILE_UUID: &str = "a7c52e00-31d4-4d2a-8f6b-5e9c1b3f7a02";
 pub const STATUS_UUID: &str = "a7c52e00-31d4-4d2a-8f6b-5e9c1b3f7a03";
 pub const EVENT_UUID: &str = "a7c52e00-31d4-4d2a-8f6b-5e9c1b3f7a04";
 pub const AUDIO_UUID: &str = "a7c52e00-31d4-4d2a-8f6b-5e9c1b3f7a05";
+
+/// 标准 Battery Service（`docs/ARCHITECTURE.md` BLE 服务一节）。
+/// 固件不存在该服务时（旧固件）电量功能静默降级，不影响其余链路。
+pub const BATTERY_SERVICE_UUID: &str = "0000180f-0000-1000-8000-00805f9b34fb";
+pub const BATTERY_LEVEL_UUID: &str = "00002a19-0000-1000-8000-00805f9b34fb";

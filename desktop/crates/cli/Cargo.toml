@@ -13,6 +13,8 @@ path = "src/main.rs"
 apm-protocol = { workspace = true }
 apm-link = { workspace = true }
 apm-sink = { workspace = true }
+# 编排（采集/解码/丢块/声卡/指标）全在 apm-app：CLI 只解析参数与打印。
+apm-app = { workspace = true }
 anyhow = "1"
 libc = "0.2"
 clap = { version = "4", features = ["derive"] }

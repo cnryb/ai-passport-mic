@@ -127,7 +127,9 @@ impl Playout {
             / consumed as f64
     }
 
-    fn set_target_ms(&mut self, ms: u32) {
+    /// 运行期改抖动缓冲目标（GUI 的缓冲滑块）。取下一批回调生效，
+    /// 不重建流、不断音。
+    pub fn set_target_ms(&mut self, ms: u32) {
         self.target_ms = ms.clamp(TARGET_MIN_MS, TARGET_MAX_MS);
         self.target_frames = self.rate as usize * self.target_ms as usize / 1000;
     }
@@ -270,10 +272,8 @@ mod tests {
             p.push(&vec![100i16; n as usize]);
 
             p.fill(&mut out);
-            if i * callback >= warm {
-                if p.stats().underruns > underruns_after_warm {
-                    underruns_after_warm = p.stats().underruns;
-                }
+            if i * callback >= warm && p.stats().underruns > underruns_after_warm {
+                underruns_after_warm = p.stats().underruns;
             }
             max_fill = max_fill.max(p.fill_ms());
         }

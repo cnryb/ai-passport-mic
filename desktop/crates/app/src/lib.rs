@@ -5,9 +5,19 @@
 
 pub mod core;
 pub mod events;
+pub mod inject;
+pub mod keymap_store;
 pub mod log;
+pub mod pipeline;
+pub mod report;
+pub mod session;
+pub mod settings;
 pub mod state;
 
-pub use core::{AppCore, AppSnapshot};
+pub use core::{AppCore, AppSnapshot, SessionRecord, SinkView};
 pub use events::{AppEvent, LogEntry, LogLevel};
+pub use pipeline::Pipeline;
+pub use report::{QualityReport, ReportCheck};
+pub use session::{SessionOptions, SessionSummary, Telemetry};
+pub use settings::Settings;
 pub use state::{AppError, AppState, DeviceView, ErrorCode};

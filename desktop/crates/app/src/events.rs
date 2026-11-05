@@ -1,8 +1,10 @@
 //! 跨 IPC 的事件与日志条目。
 //!
-//! 事件是"边沿"：只在状态变化、设备列表变化、产生日志时发一次。逐块的音频与
-//! 指标不走这里（G2 的 `telemetry` 按 5 Hz 合批，见 `docs/GUI.md` §3）。
+//! 事件是"边沿"：状态变化、设备列表变化、产生日志时发一次。
+//! 逐块音频**不进**事件通道（160 B × 50/s 喂 webview 没有意义，且必然引入抖动）：
+//! `telemetry` 按 5 Hz 合批，前端只拿数字（`docs/GUI.md` §3 的 D2 / D3）。
 
+use crate::session::{SessionSummary, Telemetry};
 use crate::state::{AppState, DeviceView};
 use serde::Serialize;
 
@@ -48,5 +50,17 @@ pub enum AppEvent {
     },
     EventLog {
         entry: LogEntry,
+    },
+    /// 5 Hz。前端拿到就覆盖，不做累加 —— 否则丢一个事件就永久偏了。
+    Telemetry {
+        telemetry: Telemetry,
+    },
+    SessionDone {
+        summary: SessionSummary,
+    },
+    /// 设备电量百分比（0..100）。只在数值变化或连接后首次读到时发一次，
+    /// 不是心跳。电量计不可用时不发。
+    Battery {
+        pct: u8,
     },
 }

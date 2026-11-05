@@ -102,6 +102,8 @@ pub enum ErrorCode {
     SinkMissing,
     SinkRateUnsupported,
     ProtocolMismatch,
+    /// 按键映射里出现了不支持的键名/修饰键/事件名，或 PTT 停止通道缺失。
+    KeymapInvalid,
     Busy,
     Internal,
 }
@@ -118,6 +120,7 @@ impl ErrorCode {
             Self::SinkMissing => "选定的虚拟声卡不见了，点「重新枚举」或检查 BlackHole 是否已加载",
             Self::SinkRateUnsupported => "该声卡不支持 16 kHz，请换一个原生支持 16 kHz 的输出",
             Self::ProtocolMismatch => "固件与桌面端版本不一致，重新烧录同一版本",
+            Self::KeymapInvalid => "键名或修饰键不在支持列表内；PTT 的停止通道不能删（见 config/README.md）",
             Self::Busy => "当前状态下不能这么做，先停止正在进行的操作",
             Self::Internal => "查看诊断日志；这属于未预期错误",
         }
@@ -145,6 +148,10 @@ impl AppError {
 
     pub fn busy(detail: impl Into<String>) -> Self {
         Self::new(ErrorCode::Busy, detail)
+    }
+
+    pub fn keymap_invalid(detail: impl Into<String>) -> Self {
+        Self::new(ErrorCode::KeymapInvalid, detail)
     }
 }
 
@@ -259,6 +266,7 @@ mod tests {
             ErrorCode::SinkMissing,
             ErrorCode::SinkRateUnsupported,
             ErrorCode::ProtocolMismatch,
+            ErrorCode::KeymapInvalid,
             ErrorCode::Busy,
             ErrorCode::Internal,
         ] {

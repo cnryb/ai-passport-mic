@@ -23,6 +23,8 @@ pub mod msg {
     pub const PING: u8 = 0x04;
     pub const STATUS: u8 = 0x81;
     pub const EVENT: u8 = 0x82;
+    /// EVENT 载荷里的手势码：按下。PC 端映射只消费这一种（`docs/ARCHITECTURE.md`）。
+    pub const EVENT_PRESS: u8 = 0;
     pub const PONG: u8 = 0x83;
 
     pub fn name(t: u8) -> &'static str {

@@ -86,12 +86,10 @@ impl Suppressor {
                 self.prev_sign = 0;
             }
 
-            if !self.muting {
-                if self.run >= MIN_RUN {
-                    self.muting = true;
-                    self.events += 1;
-                    self.calm = 0;
-                }
+            if !self.muting && self.run >= MIN_RUN {
+                self.muting = true;
+                self.events += 1;
+                self.calm = 0;
             }
 
             if self.muting {

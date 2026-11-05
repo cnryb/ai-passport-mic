@@ -38,6 +38,57 @@ pub fn output_devices() -> Result<Vec<String>> {
     Ok(devices.filter_map(|d| d.name().ok()).collect())
 }
 
+/// 一个输出设备的能力摘要，供 GUI 的声卡下拉框判断"这个能不能用"。
+///
+/// `uid` 目前等于名字：cpal 0.15 没有 `Device::id()`，macOS 上设备名已经唯一。
+/// 留这个字段是为了以后换 cpal 0.16 或上 WASAPI 时不用改前端契约
+/// （`docs/GUI.md` §8 提到 Windows 要按 UID 匹配）。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SinkInfo {
+    pub name: String,
+    pub uid: String,
+    /// 报告的最大声道数；读不到配置时为 0。
+    pub channels: u16,
+    pub min_rate: u32,
+    pub max_rate: u32,
+    /// 是否原生支持 16 kHz。不支持时界面要提前拦住，而不是等 `open` 才报错。
+    pub supports_16k: bool,
+}
+
+/// 枚举输出设备。读不到配置的设备（如被独占）跳过而不是让整次枚举失败。
+pub fn list_sinks() -> Result<Vec<SinkInfo>> {
+    let host = cpal::default_host();
+    let devices = host.output_devices().context("枚举输出设备失败")?;
+    let mut out = Vec::new();
+    for device in devices {
+        let Ok(name) = device.name() else { continue };
+        let mut channels = 0u16;
+        let mut min_rate = u32::MAX;
+        let mut max_rate = 0u32;
+        let mut supports_16k = false;
+        if let Ok(configs) = device.supported_output_configs() {
+            for range in configs {
+                channels = channels.max(range.channels());
+                min_rate = min_rate.min(range.min_sample_rate().0);
+                max_rate = max_rate.max(range.max_sample_rate().0);
+                if (range.min_sample_rate().0..=range.max_sample_rate().0).contains(&16_000) {
+                    supports_16k = true;
+                }
+            }
+        }
+        out.push(SinkInfo {
+            uid: name.clone(),
+            name,
+            channels,
+            min_rate: if min_rate == u32::MAX { 0 } else { min_rate },
+            max_rate,
+            supports_16k,
+        });
+    }
+    out.sort_by_key(|s| s.name.to_lowercase());
+    Ok(out)
+}
+
 impl Sink {
     /// 按设备名子串打开输出，固定 `rate` 采样率。
     ///
@@ -192,6 +243,14 @@ impl Sink {
             .lock()
             .map(|p| p.target_ms())
             .unwrap_or(self.target_ms)
+    }
+
+    /// 运行期改缓冲目标（40–80 ms）。超出范围夹住，不报错 ——
+    /// 滑块本来就只会给合法值，这里夹一下是防止未来别的调用方写坏。
+    pub fn retarget(&mut self, ms: u32) {
+        if let Ok(mut p) = self.playout.lock() {
+            p.set_target_ms(ms);
+        }
     }
 }
 

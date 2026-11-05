@@ -38,6 +38,11 @@ enum Command {
         #[arg(long, default_value_t = 10)]
         timeout: u64,
     },
+    /// 连接并读一次电量（BLE Battery Service）；旧固件会明确提示不可用
+    Battery {
+        #[arg(long)]
+        device: Option<String>,
+    },
     /// 录音到 WAV（16 kHz / 16-bit / mono）
     Record {
         /// 输出文件
@@ -131,6 +136,7 @@ fn main() -> anyhow::Result<()> {
                     Command::Status { device, timeout } => {
                         cmd::status(device.as_deref(), timeout).await
                     }
+                    Command::Battery { device } => cmd::battery(device.as_deref()).await,
                     Command::Record { file, seconds, device } => {
                         cmd::record(&file, seconds, device.as_deref()).await
                     }

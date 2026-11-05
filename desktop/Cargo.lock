@@ -126,6 +126,9 @@ dependencies = [
  "anyhow",
  "apm-link",
  "apm-protocol",
+ "apm-sink",
+ "core-foundation",
+ "core-graphics",
  "serde",
  "serde_json",
  "tokio",
@@ -176,6 +179,7 @@ name = "apmctl"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "apm-app",
  "apm-link",
  "apm-protocol",
  "apm-sink",

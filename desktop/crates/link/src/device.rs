@@ -3,16 +3,16 @@
 
 use anyhow::{anyhow, Context, Result};
 use apm_protocol::frame::{self, msg, Event, Status};
-use apm_protocol::{
-    AUDIO_UUID, CTRL_UUID, EVENT_UUID, PROFILE_UUID, SERVICE_UUID, STATUS_UUID,
-};
+use apm_protocol::{AUDIO_UUID, BATTERY_LEVEL_UUID, CTRL_UUID, EVENT_UUID, PROFILE_UUID, SERVICE_UUID, STATUS_UUID};
 use btleplug::api::{
     Central, Characteristic, Manager as _, Peripheral as _, ScanFilter, ValueNotification, WriteType,
 };
 use btleplug::platform::{Adapter, Manager, Peripheral};
 use futures::stream::StreamExt;
 use std::pin::Pin;
+use std::sync::Arc;
 use std::time::Duration;
+use tokio::sync::Mutex as AsyncMutex;
 use uuid::Uuid;
 
 type NotificationStream = Pin<Box<dyn futures::Stream<Item = ValueNotification> + Send>>;
@@ -43,8 +43,19 @@ pub enum Notification {
     Event(Event),
     /// PONG 回显的 seq。PONG 与 EVENT 共用特征值，靠 `frame.msg` 区分。
     Pong(u32),
+    /// 标准 Battery Service（0x2A19）的电量百分比。旧固件没有该服务时不出现。
+    Battery(u8),
 }
 
+/// 连上之后的链路。
+///
+/// **`Link` 是 `Clone + Send + Sync`**，可以随意 clone 后移进任何 future。
+/// 这点是有代价换来的：通知流本身是 `Pin<Box<dyn Stream + Send>>`（`Send` 但不
+/// `Sync`），直接放在结构体里会让 `Link: !Sync`，于是 `&Link` 不是 `Send`，
+/// `&self` 上的 async 方法就没法在要求 Send 的地方 await（Tauri 命令、`tokio::spawn`）。
+/// 因此通知流装进 `Arc<AsyncMutex<…>>`：`Mutex<T>: Sync` 只要 `T: Send`，
+/// 这一层包装就把 `Link` 拉回 `Send + Sync`，同时 clone 之间仍共享同一条流。
+#[derive(Clone)]
 pub struct Link {
     peripheral: Peripheral,
     ctrl: Characteristic,
@@ -53,7 +64,10 @@ pub struct Link {
     status: Characteristic,
     audio: Characteristic,
     event: Characteristic,
-    notifications: NotificationStream,
+    /// 标准 Battery Level（0x2A19）。旧固件没有这个服务时为 `None`，
+    /// 电量读数与通知都静默降级。
+    battery: Option<Characteristic>,
+    notifications: Arc<AsyncMutex<NotificationStream>>,
 }
 
 async fn default_adapter() -> Result<Adapter> {
@@ -176,10 +190,18 @@ pub async fn scan(timeout: Duration) -> Result<Vec<DeviceInfo>> {
     Ok(found)
 }
 
-fn pick_chars(
-    chars: &std::collections::BTreeSet<Characteristic>,
-) -> Result<(Characteristic, Option<Characteristic>, Characteristic, Characteristic, Characteristic)>
-{
+/// `pick_chars` 的返回：CTRL / PROFILE / STATUS / AUDIO / EVENT / Battery（均按
+/// `connect` 里解构的顺序）。PROFILE 与 Battery 可缺省，其余缺了就连不上。
+type PickedChars = (
+    Characteristic,
+    Option<Characteristic>,
+    Characteristic,
+    Characteristic,
+    Characteristic,
+    Option<Characteristic>,
+);
+
+fn pick_chars(chars: &std::collections::BTreeSet<Characteristic>) -> Result<PickedChars> {
     let find = |text: &str| -> Option<Characteristic> {
         let target = uuid(text);
         chars.iter().find(|c| c.uuid == target).cloned()
@@ -190,8 +212,9 @@ fn pick_chars(
     let status = find(STATUS_UUID).ok_or_else(|| anyhow!("设备没有 STATUS 特征值"))?;
     let audio = find(AUDIO_UUID).ok_or_else(|| anyhow!("设备没有 AUDIO 特征值"))?;
     let event = find(EVENT_UUID).ok_or_else(|| anyhow!("设备没有 EVENT 特征值"))?;
+    let battery = find(BATTERY_LEVEL_UUID);
 
-    Ok((ctrl, profile, status, audio, event))
+    Ok((ctrl, profile, status, audio, event, battery))
 }
 
 /// 连接设备。`selector` 可以是名字子串或 PeripheralId；为 `None` 时选第一个带服务 UUID 的设备。
@@ -240,13 +263,17 @@ pub async fn connect(selector: Option<&str>, timeout: Duration) -> Result<Link> 
         .context("发现 GATT 服务失败")?;
 
     let chars = peripheral.characteristics();
-    let (ctrl, profile, status, audio, event) = pick_chars(&chars)?;
+    let (ctrl, profile, status, audio, event, battery) = pick_chars(&chars)?;
 
     for chr in [&status, &audio, &event] {
         peripheral
             .subscribe(chr)
             .await
             .with_context(|| format!("订阅 {} 失败", chr.uuid))?;
+    }
+    // 电量通知可有可无：订阅失败不影响连接（旧固件没有这个服务）。
+    if let Some(chr) = &battery {
+        let _ = peripheral.subscribe(chr).await;
     }
 
     let notifications = peripheral
@@ -261,13 +288,23 @@ pub async fn connect(selector: Option<&str>, timeout: Duration) -> Result<Link> 
         status,
         audio,
         event,
-        notifications: Box::pin(notifications),
+        battery,
+        notifications: Arc::new(AsyncMutex::new(Box::pin(notifications))),
     })
 }
 
 impl Link {
+    /// 这只说明句柄还存在，**不**代表对端在线。
     pub fn is_connected(&self) -> bool {
         true
+    }
+
+    /// 问平台要一次真实的连接状态（CoreBluetooth 的 `isConnected`）。
+    ///
+    /// 通知流静默之后必须再问一次链路，否则"设备被拔电"会被当成"设备很安静"，
+    /// 界面会一直停在 ready/streaming。
+    pub async fn is_alive(&self) -> bool {
+        self.peripheral.is_connected().await.unwrap_or(false)
     }
 
     /// 写 CTRL 帧。CTRL 带 WRITE_NO_RSP，所以默认不等待响应。
@@ -302,9 +339,32 @@ impl Link {
         Status::decode(frame.payload).ok_or_else(|| anyhow!("STATUS 载荷长度不足"))
     }
 
+    /// 读一次电量（标准 Battery Service 0x2A19）。
+    ///
+    /// 旧固件没有该服务时返回 `Ok(None)`；读到的值 > 100 也按"不可用"算——
+    /// 设备侧在电量计缺失时保持 0xFF 占位，不会误报 0%。
+    pub async fn read_battery(&self) -> Result<Option<u8>> {
+        let Some(chr) = &self.battery else {
+            return Ok(None);
+        };
+        let value = self
+            .peripheral
+            .read(chr)
+            .await
+            .context("读 Battery Level 失败")?;
+        let Some(&pct) = value.first() else {
+            return Ok(None);
+        };
+        Ok((pct <= 100).then_some(pct))
+    }
+
     /// 取下一个通知。超时返回 `Ok(None)`，链路断了返回 `Err`。
-    pub async fn next_notification(&mut self, timeout: Duration) -> Result<Option<Notification>> {
-        let next = tokio::time::timeout(timeout, self.notifications.next()).await;
+    ///
+    /// 只锁通知流本身（不是整个 `Link`），所以 CTRL 写入不会被通知消费挡住；
+    /// 反过来同一时刻也只有一个消费者能读流，语义与原来的 `&mut self` 一致。
+    pub async fn next_notification(&self, timeout: Duration) -> Result<Option<Notification>> {
+        let mut stream = self.notifications.lock().await;
+        let next = tokio::time::timeout(timeout, stream.next()).await;
         let Some(item) = (match next {
             Ok(v) => v,
             Err(_) => return Ok(None),
@@ -314,6 +374,16 @@ impl Link {
 
         if item.uuid == self.audio.uuid {
             return Ok(Some(Notification::Audio(item.value)));
+        }
+        if let Some(chr) = &self.battery {
+            if item.uuid == chr.uuid {
+                if let Some(&pct) = item.value.first() {
+                    if pct <= 100 {
+                        return Ok(Some(Notification::Battery(pct)));
+                    }
+                }
+                return Ok(None);
+            }
         }
         if item.uuid == self.status.uuid {
             if let Ok((f, _)) = frame::decode(&item.value) {
@@ -352,7 +422,7 @@ impl Link {
     ///   `apmctl ping` 不录音，这里丢掉的只可能是 1 s 心跳。
     /// - 测到的是**链路往返**（含连接间隔与设备任务调度），音频单程 ≈ RTT/2，
     ///   不等于端到端声学延迟。
-    pub async fn ping(&mut self, seq: u32, timeout: Duration) -> Result<Option<Duration>> {
+    pub async fn ping(&self, seq: u32, timeout: Duration) -> Result<Option<Duration>> {
         let start = std::time::Instant::now();
         self.send_ctrl(msg::PING, &seq.to_le_bytes()).await?;
         let deadline = start + timeout;
@@ -373,6 +443,9 @@ impl Link {
 
     pub async fn disconnect(self) -> Result<()> {
         for chr in [&self.status, &self.audio, &self.event] {
+            let _ = self.peripheral.unsubscribe(chr).await;
+        }
+        if let Some(chr) = &self.battery {
             let _ = self.peripheral.unsubscribe(chr).await;
         }
         self.peripheral.disconnect().await.context("断开失败")
@@ -404,9 +477,50 @@ pub fn hint_for_error(err: &anyhow::Error) -> &'static str {
 mod tests {
     use super::*;
 
+    /// `Link` 必须一直是 `Send + Sync + Clone`。
+    ///
+    /// 这条不是形式主义：通知流本身 `!Sync`，把它直接放进结构体就会让 `&Link`
+    /// 不能跨 await，Tauri 命令和 `tokio::spawn` 会一起编译失败（历史上就是这样，
+    /// 当时靠复制一个 `Ctrl` 句柄绕过去的）。谁要是把 `Arc<AsyncMutex<…>>` 拆掉，
+    /// 这条会立刻红。
+    #[test]
+    fn link_is_send_sync_and_clone() {
+        fn assert_all<T: Send + Sync + Clone>() {}
+        assert_all::<Link>();
+    }
+
+    /// 编译期回归门：`&Link` 必须能进一个 `Send` 的 future。
+    ///
+    /// 只构造不运行 —— 能构造出来就说明借用检查与 auto-trait 都过了。
+    #[test]
+    fn shared_link_can_cross_await_boundary() {
+        fn assert_send_future<F: std::future::Future + Send>(f: F) -> F {
+            f
+        }
+        fn build(link: &Link) {
+            let fut = assert_send_future(async move {
+                let _ = link.is_alive().await;
+                let _ = link.next_notification(Duration::from_millis(1)).await;
+                let _ = link.start_capture().await;
+            });
+            drop(fut);
+        }
+        let _ = build as fn(&Link);
+    }
+
     #[test]
     fn uuids_are_valid() {
-        for text in [SERVICE_UUID, CTRL_UUID, PROFILE_UUID, STATUS_UUID, EVENT_UUID, AUDIO_UUID] {
+        use apm_protocol::BATTERY_SERVICE_UUID;
+        for text in [
+            SERVICE_UUID,
+            CTRL_UUID,
+            PROFILE_UUID,
+            STATUS_UUID,
+            EVENT_UUID,
+            AUDIO_UUID,
+            BATTERY_SERVICE_UUID,
+            BATTERY_LEVEL_UUID,
+        ] {
             assert!(Uuid::parse_str(text).is_ok(), "{text} 不是合法 UUID");
         }
         assert_eq!(service_uuid(), Uuid::parse_str(SERVICE_UUID).unwrap());
