@@ -1,5 +1,5 @@
 // 与 Rust 侧 IPC 契约一一对应（docs/GUI.md §6）。改这里必须同步改
-// desktop/crates/app/src/state.rs 与 events.rs。
+// desktop/crates/app/src/{state.rs,events.rs,session.rs,report.rs,keymap_store.rs}。
 
 export type ErrorCode =
   | 'bt_unauthorized'
@@ -10,6 +10,7 @@ export type ErrorCode =
   | 'sink_missing'
   | 'sink_rate_unsupported'
   | 'protocol_mismatch'
+  | 'keymap_invalid'
   | 'busy'
   | 'internal'
 
@@ -47,6 +48,22 @@ export interface LogEntry {
   message: string
 }
 
+export interface SettingsView {
+  sink: string | null
+  target_ms: number
+  save_wav: boolean
+  /** 启动后自动连接上次设备。 */
+  auto_connect: boolean
+  /** 上次连接的设备名（无记录为 null），只用于提示。 */
+  last_device: string | null
+}
+
+export interface SessionRecord {
+  session_id: string
+  wav_path: string | null
+  started_ms: number
+}
+
 export interface AppSnapshot {
   version: string
   state: AppState
@@ -54,12 +71,123 @@ export interface AppSnapshot {
   log_tail: LogEntry[]
   log_path: string
   log_dir: string
+  settings: SettingsView
+  last_session: SessionRecord | null
+}
+
+/** 5 Hz 遥测。字段口径见 docs/GUI.md §7，前端**不自己算**丢块率。 */
+export interface Telemetry {
+  rms_dbfs: number | null
+  peak_dbfs: number | null
+  buffer_ms: number
+  target_ms: number
+  blocks: number
+  lost_blocks: number
+  seq_jumps: number
+  device_dropped: number
+  underruns: number
+  silent_frames: number
+  lock_misses: number
+  bytes_written: number
+  elapsed_ms: number
+  ppm: number
+  glitch_events: number
+  overflow_drops: number
+  bad_len_blocks: number
+}
+
+export interface SessionSummary {
+  session_id: string
+  blocks: number
+  frames: number
+  duration_s: number
+  sink_device: string | null
+  wav_path: string | null
+  bytes_written: number
+  underruns: number
+  silent_frames: number
+  frames_dropped: number
+  lock_misses: number
+  ppm: number
+  frames_inserted: number
+  frames_skipped: number
+  target_start_ms: number
+  target_end_ms: number
+  glitch_events: number
+  glitch_muted_ms: number
+  lost_blocks: number
+  seq_jumps: number
+  device_dropped: number
+  bad_len_blocks: number
+  overflow_drops: number
+}
+
+export interface SinkView {
+  name: string
+  uid: string
+  channels: number
+  min_rate: number
+  max_rate: number
+  supports_16k: boolean
+}
+
+export interface ReportCheck {
+  name: string
+  ok: boolean
+  actual: string
+  expected: string
+}
+
+/** 与 `apmctl analyze --json` 同源（apm_app::report）。未测字段是 null，不是 0。 */
+export interface QualityReport {
+  recording: string
+  sample_rate: number
+  channels: number
+  downmixed: boolean
+  duration_s: number
+  samples: number
+  rms_dbfs: number | null
+  peak_dbfs: number | null
+  clipping_pct: number
+  dc_offset_pct: number
+  zero_crossing_pct: number
+  glitch_events: number
+  glitch_ms: number
+  checks: ReportCheck[]
+  pass: boolean
+  verdict: string
+}
+
+export interface BindingView {
+  event: string
+  modifiers: string[]
+  key: string
+  repeat: number
+  is_ptt: boolean
+  locked: boolean
+}
+
+export interface BindingInput {
+  event: string
+  modifiers: string[]
+  key: string
+  repeat: number
+}
+
+export interface KeymapView {
+  path: string
+  schema: string
+  bindings: BindingView[]
+  error: string | null
 }
 
 export type AppEvent =
   | { type: 'state-changed'; state: AppState }
   | { type: 'devices'; devices: DeviceView[] }
   | { type: 'event-log'; entry: LogEntry }
+  | { type: 'telemetry'; telemetry: Telemetry }
+  | { type: 'session-done'; summary: SessionSummary }
+  | { type: 'battery'; pct: number }
 
 export const STATE_LABEL: Record<StateKind, string> = {
   no_adapter: '无蓝牙适配器',
@@ -82,6 +210,87 @@ export const ERROR_HINTS: Record<ErrorCode, string> = {
   sink_missing: '选定的虚拟声卡不见了，检查 BlackHole 是否已加载',
   sink_rate_unsupported: '该声卡不支持 16 kHz，换一个原生支持 16 kHz 的输出',
   protocol_mismatch: '固件与桌面端版本不一致，重新烧录同一版本',
+  keymap_invalid: '键名或修饰键不在支持列表内；PTT 的停止通道不能删',
   busy: '当前状态下不能这么做，先停止正在进行的操作',
   internal: '查看诊断日志；这属于未预期错误',
 }
+
+/**
+ * 事件名 → 中文说明。只用于展示，键名/事件名本身以 config/README.md 为准。
+ *
+ * v3 起只有 3 个事件：一个键一个动作。按下触发，抬起/短按/双击/长按都不参与映射。
+ * OK 是开关式（按一下开、再按一下关），所以不再像 v2 那样分"开/关"两行。
+ */
+export const EVENT_LABEL: Record<string, string> = {
+  up: '上键',
+  down: '下键',
+  ok: 'OK（PTT 开关）',
+  // 下面两行不是按键，是"采集状态钩子"：开麦/关麦的那一刻注入的快捷键（点按）。
+  'capture.start': '开麦时 · 注入',
+  'capture.stop': '关麦时 · 注入',
+}
+
+/** 常用键名，给输入框做候选；最终合法性由后端校验。 */
+export const KEY_CHOICES = [
+  'enter',
+  'esc',
+  'space',
+  'tab',
+  'backspace',
+  'delete',
+  'up',
+  'down',
+  'left',
+  'right',
+  'home',
+  'end',
+  'pageup',
+  'pagedown',
+  'insert',
+  'printscreen',
+  'menu',
+  'capslock',
+  // 修饰键本身作为目标键（macOS 上 Alt = Option，左右键码 58/61 不同）。
+  'lalt',
+  'ralt',
+  'f1',
+  'f2',
+  'f3',
+  'f4',
+  'f5',
+  'f6',
+  'f7',
+  'f8',
+  'f9',
+  'f10',
+  'f11',
+  'f12',
+  'a',
+  'b',
+  'c',
+  'd',
+  'e',
+  'f',
+  'g',
+  'h',
+  'i',
+  'j',
+  'k',
+  'l',
+  'm',
+  'n',
+  'o',
+  'p',
+  'q',
+  'r',
+  's',
+  't',
+  'u',
+  'v',
+  'w',
+  'x',
+  'y',
+  'z',
+  'ptt-start',
+  'ptt-stop',
+]

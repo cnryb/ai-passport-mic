@@ -49,7 +49,24 @@ fn main() {
             commands::scan_start,
             commands::scan_stop,
             commands::connect,
+            commands::set_auto_connect,
             commands::disconnect,
+            commands::list_sinks,
+            commands::set_sink,
+            commands::set_save_wav,
+            commands::set_buffer_target,
+            commands::start_stream,
+            commands::stop_stream,
+            commands::analyze_session,
+            commands::analyze_session_json,
+            commands::reveal_path,
+            commands::keymap_view,
+            commands::keymap_save,
+            commands::keymap_import,
+            commands::keymap_reset,
+            commands::keymap_text,
+            commands::inject_permission,
+            commands::open_accessibility_settings,
             commands::diagnostics_text,
             commands::log_path,
             commands::reveal_log,
@@ -96,7 +113,11 @@ fn main() {
                     run_smoke(boot_core).await;
                     return;
                 }
-                let _ = boot_core.detect_adapter().await;
+                // 适配器就绪后自动连接上次的设备。失败（设备没上电、不在广播）
+                // 只落 warn 日志并回到 idle，不弹错误横幅——设备端是常态。
+                if boot_core.detect_adapter().await.is_ok() {
+                    let _ = boot_core.auto_connect().await;
+                }
             });
 
             Ok(())

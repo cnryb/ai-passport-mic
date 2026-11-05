@@ -6,7 +6,8 @@
 //! - 错误统一是 `{code, detail}`，前端按 code 查指引。
 
 use crate::GuiState;
-use apm_app::{AppError, AppSnapshot};
+use apm_app::keymap_store::{self, BindingInput, KeymapView};
+use apm_app::{AppError, AppSnapshot, QualityReport, SessionSummary, SinkView};
 use tauri::State;
 
 #[tauri::command]
@@ -35,6 +36,12 @@ pub async fn connect(state: State<'_, GuiState>, device_id: String) -> Result<()
     state.core.connect(device_id).await
 }
 
+/// 启动自动连接开关（立即落盘）。
+#[tauri::command]
+pub fn set_auto_connect(state: State<'_, GuiState>, enabled: bool) -> Result<(), AppError> {
+    state.core.set_auto_connect(enabled)
+}
+
 /// 异步命令只要带 `State<'_, _>` 就必须返回 `Result`（Tauri 的借用检查约束），
 /// 所以这里即使不失败也包一层 `Ok(())`。
 #[tauri::command]
@@ -42,6 +49,143 @@ pub async fn disconnect(state: State<'_, GuiState>) -> Result<(), AppError> {
     state.core.disconnect().await;
     Ok(())
 }
+
+// ---- G2 / G3：声卡与推流 ----
+
+#[tauri::command]
+pub fn list_sinks(state: State<'_, GuiState>) -> Result<Vec<SinkView>, AppError> {
+    state.core.list_sinks()
+}
+
+#[tauri::command]
+pub fn set_sink(state: State<'_, GuiState>, name: String) -> Result<(), AppError> {
+    state.core.set_sink(name)
+}
+
+#[tauri::command]
+pub fn set_save_wav(state: State<'_, GuiState>, save: bool) -> Result<(), AppError> {
+    state.core.set_save_wav(save)
+}
+
+#[tauri::command]
+pub fn set_buffer_target(state: State<'_, GuiState>, ms: u32) -> Result<(), AppError> {
+    state.core.set_buffer_target(ms)
+}
+
+#[tauri::command]
+pub async fn start_stream(state: State<'_, GuiState>, save_wav: bool) -> Result<String, AppError> {
+    state.core.start_stream(save_wav).await
+}
+
+#[tauri::command]
+pub async fn stop_stream(state: State<'_, GuiState>) -> Result<SessionSummary, AppError> {
+    state.core.stop_stream().await
+}
+
+// ---- G4：音质报告 ----
+
+#[tauri::command]
+pub fn analyze_session(
+    state: State<'_, GuiState>,
+    session_id: String,
+) -> Result<QualityReport, AppError> {
+    state.core.analyze_session(&session_id)
+}
+
+#[tauri::command]
+pub fn analyze_session_json(
+    state: State<'_, GuiState>,
+    session_id: String,
+) -> Result<String, AppError> {
+    state.core.analyze_session_json(&session_id)
+}
+
+/// 在访达里选中一次会话的 WAV。路径由后端给出，前端不自己拼目录。
+#[tauri::command]
+pub fn reveal_path(state: State<'_, GuiState>, path: String) -> Result<(), AppError> {
+    let _ = state;
+    #[cfg(target_os = "macos")]
+    {
+        std::process::Command::new("open")
+            .arg("-R")
+            .arg(&path)
+            .spawn()
+            .map(|_| ())
+            .map_err(|e| AppError::internal(format!("在访达中显示失败：{e}")))
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        let _ = path;
+        Err(AppError::internal("首发只支持 macOS"))
+    }
+}
+
+// ---- G5：按键映射 ----
+//
+// 校验全在 `apm_app::keymap_store`（复用 `apm_protocol::keymap`），
+// 命令层不重复判断"这个键名合不合法"。
+
+#[tauri::command]
+pub fn keymap_view() -> KeymapView {
+    keymap_store::view()
+}
+
+#[tauri::command]
+pub fn keymap_save(bindings: Vec<BindingInput>) -> Result<KeymapView, AppError> {
+    keymap_store::save_bindings(&bindings).map_err(AppError::keymap_invalid)
+}
+
+#[tauri::command]
+pub fn keymap_import(text: String) -> Result<KeymapView, AppError> {
+    keymap_store::save_text(&text).map_err(AppError::keymap_invalid)
+}
+
+#[tauri::command]
+pub fn keymap_reset() -> Result<KeymapView, AppError> {
+    keymap_store::reset().map_err(AppError::keymap_invalid)
+}
+
+#[tauri::command]
+pub fn keymap_text() -> String {
+    keymap_store::text()
+}
+
+// ---- M3：注入权限引导 ----
+//
+// 没有辅助功能权限时 CGEventPost 静默丢弃（`apm_app::inject` 的探针已经把这层
+// 拦在"发出错误"而不是"按了没反应"），但用户仍得自己摸到系统设置那一页。
+// 这两个命令只做引导：查状态 + 跳面板，权限本身应用内无法替代勾选。
+
+/// 当前 App 有没有辅助功能权限（注入快捷键的前提）。
+#[tauri::command]
+pub fn inject_permission() -> bool {
+    apm_app::inject::available()
+}
+
+/// 打开系统设置的"辅助功能"面板，把用户送到能勾选的那一页。
+///
+/// 关键顺序：**先请求权限、再开面板**。纯探测（`AXIsProcessTrusted`）不会让本 App
+/// 出现在辅助功能列表里；带 `kAXTrustedCheckOptionPrompt` 的请求会弹系统授权框，
+/// 并把本 App 以未勾选状态登记进列表——用户接下来只需拨开关，不用手动添加。
+#[tauri::command]
+pub fn open_accessibility_settings() -> Result<(), AppError> {
+    #[cfg(target_os = "macos")]
+    {
+        // 弹授权框（若已授权则无副作用），列表里由此出现本 App。
+        let _ = apm_app::inject::request_permission();
+        std::process::Command::new("open")
+            .arg("x-apple.systempreferences:com.apple.preference.security?Privacy_Accessibility")
+            .spawn()
+            .map(|_| ())
+            .map_err(|e| AppError::internal(format!("打开系统设置失败：{e}")))
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        Err(AppError::internal("首发只支持 macOS"))
+    }
+}
+
+// ---- 诊断 ----
 
 /// 生成可直接粘贴的诊断包。写剪贴板交给前端（`navigator.clipboard` 不可用时
 /// 回退到 textarea + execCommand），这样后端不需要引额外插件。

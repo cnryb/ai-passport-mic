@@ -3,7 +3,17 @@
 
 import { invoke } from '@tauri-apps/api/core'
 import { listen, type UnlistenFn } from '@tauri-apps/api/event'
-import type { AppEvent, AppError, AppSnapshot, ErrorCode } from './types'
+import type {
+  AppEvent,
+  AppError,
+  AppSnapshot,
+  BindingInput,
+  ErrorCode,
+  KeymapView,
+  QualityReport,
+  SessionSummary,
+  SinkView,
+} from './types'
 
 export const api = {
   snapshot: () => invoke<AppSnapshot>('snapshot'),
@@ -12,7 +22,30 @@ export const api = {
   scanStart: (windowMs?: number) => invoke<void>('scan_start', { windowMs }),
   scanStop: () => invoke<void>('scan_stop'),
   connect: (deviceId: string) => invoke<void>('connect', { deviceId }),
+  setAutoConnect: (enabled: boolean) => invoke<void>('set_auto_connect', { enabled }),
   disconnect: () => invoke<void>('disconnect'),
+
+  listSinks: () => invoke<SinkView[]>('list_sinks'),
+  setSink: (name: string) => invoke<void>('set_sink', { name }),
+  setBufferTarget: (ms: number) => invoke<void>('set_buffer_target', { ms }),
+  setSaveWav: (save: boolean) => invoke<void>('set_save_wav', { save }),
+  startStream: (saveWav: boolean) => invoke<string>('start_stream', { saveWav }),
+  stopStream: () => invoke<SessionSummary>('stop_stream'),
+
+  analyzeSession: (sessionId: string) => invoke<QualityReport>('analyze_session', { sessionId }),
+  analyzeSessionJson: (sessionId: string) =>
+    invoke<string>('analyze_session_json', { sessionId }),
+  revealPath: (path: string) => invoke<void>('reveal_path', { path }),
+
+  keymapView: () => invoke<KeymapView>('keymap_view'),
+  keymapSave: (bindings: BindingInput[]) => invoke<KeymapView>('keymap_save', { bindings }),
+  keymapImport: (text: string) => invoke<KeymapView>('keymap_import', { text }),
+  keymapReset: () => invoke<KeymapView>('keymap_reset'),
+  keymapText: () => invoke<string>('keymap_text'),
+
+  injectPermission: () => invoke<boolean>('inject_permission'),
+  openAccessibilitySettings: () => invoke<void>('open_accessibility_settings'),
+
   diagnosticsText: () => invoke<string>('diagnostics_text'),
   logPath: () => invoke<string>('log_path'),
   revealLog: () => invoke<void>('reveal_log'),
@@ -31,6 +64,7 @@ const KNOWN_CODES: ErrorCode[] = [
   'sink_missing',
   'sink_rate_unsupported',
   'protocol_mismatch',
+  'keymap_invalid',
   'busy',
   'internal',
 ]
