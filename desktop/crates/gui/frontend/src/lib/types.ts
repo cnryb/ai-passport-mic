@@ -153,6 +153,8 @@ export interface QualityReport {
   zero_crossing_pct: number
   glitch_events: number
   glitch_ms: number
+  /** 采样率不是 16 kHz 时的提醒，与 apmctl 同一份文案；16 kHz 时为 null。 */
+  rate_note: string | null
   checks: ReportCheck[]
   pass: boolean
   verdict: string

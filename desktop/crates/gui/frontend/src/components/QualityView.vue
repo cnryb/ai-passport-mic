@@ -64,8 +64,10 @@ function fmt(v: number | null, digits = 2, unit = ''): string {
         <div class="cell"><span class="dim">直流偏置</span><b>{{ fmt(report.dc_offset_pct, 3, ' %') }}</b></div>
         <div class="cell"><span class="dim">过零率</span><b>{{ fmt(report.zero_crossing_pct, 2, ' %') }}</b></div>
         <div class="cell"><span class="dim">毛刺</span><b>{{ report.glitch_events }} 段 / {{ fmt(report.glitch_ms, 0, ' ms') }}</b></div>
-        <div class="cell"><span class="dim">格式</span><b>{{ report.sample_rate }} Hz · {{ report.channels }} ch</b></div>
+        <div class="cell"><span class="dim">格式</span><b>{{ report.sample_rate }} Hz · {{ report.channels }} ch{{ report.downmixed ? ' · 已下混' : '' }}</b></div>
       </div>
+
+      <p v-if="report.rate_note" class="note">{{ report.rate_note }}</p>
 
       <table class="checks">
         <thead>
@@ -126,6 +128,13 @@ function fmt(v: number | null, digits = 2, unit = ''): string {
   margin: 0;
   color: var(--err);
   font-size: 12px;
+}
+
+.note {
+  margin: 0;
+  color: var(--warn);
+  font-size: 11.5px;
+  line-height: 1.6;
 }
 
 .verdict {

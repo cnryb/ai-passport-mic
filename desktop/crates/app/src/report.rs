@@ -34,6 +34,8 @@ pub struct QualityReport {
     pub zero_crossing_pct: f64,
     pub glitch_events: u64,
     pub glitch_ms: f64,
+    /// 采样率不是 16 kHz 时的对比口径提醒，与 `apmctl` 共用同一份文案。
+    pub rate_note: Option<String>,
     /// 每条阈值判定，GUI 表格直接渲染这个。
     pub checks: Vec<ReportCheck>,
     pub pass: bool,
@@ -95,6 +97,7 @@ pub fn analyze_file(path: &Path) -> Result<QualityReport, String> {
         zero_crossing_pct: m.zero_crossing_pct,
         glitch_events: g.events,
         glitch_ms: g.duration_ms(file.sample_rate),
+        rate_note: rate_note(file.sample_rate),
         checks: checks
             .into_iter()
             .map(|c| ReportCheck {
