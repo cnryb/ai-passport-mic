@@ -26,8 +26,9 @@ device/
     CMakeLists.txt
     app_main.c            # 任务编排：采集 / 事件 / STATUS 心跳
     protocol.c/.h         # 帧、CRC16-CCITT、IMA-ADPCM（纯 C，可在主机单测）
-    audio.c/.h            # ES8311 + I2S 全双工，16 kHz / 16-bit / mono
-    link.c/.h             # NimBLE GATT、广播、MTU 协商、通知
+    audio.c/.h            # ES8311 + I2S 全双工，16 kHz / 16-bit / mono；共享 I2C 总线
+    battery.c/.h          # CW2017 电量计 + 低电量背光呼吸指示（阈值 20%）
+    link.c/.h             # NimBLE GATT、广播、MTU 协商、通知、标准 Battery Service
     buttons.c/.h          # 单 ADC 三键手势判定（去抖 / 单击 / 双击 / 长按 / PTT）
     board.h               # 引脚与硬件常量（唯一事实来源）
   test/

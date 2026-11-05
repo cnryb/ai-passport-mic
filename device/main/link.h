@@ -25,6 +25,8 @@ int apm_link_notify_event(apm_btn_t btn, apm_btn_ev_t ev, uint8_t flags);
 // PONG 与 EVENT 共用特征值；seq/len 为 PING 的载荷（必须 4 字节）。
 int apm_link_notify_pong(const uint8_t *seq, size_t len);
 int apm_link_notify_status(apm_state_t state, uint8_t flags, uint16_t drops, uint32_t sent);
+// 标准 Battery Service（0x2A19）：pct 为百分比 0..100，裸值不套帧。同时更新读缓存。
+int apm_link_notify_battery(uint8_t pct);
 
 // 当前协商到的 MTU（未连接时为 0），用于日志与 STATUS 诊断。
 uint16_t apm_link_mtu(void);

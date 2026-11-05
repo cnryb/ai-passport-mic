@@ -13,12 +13,27 @@
 #define APM_LCD_BL_GPIO 21
 
 // ---------------------------------------------------------------------------
-// I2C：ES8311 音频 codec（唯一使用者，电量计不在第一版范围内）
+// I2C：ES8311 音频 codec 与 CW2017 电量计共用一条总线
+// 电量计事实来自上游 FoloToy BSP（bsp_pins.h，MIT）。VCELL（0x02/0x03）的
+// 换算系数未经实测核对，第一版只读 SOC，避免上报未验证的数值。
 // ---------------------------------------------------------------------------
 #define APM_I2C_PORT       0          // I2C_NUM_0
 #define APM_I2C_SDA_GPIO   10
 #define APM_I2C_SCL_GPIO   7
 #define APM_ES8311_ADDR    0x18       // 7 位地址；audio_codec_new_i2c_ctrl 需要 8 位形式
+#define APM_I2C_CW2017_ADDR 0x63      // 7 位地址
+
+// ---------------------------------------------------------------------------
+// 背光：GPIO21，LEDC PWM（参数来自上游 BSP）。屏幕第一版不驱动，背光
+// 被低电量指示复用（见 battery.c）：SOC <= 阈值时**按任意键短闪 3 次**，
+// 平时恒灭（零功耗）。充电口旁的充电指示灯是充电 IC 硬件直驱，MCU 不可控。
+// ---------------------------------------------------------------------------
+#define APM_BL_GPIO            21
+#define APM_BL_LEDC_TIMER      0          // LEDC_TIMER_0
+#define APM_BL_LEDC_CHANNEL    0          // LEDC_CHANNEL_0
+#define APM_BL_LEDC_RESOLUTION 10         // bit，最大占空比 1023
+#define APM_BL_LEDC_FREQ_HZ    5000
+#define APM_BL_BREATH_PEAK_PCT 4          // 呼吸峰值占空比（满量程的百分比）
 
 // ---------------------------------------------------------------------------
 // I2S：全双工，同端口共用 MCLK/BCLK/WS

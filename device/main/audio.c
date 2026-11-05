@@ -52,6 +52,12 @@ static esp_err_t i2c_bus_init(void)
     return ESP_OK;
 }
 
+i2c_master_bus_handle_t apm_audio_i2c_bus(void)
+{
+    if (!s_bus && i2c_bus_init() != ESP_OK) return NULL;
+    return s_bus;
+}
+
 static esp_err_t i2s_init(void)
 {
     i2s_chan_config_t chan = {

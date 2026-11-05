@@ -2,6 +2,7 @@ idf_component_register(
     SRCS "app_main.c"
          "protocol.c"
          "audio.c"
+         "battery.c"
          "link.c"
          "buttons.c"
     INCLUDE_DIRS "."

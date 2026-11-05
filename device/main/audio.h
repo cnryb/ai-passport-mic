@@ -2,6 +2,7 @@
 // ES8311 采集：I2C 控制口 + I2S 全双工数据口，16 kHz / 16-bit / mono。
 #pragma once
 
+#include "driver/i2c_master.h"
 #include "esp_err.h"
 #include <stdbool.h>
 #include <stddef.h>
@@ -9,6 +10,10 @@
 
 // 初始化 I2C 总线、I2S 通道与 ES8311，并按 16k/16bit/mono 打开。可重复调用。
 esp_err_t apm_audio_init(void);
+
+// 共享 I2C 总线句柄（惰性创建，幂等）。电量计等 I2C 设备从这里拿总线，
+// 不要自己再 new 一条——总线上同一 port 只允许创建一次。
+i2c_master_bus_handle_t apm_audio_i2c_bus(void);
 
 // 阻塞读取 samples 个 16-bit 单声道采样（一次 20 ms = 320 采样）。
 // 返回 ESP_ERR_INVALID_STATE 表示音频未就绪，调用方必须据此上报错误而不是当作静音。

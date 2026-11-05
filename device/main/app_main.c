@@ -6,6 +6,7 @@
 //   - 未连接或未订阅时块直接丢弃并计入丢失，不假装在录音；
 //   - 按键回调只入队，真正的 BLE 通知在事件任务里做。
 #include "audio.h"
+#include "battery.h"
 #include "board.h"
 #include "buttons.h"
 #include "link.h"
@@ -55,6 +56,9 @@ static bool capture_on(void) { return s_forced_capture || s_ptt_held; }
 // ---------------------------------------------------------------------------
 static void on_button(apm_btn_t btn, apm_btn_ev_t ev)
 {
+    // 低电量被动提示：平时是空操作，只置一个计数，不影响按键路径。
+    apm_battery_on_button();
+
     apm_evt_t e = { 0 };
     e.src = APM_EVT_SRC_BUTTON;
     e.btn = (uint8_t)btn;
@@ -289,6 +293,13 @@ void app_main(void)
     err = apm_buttons_start(on_button);
     if (err != ESP_OK) {
         ESP_LOGE(TAG, "按键启动失败: %s", esp_err_to_name(err));
+    }
+
+    // 电量计失败不阻止启动：BLE 电量服务只是没有数据，其余功能不受影响。
+    err = apm_battery_start();
+    if (err != ESP_OK) {
+        ESP_LOGW(TAG, "电量计启动失败: %s（Battery Service 将保持 0%）",
+                 esp_err_to_name(err));
     }
 
     xTaskCreate(audio_task, "apm_audio", 4096, NULL, 9, NULL);

@@ -36,11 +36,17 @@ static const ble_uuid128_t s_stat_uuid = BLE_UUID128_INIT(APM_UUID128_BYTES(0x03
 static const ble_uuid128_t s_evt_uuid  = BLE_UUID128_INIT(APM_UUID128_BYTES(0x04));
 static const ble_uuid128_t s_aud_uuid  = BLE_UUID128_INIT(APM_UUID128_BYTES(0x05));
 
+// 标准 Battery Service（0x180F / 0x2A19，1 字节 = 百分比）。走标准 UUID 而不是
+// 塞进自定义服务：系统（macOS 蓝牙面板等）与 GUI 都能免驱动读取。
+static const ble_uuid16_t s_batt_svc_uuid = BLE_UUID16_INIT(0x180F);
+static const ble_uuid16_t s_batt_chr_uuid = BLE_UUID16_INIT(0x2A19);
+
 static uint16_t s_h_ctrl;
 static uint16_t s_h_prof;
 static uint16_t s_h_stat;
 static uint16_t s_h_evt;
 static uint16_t s_h_aud;
+static uint16_t s_h_batt;
 
 static uint16_t s_conn = BLE_HS_CONN_HANDLE_NONE;
 static uint16_t s_mtu;
@@ -54,6 +60,9 @@ static apm_ctrl_cb_t s_ctrl_cb;
 
 static uint8_t  s_status_payload[8];
 static uint16_t s_status_len;
+// Battery Service 缓存。0xFF = 电量计不可用/还没读到过（BAS 合法值只有 0..100），
+// 读路径对 >100 返回 ATT 错误，PC 端按"电量不可用"处理而不是误报 0%。
+static uint8_t  s_battery_pct = 0xFF;
 
 static int gatt_access(uint16_t conn_handle, uint16_t attr_handle,
                        struct ble_gatt_access_ctxt *ctxt, void *arg);
@@ -101,11 +110,27 @@ static const struct ble_gatt_chr_def s_chrs[] = {
     { 0 },
 };
 
+static const struct ble_gatt_chr_def s_batt_chrs[] = {
+    {
+        .uuid       = &s_batt_chr_uuid.u,
+        .access_cb  = gatt_access,
+        .arg        = (void *)6,  // Battery Level
+        .flags      = BLE_GATT_CHR_F_READ | BLE_GATT_CHR_F_NOTIFY,
+        .val_handle = &s_h_batt,
+    },
+    { 0 },
+};
+
 static const struct ble_gatt_svc_def s_svcs[] = {
     {
         .type            = BLE_GATT_SVC_TYPE_PRIMARY,
         .uuid            = &s_svc_uuid.u,
         .characteristics = s_chrs,
+    },
+    {
+        .type            = BLE_GATT_SVC_TYPE_PRIMARY,
+        .uuid            = &s_batt_svc_uuid.u,
+        .characteristics = s_batt_chrs,
     },
     { 0 },
 };
@@ -166,6 +191,13 @@ static int gatt_access(uint16_t conn_handle, uint16_t attr_handle,
                                            frame, sizeof frame);
             if (flen == 0) return BLE_ATT_ERR_UNLIKELY;
             return os_mbuf_append(ctxt->om, frame, flen) == 0
+                       ? 0 : BLE_ATT_ERR_INSUFFICIENT_RES;
+        }
+        if (which == 6) {
+            // Battery Level（0x2A19）：1 字节百分比，原始值，不带帧头。
+            // 0xFF 表示电量计不可用，回错误让对端区分"没电"和"读不到"。
+            if (s_battery_pct > 100) return BLE_ATT_ERR_UNLIKELY;
+            return os_mbuf_append(ctxt->om, &s_battery_pct, 1) == 0
                        ? 0 : BLE_ATT_ERR_INSUFFICIENT_RES;
         }
         return BLE_ATT_ERR_UNLIKELY;
@@ -370,6 +402,14 @@ int apm_link_notify_status(apm_state_t state, uint8_t flags, uint16_t drops, uin
                                    frame, sizeof frame);
     if (flen == 0) return -2;
     return notify(s_h_stat, frame, flen);
+}
+
+int apm_link_notify_battery(uint8_t pct)
+{
+    // 即使没人订阅也要更新缓存：特征值读路径回的是这份缓存。
+    s_battery_pct = pct;
+    if (s_conn == BLE_HS_CONN_HANDLE_NONE || s_h_batt == 0) return -1;
+    return notify(s_h_batt, &pct, 1);
 }
 
 // ---------------------------------------------------------------------------
