@@ -49,6 +49,23 @@
 - STATUS: `...7a03`
 - EVENT: `...7a04`
 - AUDIO: `...7a05`
+- **Battery Service（标准）**: `0x180F` / Battery Level `0x2A19`（见下）
+
+### Battery Service（电量）
+
+电量来自设备 I2C 总线上的 CW2017 电量计（0x63，与 ES8311 共总线），走 **蓝牙标准**
+Battery Service，不占用自定义协议帧：
+
+- 特征值 `0x2A19`（READ + NOTIFY）：1 字节 = 电量百分比（0..100），**裸值不套帧头**。
+- 设备每 1 s 采样一次 SOC，只在数值变化时通知；连接后 PC 端主动读一次。
+- **0xFF / ATT 错误 = 电量不可用**（旧固件或电量计缺失），PC 端不得显示成 0%。
+- 低电量阈值 20%（`device/main/battery.h` 的 `APM_BATTERY_LOW_SOC_PCT`）由设备端判定：
+  GUI 状态栏高亮提示；设备端背光（GPIO21，LEDC PWM）做**被动查询式**指示——
+  低电量时按任意键背光短闪 3 次，平时恒灭（零功耗）。不做常驻呼吸/闪烁：
+  "没电了还持续点亮背光"与省电目标冲突，已明确否掉。
+- 充电口旁的充电指示灯由充电 IC **硬件直驱**（充电时常亮、充满熄灭），MCU 未接线，
+  固件不可控、不可变色；上游 BSP 能力契约也没有 LED 接口。
+- 旧固件没有该服务时，PC 端静默降级：电量显示不出现，其余链路不受影响。
 
 控制帧：
 
@@ -117,7 +134,16 @@ STATUS 载荷：`state u8, flags u8, dropped u16-LE, sent u32-LE`。
 ### 按键事件
 
 `ev`：`0` PRESS / `1` CLICK / `2` DOUBLE / `3` LONG / `4` RELEASE。
-与 `config/README.md` 的事件名对应：`CLICK → *.short`，`PRESS/RELEASE → ok.press / ok.release`。
+
+**键位映射只用 `PRESS`**（`keymap-3` 起，一个键一个动作）。`RELEASE` / `CLICK` /
+`DOUBLE` / `LONG` 仍然照旧上报——这是跨端协议，改它要动帧格式、UUID 与共享向量，
+收益只是省几帧通知——但 PC 端不再为它们提供映射项。
+
+副作用要知道：**双击 = 两次 `PRESS`**，在 OK 的 toggle 语义下等于"开了又关"。
+PC 端有切换窗口防抖（`apm_app::core` 的 `ptt_switching`）：开/关麦进行中（约几百毫秒）
+再来的 PRESS 会被忽略，所以落在切换窗口内的双击只算一次动作；窗口外的双击仍是
+一次正常的开+关。三键方案的语义代价还在，真要双击语义得单独加事件。
+见 [`config/README.md`](../config/README.md)。
 
 固件侧手势时序：去抖 20 ms、双击窗口 180 ms、长按 500 ms。
 长按在按住满 500 ms 时**立即**上报，抬起后不再补发单击。

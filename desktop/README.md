@@ -1,11 +1,13 @@
-# desktop/ —— PC 端软件（M2 部分落地）
+# desktop/ —— PC 端软件（M2 主链路 + GUI G1–G5）
 
 把设备送上来的 BLE 音频解码后写入系统虚拟声卡，让会议软件把它当麦克风用。
 
 **已实现**：协议层、BLE 链路、虚拟声卡输出（抖动缓冲）、`apmctl` CLI
-（scan / status / record / sink / ping / probe / analyze / selftest）、`apm-gui` 的 G0
-（Tauri 骨架 + 蓝牙权限 + 设备扫描）。
-**未实现**：GUI 的电平表与推流界面（G2）、按键注入、按键映射/音质报告界面（G4/G5）。
+（scan / status / record / sink / ping / probe / analyze / selftest）、`apm-gui` 的
+G0–G5（骨架 + 权限 + 设备发现 + 状态机 + 实时电平与推流 + 声卡选择与会话 WAV +
+音质报告 + 按键映射编辑）。音频编排只有一份：`crates/app`，CLI 与 GUI 都只调它。
+**未实现**：G3b 回环自动验收（`--verify` 仍在 CLI）、G6 签名公证、按键注入（M3）、
+GUI 的 `run_selftest`（bundle 里没有向量文件，协议自检仍归 `apmctl selftest`）。
 链路与声卡输出都在真机上跑通，并**在会议软件里实测可用**（用户确认：选中 BlackHole 2ch
 当麦克风，说话有电平）。回环自动验收仍受限：宿主的麦克风权限被系统拒绝，读回来是数字静音。
 macOS 上蓝牙**必须走 .app bundle 才能拿到权限**，见文末「macOS 上的蓝牙权限」。
@@ -18,7 +20,7 @@ macOS 上蓝牙**必须走 .app bundle 才能拿到权限**，见文末「macOS 
 | 结构 | Cargo workspace（protocol / link / sink / app / cli / gui） | 已用 |
 | BLE | `btleplug` 0.11 | 已用（真机 scan / status / record / sink 均通过） |
 | 音频输出 | `cpal` 0.15 → 系统虚拟声卡（macOS BlackHole / Windows VB-CABLE） | 已实现 `crates/sink`：40–80 ms 抖动缓冲 + 单样本漂移补偿 |
-| GUI | Tauri 2 + Vue 3 + Vite + TS | 已落地 G0（骨架 + 权限 + 设备发现） |
+| GUI | Tauri 2 + Vue 3 + Vite + TS | 已落地 G0–G5；G3b/G6 未做（见 `../docs/GUI.md` §10） |
 
 ## 目录
 
@@ -34,8 +36,12 @@ desktop/
       src/device.rs
     sink/             # 抖动缓冲 + 写虚拟声卡（cpal），含回环探针
       src/lib.rs
-    app/              # apm-app：无 UI 应用内核（状态机 / 编排 / 事件 / 诊断日志）
-      src/{core,state,events,log}.rs
+    app/              # apm-app：无 UI 应用内核（状态机 / 编排 / 事件 / 诊断 / 报告 / 配置）
+      src/core.rs     # 状态机 + 扫描/连接/推流编排 + 5 Hz telemetry
+      src/session.rs  # 声卡线程（cpal Stream 是 !Send，只能线程内自持）+ WAV 增量写 + 指标
+      src/pipeline.rs # 音频块 → 长度校验/序号跳变/解码 → 声卡或文件（CLI 与 GUI 唯一入口）
+      src/report.rs   # 音质报告（与 apmctl analyze --json 同一份）
+      src/{state,events,log,settings,keymap_store}.rs
     cli/              # apmctl
       src/{main,cmd}.rs
     gui/              # apm-gui：Tauri 2 主程序 + Info.plist 权限声明
@@ -50,6 +56,7 @@ desktop/
 cd desktop
 cargo test            # protocol 的全部测试，含与 C 实现的逐字节对拍
 cargo build --release # 产出 target/release/apmctl
+../scripts/test-sink.sh  # 真声卡冒烟（默认 #[ignore]；没虚拟声卡就 SKIP）
 ```
 
 `cargo test` 会读 `config/protocol-vectors.json`。那份文件由**固件侧 C 实现**导出：
@@ -61,10 +68,15 @@ cargo build --release # 产出 target/release/apmctl
 
 改了 `device/main/protocol.c` 就必须重跑生成脚本，否则对拍会用旧向量。
 
-## GUI（apm-gui）—— 当前只到 G0
+## GUI（apm-gui）—— G0–G5 已落地
 
-分期方案见 [`../docs/GUI.md`](../docs/GUI.md)。**G0 = 骨架 + 应用身份 + 蓝牙权限 + 设备发现**，
-界面里还没有电平表与推流按钮（那是 G2），现在界面上明确标着"G2 接入"，不显示假数字。
+分期方案见 [`../docs/GUI.md`](../docs/GUI.md)。界面四个 tab：实时（设备 / 电平表 / 指标条 /
+声卡与缓冲 / 开始停止 / 同时保存 WAV）、音质报告、按键映射、诊断。
+
+- 电平表是 canvas 手绘，数据来自后端 5 Hz `telemetry`；**前端不算任何指标**。
+- 推流前会先检查有没有选声卡、声卡是否原生支持 16 kHz；不满足直接报错，不先开流再报错。
+- 会话 WAV 默认不落盘，勾选后写到 `~/Library/Application Support/com.cnryb.ai-passport-mic/sessions/`。
+- 按键映射页只改映射表；**注入层（M3）没实现，改完不会真的敲键盘**，页面里写明了。
 
 ```bash
 ./scripts/build-gui.sh                 # 前端构建 + tauri build --bundles app + 校验 Info.plist
@@ -151,10 +163,10 @@ min / 中位 / p95 / max 与抖动（`--json` 出 `ai-passport-mic-ping-report-1
 - **时钟漂移已补偿，但只在仿真里验过**：`crates/sink/src/playout.rs` 用单样本插删吸收长期
   漂移（比例控制，上限 1%）。仿真里 15933 Hz 生产 / 16000 Hz 消费跑 60 s 零欠载、零超容量
   丢弃；真机上"20 s 差 84 ms"这个数还没用新代码复测。
-- **GUI 只到 G0**：界面能做设备扫描与连接，没有电平表、没有推流按钮、没有按键映射编辑。
+- **GUI 缺 G3b/G6**：回环自动验收仍在 CLI（`apmctl sink --verify`），签名只有 ad-hoc。
 - **编排还没全部进 `apm-app`**：`detect_adapter` / `scan` / `connect` 已在 `apm-app`，
-  但 `record` / `sink` 的编排仍在 `crates/cli/src/cmd.rs`，`apm-app` 也还没依赖 `apm-sink`。
-  这是 G2 的前置——不迁，GUI 和 CLI 会各长一套编排（见 `../docs/GUI.md` 决定 D1）。
+  编排已迁进 `apm-app`（`session` / `pipeline`），CLI 里只剩参数解析与打印，
+  GUI 走同一条管线（见 `../docs/GUI.md` 决定 D1）。
 - **裸二进制不能用蓝牙**：macOS TCC 要求 bundle + 用途声明，直接 `./target/release/apmctl record`
   会被系统 abort，见上文「macOS 上的蓝牙权限」。
 - **满量程毛刺：根因未定位，只做了两端拦截**（`../docs/KNOWN_ISSUES.md` KI-001）。

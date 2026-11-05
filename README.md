@@ -5,16 +5,19 @@
 识别、文字输入或云端 ASR。
 
 > **当前状态：M1 固件真机跑通采集与 BLE 链路；M2 主链路打通——虚拟声卡能当麦克风用；
-> GUI 只到 G0（骨架 + 权限 + 设备发现）。**
+> GUI 的 G1–G5 已落地（电平表 + 推流 + 声卡选择 + 会话 WAV + 音质报告 + 按键映射），
+> G3b（回环自动验收）与 G6（签名公证）未做。**
 > `device/` 是完整的 ESP-IDF 工程：ES8311 采集、IMA-ADPCM 编码、自定义 GATT 传输、
 > 单 ADC 三键手势判定。能编译、能烧录、能在真机上连续采集。
-> `desktop/` 有协议层、BLE 链路、虚拟声卡输出和 `apmctl` CLI（scan / status / record /
-> sink / ping / probe / analyze / selftest），协议与固件用同一份共享向量逐字节对拍。
+> `desktop/` 有协议层、BLE 链路、虚拟声卡输出、`apmctl` CLI（scan / status / battery /
+> record / sink / ping / probe / analyze / selftest）和 `apm-gui` 界面；音频编排只有一份
+> （`apm-app`），CLI 与 GUI 共用。协议与固件用同一份共享向量逐字节对拍。
 > 真机已验证：烧录、ES8311 16 kHz 采集、MTU 247、scan / status / record / sink，
 > 以及**会议软件里当麦克风用**（虚拟声卡输出已实现并实测）。
 > 仍未验证：按键手势逐项核对、链路往返时延（`apmctl ping` 已实现，未烧新固件实测）、
-> 端到端声学延迟、长时间（>10 分钟）稳定性、GUI 首次蓝牙授权。已拦但待真机复测：时钟漂移
-> （单样本插删补偿）、满量程毛刺（固件压静音 + PC 端静音替换）。
+> 端到端声学延迟、长时间（>10 分钟）稳定性、GUI 首次蓝牙授权，以及
+> **GUI G1–G5 的每一条实测验收**（拔电源回 idle、10 min 0 欠载、GUI 与 CLI 同时录对拍）。
+> 已拦但待真机复测：时钟漂移（单样本插删补偿）、满量程毛刺（固件压静音 + PC 端静音替换）。
 > **未解决的问题**（毛刺根因、待复测项、缺失的声学回环）集中在
 > [`docs/KNOWN_ISSUES.md`](docs/KNOWN_ISSUES.md)，不散落在各处。
 > 注意 macOS 上 BLE 必须走 .app bundle 拿权限，见 [`desktop/README.md`](desktop/README.md)。
@@ -40,7 +43,7 @@
 | 路径 | 内容 | 状态 |
 | --- | --- | --- |
 | [`device/`](device/) | 固件工作区（ESP-IDF 5.5.3 / ESP32-C3 / 8 MB Flash / 无 PSRAM） | M1 已实现并真机跑通（按键手势未逐项核对）；见 `device/README.md` |
-| [`desktop/`](desktop/) | PC 软件工作区（Rust workspace：protocol / link / sink / app / cli / gui） | 协议 + 链路 + 声卡输出 + CLI 已实现；GUI 到 G0，见 `desktop/README.md` |
+| [`desktop/`](desktop/) | PC 软件工作区（Rust workspace：protocol / link / sink / app / cli / gui） | 协议 + 链路 + 声卡输出 + CLI + GUI（G1–G5）已实现；G3b/G6 未做，见 `desktop/README.md` |
 | [`config/`](config/) | 按键映射样例、字段说明、跨端协议向量 | 样例 + 说明 + `protocol-vectors.json`（由 C 实现导出） |
 | [`docs/`](docs/) | [产品](docs/PRODUCT.md)、[架构](docs/ARCHITECTURE.md)、[环境](docs/ENVIRONMENT.md)、[音质](docs/SOUND_QUALITY.md)、[路线图](docs/ROADMAP.md)、[参考实现](docs/REFERENCES.md)、[GUI 方案](docs/GUI.md)、[已知问题](docs/KNOWN_ISSUES.md) | 已就绪；未解决项集中在新加的 `KNOWN_ISSUES.md` |
 | [`scripts/`](scripts/) | 环境体检、IDF 激活、基线自检、协议单测与向量导出、固件构建、GUI 打包、macOS app-bundle 运行器 | 可用 |
@@ -77,12 +80,13 @@ cd desktop && cargo test
 ## 按键映射
 
 示例配置见 [`config/button-map.example.json`](config/button-map.example.json)，
-字段说明见 [`config/README.md`](config/README.md)。映射支持 UP / DOWN / OK 的短按、
-双击、长按、按下、抬起，以及 Ctrl / Shift / Alt / Win 修饰键。OK 的按下和抬起默认是
-PTT 采集开关，不能在没有替代停止机制时移除。
+字段说明见 [`config/README.md`](config/README.md)。映射是**一个键一个动作**（UP / DOWN / OK，
+共 3 个事件，`keymap-3`），可叠加 Ctrl / Shift / Alt / Win 修饰键。OK 默认是 PTT 开关
+（按一下开、再按一下关），不能在没有替代停止机制时移除。
 
 > 两端代码都有了：固件把按键手势编码成 BLE 事件发出去，PC 端 `apm-protocol` 能解析并
-> 校验映射表（含 PTT 约束）。**但还没有把事件翻译成实际按键注入** —— 那是 M3 的事。
+> 校验映射表（含 PTT 约束），GUI 的「按键映射」页能编辑、导入导出、恢复默认。
+> **但还没有把事件翻译成实际按键注入** —— 那是 M3 的事，所以现在改映射不会真的敲键盘。
 > 实现时以 `config/README.md` 为准，不要静默改动字段名。
 
 ## 声音质量评估

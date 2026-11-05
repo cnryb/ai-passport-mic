@@ -1,13 +1,16 @@
 # GUI 方案（Tauri 2 + Vue 3）
 
-> **状态：G0 已落地（2026-11-05），G1–G6 未开始。**
+> **状态：G1–G5 代码已落地（2026-11-05），G3b / G6 未完成。**
 > 已实现：Tauri 2 + Vue 3 骨架、`apm-app` 无 UI 内核、`.app` 打包与 ad-hoc 签名、
-> Info.plist 用途声明、设备扫描与连接、诊断日志与诊断页。
-> 未验证：首次蓝牙授权弹窗与"扫到设备"（需要人在系统弹窗点「允许」，本轮两次启动都停在等待授权）。
-> 实施记录与本方案的偏差见 §14。
-> 截至 2026-11-04，`desktop/crates` 只有 `protocol` / `link` / `sink` / `cli` 四个 crate，
-> `desktop/Cargo.lock` 中 `tauri` 命中数为 0，没有任何前端目录。
-> 本文只描述要做什么、怎么切分、怎么验收；确认后再写第一行代码。
+> Info.plist 用途声明、设备扫描与连接、诊断日志与诊断页、**实时电平表与推流（G2）**、
+> **声卡选择与会话 WAV（G3）**、**音质报告页（G4）**、**按键映射编辑（G5）**，
+> 以及 G2 的前置——`record` / `sink` 编排已从 `cli` 迁进 `apm-app`。
+> 真机已验证的只有 G0 的构建与打包；**G1–G5 的验收条目需要接上设备、并由人在系统弹窗
+> 点「允许蓝牙」才能跑**，本轮屏幕处于锁屏状态，探到的是 `no_adapter`，所以那些条目
+> 一律记「未验证」，不写成通过。
+> 实施记录、与方案的偏差、跑过的门禁结果见 §14（自检结论在 §14.2）；
+> `Send` 相关三个坑的收尾在 §14.3。
+> 本文描述要做什么、怎么切分、怎么验收；具体调度与口径以实现为准。
 
 ## 1. 为什么现在做，以及它真正解决什么
 
@@ -168,6 +171,7 @@ Tab（右上角切换，不引 vue-router，条件渲染即可）：
 | `scan_start` | `window_ms?`（≤ 12000） | `()` | 到点自动 `scan_stop` |
 | `scan_stop` | — | `Vec<DeviceInfo>` | `DeviceInfo{ id, name, rssi, is_ours }` |
 | `connect` | `device_id` | `()` | 进度靠 `state-changed` |
+| `set_auto_connect` | `enabled` | `()` | 启动自动连接开关，立即落盘（§14.15） |
 | `disconnect` | — | `()` | |
 | `list_sinks` | — | `Vec<SinkInfo>` | `SinkInfo{ name, uid, channels, min_rate, max_rate }` |
 | `set_sink` | `name` | `()` | 存到配置，下次启动恢复 |
@@ -187,6 +191,7 @@ Tab（右上角切换，不引 vue-router，条件渲染即可）：
 | `telemetry` | 5 Hz | `{ rms_dbfs, peak_dbfs, buffer_ms, blocks, lost_blocks, seq_jumps, device_dropped, underruns, silent_frames, lock_misses, bytes_written, elapsed_ms }` |
 | `event-log` | 边沿 | `{ ts_ms, level, source, message }` |
 | `session-done` | 边沿 | `SessionSummary` |
+| `battery` | 边沿 | `{ pct }`（0..100）。连接后读一次 + 设备数值变化时推送；电量计不可用时不发，`pct` 永不出 0FF/非法值 |
 
 约定：`telemetry` 的 `ts_ms` 用**单调时钟**（`Instant`），不要用 `SystemTime` 或前端 `Date.now()` 做释放计时——前端计时器在后台会被节流。
 
@@ -217,6 +222,8 @@ Tab（右上角切换，不引 vue-router，条件渲染即可）：
 
 1. **bundle identifier 固定为 `com.cnryb.ai-passport-mic`**，开发期也不要改。macOS TCC 授权按 bundle id 记，改了等于所有用户重新授权一次。
 2. 开发期用 ad-hoc 签名（`codesign -s -`）；首次启动必须由 LaunchServices 启动（`open`）才能触发授权弹窗，直接跑 `target/debug/apm-gui` 不会弹。
+   ⚠️ **ad-hoc 没有稳定身份**：重建后是否会重弹授权**不确定**（实测五次里三次弹、两次没弹）。
+   开发期按"可能要重授"对待；G6 用正式证书根治。
 3. 打包不夹带 BlackHole（GPL-3.0，随包分发需商业许可），只做检测 + 指引 + 装完一键验证。
 
 ## 9. 目录与命名
@@ -242,16 +249,16 @@ GUI 必须放在同一个 workspace 里，否则 `link` / `sink` 的依赖会走
 
 每个阶段单独可验收，交付时**分项报状态**，不许压成一句"GUI 好了"。
 
-| 阶段 | 内容 | 验收（必须实测） |
-| --- | --- | --- |
-| **G0 骨架 + 权限** | Tauri 空窗口；`detect_adapter` + `scan_start` 打通 | 双击 `.app` 弹出蓝牙授权；6 s 内列出 `AI Passport Mic`，RSSI 与 `apmctl scan` 相差 ≤ 6 dBm |
-| **G1 连接 + 状态机 + 日志** | connect/subscribe/disconnect、错误码映射、诊断 tab | 连上后 `state=ready`；拔设备电源 → 2 s 内进 `idle` 且日志有记录；关系统蓝牙 → `bt_unavailable` |
-| **G2 实时电平 + 推流** | 电平表、指标条、start/stop、缓冲滑块 | 连续 10 min：0 欠载、0 静音帧；前端 ≥ 30 fps；CPU < 8%（M 系）、内存 < 150 MB |
-| **G3 声卡选择 + 会话 WAV** | 枚举/切换声卡、落盘、收尾顺序 | GUI 与 `apmctl record` 同时录 15 s，块数差 ≤ 1、丢块一致；会话 WAV 能被 `analyze` 直接吃 |
-| **G3b 回环自动验收** | 用 GUI 自身身份申请麦克风，恢复 `probe` / `--verify` | 推 440 Hz 正弦 → 回读 RMS > -30 dBFS；给出稳态延迟数值（这是延迟预算第一次可自动测） |
-| **G4 音质报告** | analyze 视图 + JSON 导出 | 报告字段与 `apmctl analyze --json` 逐字段一致；未测字段为 null |
-| **G5 按键映射** | 12 事件编辑、导入导出、恢复默认 | 改成非默认键位 → 设备按键触发正确；OK 的 PTT 停止路径在任何配置下都可用 |
-| **G6 打包** | 签名、公证、版本号、崩溃日志脱敏 | 干净机器上从 dmg 装 → 首次启动授权 → 完成 G1~G3 验收 |
+| 阶段 | 内容 | 验收（必须实测） | 当前 |
+| --- | --- | --- | --- |
+| **G0 骨架 + 权限** | Tauri 空窗口；`detect_adapter` + `scan_start` 打通 | 双击 `.app` 弹出蓝牙授权；6 s 内列出 `AI Passport Mic`，RSSI 与 `apmctl scan` 相差 ≤ 6 dBm | **PASS（2026-11-05 真机）**：授权弹窗正常、6 s 扫到 7 个设备、RSSI 两边都是 −50 dBm。明细见 §14.7 |
+| **G1 连接 + 状态机 + 日志** | connect/subscribe/disconnect、错误码映射、诊断 tab | 连上后 `state=ready`；拔设备电源 → **≤ 8 s** 内进 `idle` 且日志有记录；关系统蓝牙 → `bt_unavailable` | **部分 PASS**：`ready` 与 `ready → stopping → idle` 已验（修掉了两处 btleplug 挂死）；实测 **7.64 s**，符合 8 s 口径。**口径已于 2026-11-05 由 2 s 调整为 8 s**，理由见 §14.7；「关蓝牙 → `bt_unavailable`」未测 |
+| **G2 实时电平 + 推流** | 电平表、指标条、start/stop、缓冲滑块 | 连续 10 min：0 欠载、0 静音帧；前端 ≥ 30 fps；CPU < 8%（M 系）、内存 < 150 MB | 代码完成。**GUI 侧 10 min 已跑（§14.10）**：50.03 块/秒、丢块 0、设备丢弃 0、缓冲 77–90 ms、漂移 +94 ppm；**欠载 4 次 / 142 帧 → "0 欠载" FAIL（KI-006）**。CPU/内存按全家桶口径均超：**CPU 20.7%**（主进程 3.2%）、**内存 166.9 MB**（主进程 26 MB）；前端 fps 未测。详见 §14.10 |
+| **G3 声卡选择 + 会话 WAV** | 枚举/切换声卡、落盘、收尾顺序 | GUI 与 `apmctl record` 同时录 15 s，块数差 ≤ 1、丢块一致；会话 WAV 能被 `analyze` 直接吃 | 代码完成（枚举带采样率能力、不支持 16 kHz 的设备提前拒绝）；**对拍未做** |
+| **G3b 回环自动验收** | 用 GUI 自身身份申请麦克风，恢复 `probe` / `--verify` | 推 440 Hz 正弦 → 回读 RMS > -30 dBFS；给出稳态延迟数值（这是延迟预算第一次可自动测） | **未实现**：`apmctl sink --verify` 仍在 CLI，GUI 侧没有回环入口 |
+| **G4 音质报告** | analyze 视图 + JSON 导出 | 报告字段与 `apmctl analyze --json` 逐字段一致；未测字段为 null | 代码完成：报告构造只有一份（`apm_app::report`），GUI 的 JSON 由后端同一函数生成 |
+| **G5 按键映射** | **3 个事件**（一个键一个动作）的编辑、导入导出、恢复默认 | 改成非默认键位 → 设备按键触发正确；OK 的 PTT 停止路径在任何配置下都可用 | 编辑/校验/落盘完成，`ok.release` 强制回填 `ptt-stop`；**"按键触发正确"依赖 M3 注入层，未实现**。事件表已于 2026-11-05 两次归并：15 → 6（§14.11）→ 3（§14.12） |
+| **G6 打包** | 签名、公证、版本号、崩溃日志脱敏 | 干净机器上从 dmg 装 → 首次启动授权 → 完成 G1~G3 验收 | **未做**：需要 Apple 开发者证书；当前只有 ad-hoc 签名 |
 
 依赖关系：G0 → G1 → G2 → G3 串行；G3b、G4、G5 可并行；G6 等 G5。
 **G2 之前必须先完成 §12 第 1 条的编排迁移** —— `apm-app` 目前只接管了 `detect_adapter` /
@@ -298,8 +305,8 @@ GUI 必须放在同一个 workspace 里，否则 `link` / `sink` 的依赖会走
 "真机验证 scan/status/record —— 未做"，而这几项都已实测通过；`device/README.md` 标题还挂着
 "未真机验证"，`AGENTS.md` 交付清单也没有 GUI 行。这一轮连同上面四份文件一起对齐了。
 
-表里剩一条没做：`../desktop/README.md` 的技术栈表与目录树已随 G0 落地更新，
-「没有 GUI」那条限制已删；后续 G1/G2 落地时按同样方式补。
+表里的四份文件已随 G0 与 G1–G5 两轮落地更新；`../desktop/README.md` 的技术栈表、
+目录树与「已知限制」也同步改过，"没有 GUI"那条已删。
 
 ## 14. 实施记录（G0）
 
@@ -319,3 +326,409 @@ GUI 必须放在同一个 workspace 里，否则 `link` / `sink` 的依赖会走
 （`Info.plist entries=18`，`codesign --verify --deep --strict` 通过）。
 `bundle.macOS.signingIdentity = "-"`（ad-hoc）：不设它时 Tauri 只做 linker 签名，
 `Info.plist=not bound`，TCC 认不出这是哪个 App。
+
+### 14.1 G1–G5（2026-11-05）
+
+按方案落地的部分不重复，这里只记**与方案不一致**的地方和踩到的坑。
+
+| # | 变化 | 原因 |
+| --- | --- | --- |
+| 1 | 声卡对象放在一条独立的 **std 线程**里，不用 tokio 任务 | `cpal::Stream` 在 0.15 是 `!Send`（`NotSendSyncAcrossAllPlatforms`），放进 `Arc<AppCore>` 编译不过；线程内自持 `Sink` + WAV 写入器，主线程只喂有界 channel。**这条约束的上游变化与升级判据见 [`KNOWN_ISSUES.md`](KNOWN_ISSUES.md) KI-004** |
+| 2 | channel 满时丢**最新**一块并计数，不是丢最旧 | `mpsc` 两端只能各自操作；32 块 = 640 ms，真满了说明声卡线程已经卡死，新旧数据都救不回来。计数进 `overflow_drops`，界面单独显示 |
+| 3 | ~~新增 `apm_link::Ctrl` 句柄~~ **已被 §14.3 取代** | 当时的理由：`Link` 里有 `Pin<Box<dyn Stream + Send>>`，`&Link` 不是 `Send`，Tauri 命令没法 await `&Link` 的 async 方法。现在通知流装进 `Arc<AsyncMutex<…>>`，`Link` 回到 `Send + Sync + Clone`，`Ctrl` 已删除 |
+| 4 | ~~判活改成 `apm_link::is_alive(handle)`~~ **已被 §14.3 取代** | 同上，现在就是 `Link::is_alive(&self)` |
+| 5 | `SinkInfo.uid` 目前等于设备名 | cpal 0.15 没有 `Device::id()`；macOS 上设备名唯一。字段留着是为了以后上 WASAPI 不用改前端契约。cpal 0.17 起有 `Device::id()`，升级时顺手换掉（同 KI-004） |
+| 6 | 事件是 **15** 个，不是文档早先写的 12 个（**已被 §14.11 取代：现在 6 个**） | schema 是 3 个按键 × 5 种手势（短按/双击/长按/按下/抬起），`config/README.md` 才是权威 |
+| 7 | 新增错误码 `keymap_invalid` | 映射校验失败是真实分支，塞进 `internal` 会让用户查到"未预期错误" |
+| 8 | 新增命令 `set_save_wav` / `analyze_session_json` / `reveal_path` | 勾选状态要持久化；"复制 JSON"必须由后端同一份报告函数生成，否则和 `apmctl analyze --json` 迟早不一致；访达定位需要路径 |
+| 9 | **未实现** `run_selftest` | `.app` 里没有 `config/protocol-vectors.json`，跑也是"找不到向量文件"。协议自检仍由 `apmctl selftest` 承担 |
+| 10 | 电平表：后端 5 Hz + 前端 rAF 插值 | 5 Hz 数据直接画会一跳一跳。前端只做动画（上升跟手、下降 24 dB/s，峰值 1.5 s 保持后 12 dB/s 释放），不自己算丢块率 |
+| 11 | 会话 WAV 增量写：先占 44 字节头，收尾回填长度 | 一次会话可能几十分钟（16 kHz × 2 B/s ≈ 32 KB/s），攒内存没意义 |
+| 12 | 断连判定 = 5 s 静默 + `is_connected` 探活；断链后再探一次适配器 | 拔电源不会产生任何通知，"什么都没有"才是信号；探适配器才能区分"设备没了"（`idle`）和"蓝牙被关了"（`no_adapter`） |
+| 13 | `CTRL START` 失败时状态回到 `ready`，不是 `error` | 设备还连着，落到 `error` 会让"再点一次开始"被状态机挡住 |
+| 14 | 会话 WAV 命名 `s<epoch_ms>.wav`，落在 `~/Library/Application Support/com.cnryb.ai-passport-mic/sessions/` | 与配置、按键映射同一个目录，卸载时一起清 |
+
+**仍然没做**（不许在交付里写成已完成）：
+
+- **G3b 回环自动验收**：`--verify` 还在 CLI，GUI 没有回环入口，麦克风权限没在 App 身份下验过。
+- **G6 签名公证**：只有 ad-hoc 签名，没有 Apple 开发者证书。
+- **M3 按键注入**：映射表能编辑、能校验，但**不会真的替你敲键盘**。按键映射页明确写了这一点。
+- **真机验收**：G1–G5 的每一条实测（拔电源 2 s 内回 idle、10 min 0 欠载、GUI/CLI 对拍）都需要设备在手 + 人在弹窗点「允许」，本轮只验证到"内核启动、枚举到 BlackHole 2ch 并写进配置、无适配器时正确落到 `no_adapter`"。
+
+### 14.2 本轮跑过的门禁（2026-11-05）
+
+| 检查 | 命令 | 结果 |
+| --- | --- | --- |
+| 基线自检 | `./scripts/verify.sh` | **PASS**（Structure / Docs links / Scripts / Protocol 44 passed / Vectors / Desktop / Env 全绿） |
+| 桌面端单测 | `cd desktop && cargo test` | **PASS** 93 passed / 0 failed / **1 ignored**，7 个测试目标：`apm-app` 41、`apm-protocol` 31、`c-vectors` 5、`apm-link` 5、`apm-sink` 4、`apmctl` 4、`glitch_repro` 3 |
+| 静态检查 | `cargo clippy --all-targets` | **PASS**，**0 警告**（顺手清掉了 `protocol/src/glitch.rs` 与 `sink/src/playout.rs` 里两条既存的 `collapsible_if`） |
+| 前端类型 | `npx vue-tsc --noEmit` | **PASS** |
+| 前端构建 | `npm run build` | **PASS** |
+| 打包 | `./scripts/build-gui.sh` | **PASS**，`.app` 30.29 MiB，`Info.plist` 用途声明与 bundle id 校验通过 |
+| 真声卡冒烟 | `./scripts/test-sink.sh` | **PASS**（本机有 BlackHole：cpal 按 16 kHz 打开、推 0.5 s 块、`clear` 收尾都成立；**不代表音质合格**） |
+
+| 启动冒烟 | `open "…/AI Passport Mic.app"` | **部分通过**：进程存活、写出 `settings.json`（`sink: "BlackHole 2ch"`, `target_ms: 80`）、日志确认状态 `idle → no_adapter`。**界面渲染未确认**（屏幕锁屏，截图为全黑） |
+
+启动那次的实际日志（`~/Library/Logs/AI Passport Mic/app-20261105.jsonl`）值得单独说清楚，
+因为它容易被误读：
+
+```
+应用内核启动 v0.1.0
+配置：声卡=None 缓冲目标=80 ms 录 WAV=false
+检测蓝牙适配器
+输出声卡改为 BlackHole 2ch          ← 配置里没有声卡时自动选默认，并写回
+适配器探测超时：6 s 内没拿到蓝牙适配器状态
+状态 idle → no_adapter
+```
+
+- 「适配器探测超时」**不是**"蓝牙关着"：同机 `system_profiler SPBluetoothDataType` 显示
+  `State: On`。真实原因是 TCC 蓝牙授权弹窗没人点（屏幕锁着），
+  6 s 超时兜底把界面从"检测中"解出来，这正是 §14 第 5 条那个 bug 的修复在起作用。
+- 「配置：声卡=None」是因为冒烟前删了 `settings.json`，随后自动选默认声卡并写回，
+  不是读取配置失败。
+
+**没跑过的**：`./scripts/build-firmware.sh`（本轮没改固件）、G1–G5 的人工验收路径、任何需要蓝牙适配器的场景。
+
+### 14.3 三个坑的收尾（2026-11-05 第二轮）
+
+§14.1 记了三个"只能这么写"的坑。这一轮把能消掉的消掉了，消不掉的明确标成债。
+
+| 坑 | 处置 | 结果 |
+| --- | --- | --- |
+| `&Link` 不是 `Send`（因为有 `Pin<Box<dyn Stream + Send>>`） | **彻底消掉**：通知流装进 `Arc<AsyncMutex<…>>`（`Mutex<T>: Sync` 只需 `T: Send`），`Link` 变成 `Send + Sync + Clone` | `apm_link::Ctrl` 整个删除；`is_alive` 从自由函数变回 `Link::is_alive(&self)`；`next_notification` / `ping` 从 `&mut self` 变 `&self`。`core` 不再握着锁跨 await，Tauri 命令不用等那 700 ms 窗口 |
+| `cpal::Stream` 是 `!Send` | **消不掉**（钉在 cpal 0.15）：改成可执行的债 —— [`KNOWN_ISSUES.md`](KNOWN_ISSUES.md) **KI-004** 写清上游 0.17/0.18 已给 CoreAudio 加 `Send`、破坏性改动清单、以及"升级前后各跑一次 `test-sink.sh`"的判据 | 设计不变（声卡独占线程），但它从"没得选"变成"有得选，暂时不选" |
+| 真声卡测试"没声卡就 return"，`cargo test` 显示 ok | **消掉假通过**：改 `#[test] #[ignore]`，新增 [`scripts/test-sink.sh`](../scripts/test-sink.sh) 先探设备再跑，没设备就明说 SKIP | `cargo test` 现在会显示 `1 ignored`，不再假装测过；本机有 BlackHole，脚本实跑 **PASS** |
+
+新增的回归门（都是编译期/生命周期层面的，不依赖硬件）：
+
+- `link_is_send_sync_and_clone` —— 谁把 `Arc<AsyncMutex<…>>` 拆掉，这条立刻红；
+- `shared_link_can_cross_await_boundary` —— 构造一个持有 `&Link` 的 `Send` future，
+  能构造出来就说明 auto-trait 没退化；
+- `core_stays_send_and_sync` —— `AppCore: Send + Sync`、`SessionHandle`/`Pipeline: Send`，
+  有人把声卡对象挪进内核会当场编译失败；
+- `session_can_restart_after_finish` —— 线程真的回收了，能连着开第二条会话；
+- `drop_without_finish_still_closes_wav` —— 异常路径 `Drop` 仍 join 线程并回填 WAV 头。
+
+**仍然没解决**：`cpal` 版本没升（KI-004）；真声卡测试只证明"打开/写入/收尾成立"，
+**不证明音质、延迟、长时间稳定性**；`SinkInfo.uid` 还是设备名。
+
+### 14.4 release 打包与重新授权（2026-11-05 第三轮）
+
+| 变化 | 原因 | 结果 |
+| --- | --- | --- |
+| `build-gui.sh --release` **原来是坏的** | Tauri 2 里 release 是**默认**行为，没有 `--release` 这个 flag；脚本把 `${profile}` 原样传给 `tauri build`，被当成位置参数报 `unexpected argument '--release' found`。只有 `-d/--debug` 可选 | 改成按 profile 决定是否加 `-d`：`--release` → `tauri build --bundles app`，默认 → `tauri build --debug --bundles app`。修完出包通过 |
+| G2 的性能指标必须用 **release** 包测 | debug 包带边界检查、不打优化，CPU 与帧率都不能当验收数据 | `.app` 出在 `desktop/target/release/bundle/macos/` 与 debug 包**同 bundle id**，TCC 记录不因路径变化而重置（但见下一条） |
+| **重新打包后要不要重新授权：不确定** | ad-hoc 签名没有稳定身份，macOS 可能按路径、也可能按代码哈希认，行为不稳 | 实测五次：debug 路径探测成功 → 换 release 路径 **弹窗** → release 原地重建 **不弹** → 改 `core.rs` 重建 **弹** → 再改重建 **又弹** → 改 keymap 重建 **不弹**。结论：**重建后可能弹也可能不弹，无法预测**；开发期一律按"可能要重授"对待，别把"上一次没弹"当保证。G6 换成正式开发者证书才能根治 |
+
+这一条对 G0 的验收口径有影响：**"首次启动弹授权"要在最终那个构建上验一次**，
+不能拿早先一次 debug 包的授权成功来顶。`apmctl-macos.sh` 那套 `APMCTL.app` 是另一套
+bundle，因此 CLI 的授权与 GUI 的授权互不相干，两处都可能各弹一次。
+
+### 14.5 `--smoke-scan` 在这台机器上不生效（2026-11-05，未修）
+
+§14 第 4 条给的无人值守验收开关，本轮**用不了**：
+
+| 尝试 | 结果 |
+| --- | --- |
+| `open <abs-path>.app --args --smoke-scan` | 诊断日志里 `SMOKE` 出现 **0** 次，只有 boot 那条"检测蓝牙适配器"；`pgrep -fl` 显示的 argv 里也没有该参数 |
+| `open -n <abs-path>.app --args --smoke-scan` | 同上 |
+| `open -a "AI Passport Mic" --args --smoke-scan` | 同上 |
+| `launchctl setenv APM_GUI_SMOKE scan` | 被系统拒绝：`Not privileged to set domain environment` |
+| 直接跑 `Contents/MacOS/apm-gui --smoke-scan` | **exit 134（SIGABRT）**——TCC 以缺蓝牙用途声明 abort，印证 §8 第 2 条"必须 LaunchServices 启动" |
+
+结论：**G0 的"扫到设备"这条目前只能人工点「扫描」验**，`run_smoke` 那条自动路径等于断了。
+要恢复它，参数得从别的地方进来（文件哨兵、`NSUserDefaults`、或者写进 `settings.json` 的
+一次性开关），不能再依赖 `open --args`。**G0 至今没有自动化证据，只有 §14 记的那次人工冒烟。**
+
+### 14.6 GUI 与 CLI 不能同时占设备（不是 bug，但要写进流程）
+
+设备只支持一条 BLE 连接。GUI 开着（哪怕没点连接、只是探测过）时起 `apmctl sink`，
+块率会从 50 块/秒掉到 1.5 块/秒，欠载和漂移数值全部失真。**所有 CLI 侧长测前必须先退 GUI。**
+
+配套的另一种脏数据来自设备自己（异常断开后不恢复），实测与处置见
+[`KNOWN_ISSUES.md`](KNOWN_ISSUES.md) **KI-005**。
+
+
+### 14.7 G0 / G1 真机验收（2026-11-05，人在场那一轮）
+
+#### G0 权限与扫描：**PASS**
+
+| 验收项 | 结果 |
+| --- | --- |
+| 双击 `.app` 弹出蓝牙授权 | 出现，手动点「允许」后生效（同一个 `com.cnryb.ai-passport-mic` 在不同构建上弹了不止一次，见 §14.4） |
+| 6 s 内列出 `AI Passport Mic` | 扫描窗口 6000 ms，一次扫到 **7 个设备**，目标设备在列 |
+| RSSI 与 `apmctl scan` 相差 ≤ 6 dBm | 两边都是 **−50 dBm**，差 0 dBm |
+
+#### G1 连接与断链：**部分 PASS**
+
+| 验收项 | 口径 | 实测 | 结论 |
+| --- | --- | --- | --- |
+| 连上后 `state=ready` | 必须 | `idle → connecting → ready`，连接耗时 **2.1 s**（第一次 5.0 s，冷启动广播窗口） | PASS |
+| 拔设备电源 → 回到 `idle` | **≤ 8 s**（2026-11-05 由 2 s 调整） | **7.64 s**（5 s 静默 + 2 s 探活 + 0.64 s 调度） | PASS |
+| 断链后能从 `ready` 走回 `idle` | 必须 | `ready → stopping → idle`，`stopping` 只停留 1 ms | PASS（修完才成立，见下） |
+| 关系统蓝牙 → `bt_unavailable` | 必须 | 未测（关蓝牙会一起断掉本机的 BLE 鼠标，留到专场） | SKIP |
+
+**这一轮修掉的两个真 bug**（都只有真机能暴露）：
+
+1. `btleplug::Peripheral::is_connected()` 在设备消失后**不返回**。原来的判定是
+   「5 s 静默 → 问一次链路」，问的那一句直接挂死，监控循环再也不动，
+   **状态永久停在 `ready`、界面继续显示"已连接"、日志一行不写**。
+   修法：探活加 2 s 超时（`LINK_PROBE_TIMEOUT`），超时按"已断开"处理并记 warn。
+2. `Peripheral::disconnect()` 同样会挂。修完第 1 条之后，状态走到 `stopping` 就停住，
+   永远回不到 `idle`。修法：断开调用加 3 s 超时（`DISCONNECT_TIMEOUT`），
+   并且当监控循环已经判定链路丢失（`link_lost`）时**直接跳过**这次调用——
+   对一只已经不在的外设调断开只会白等。
+
+**为什么原来的"2 s 内进 idle"是错的口径**：实现上是**轮询**判活（设备 1 Hz 心跳 → 5 s 静默
+才认定可疑 → 再探活），最快也不可能低于 5 s；`is_connected()` 卡住时还要再加 2 s。
+这条口径是从"系统会立刻推断连事件"的假设写下来的，但本实现没有订阅
+btleplug 的 `CentralEvent::DeviceDisconnected`。
+
+**决定（2026-11-05，项目负责人确认）：口径改成 ≤ 8 s**，与轮询设计对齐。
+事件驱动那条路仍然值得做（能把反应压到 < 1 s），但另开一轮：work 在 `apm-link` 要保存
+并暴露 manager 的事件流，轮询保留作兜底。
+
+### 14.8 G2 第一次尝试：**未通过，且这一跑的数据不可信**（2026-11-05）
+
+按 G2 的口径（连续 10 min：0 欠载、0 静音帧；前端 ≥ 30 fps；CPU < 8%、内存 < 150 MB）试了一跑，
+结果是废的：
+
+| 指标 | 实测 | 说明 |
+| --- | --- | --- |
+| 块率 | 约 **28 块/秒**（名义 50/s） | 一半的块根本没到 |
+| 丢块 / 跳变 | 3498 / 3398 | 序号跳变说明链路层就丢了 |
+| 设备丢弃 | **3992** | 设备自己报的发送侧丢弃，干净会话是 0 |
+| 欠载 / 静音帧 | 6100 / 1089273 | 声卡在狂补静音 |
+| 缓冲 / 漂移 | 掉到 20 ms / 打到 −9997 ppm 下限 | 存量被抽干 |
+
+**结论：不是 GUI 性能问题，是设备又进了 KI-005 的"半死"态。**证据链：同一台机器、同一条链路，
+复位后 `apmctl sink --seconds 30` 立刻回到 1498 块 / 0 丢块 / 0 欠载 / 设备侧丢弃 0。
+差别只在"连接 → START"的间隔（CLI 立刻发，GUI 等了约 90 秒）。详见
+[`KNOWN_ISSUES.md`](KNOWN_ISSUES.md) **KI-005 的第二种触发方式**。
+
+**因此 G2 的四条口径一个都没拿到有效数据**：
+
+- 0 欠载 / 0 静音帧：这次不成立（但成因是设备态，不是声卡）；
+- 前端 ≥ 30 fps：没有采集手段，未测；
+- CPU < 8% / 内存 < 150 MB：**自动化侧读不到** —— 沙箱内 `ps` / `top` 都是
+  `operation not permitted`，退出沙箱后仍被拦；用 UI 脚本操作活动监视器被辅助功能权限挡住。
+  这一项要么人肉读活动监视器，要么在应用内加一个"诊断页显示自身 CPU/内存"的功能（后者更可靠，
+  也符合"GUI 自己能报自己"的方向）。
+
+**下次怎么跑**：复位设备 → 立刻连接 → **30 s 内点开始**（别让它在 `ready` 上干等）→ 跑满 10 min。
+
+### 14.9 开流前预置 STOP（2026-11-05 修复）
+
+针对 §14.8 那次作废的跑法，改了两处：
+
+| 位置 | 改动 |
+| --- | --- |
+| `apm-app` `start_stream` | 校验通过后、开声卡之前，先发一次 `CTRL STOP`，静默 `CAPTURE_RESET_SETTLE = 120 ms`，再开声卡、再 `START`。STOP 对 idle 设备是幂等的，失败只记 debug 不阻塞 |
+| `apmctl record` / `apmctl sink` | 同样在 `start_capture()` 前调 `reset_capture_state()`（STOP + 120 ms），跟内核语义对齐 |
+
+为什么值得加：这是"设备停在半死态"的唯一低成本兜底。加之前，GUI 只要在 `ready` 上多停一会儿
+就必然半死（§14.8 实测块率 28/s、设备侧丢弃 3992）；加之后每次开流都先把设备打回 idle 再启动。
+代价是点"开始"到出声多 120 ms。
+
+**顺带发现（文档与实现不一致，已记录未修）**：`AGENTS.md` 写的"编排只有一份——
+`connect` / `start_stream` / `stop_stream` 全在 `apm-app`，`cli` 只解析参数与打印"
+**对 `record` / `sink` 不成立**。`crates/cli/src/cmd.rs` 仍然自己调
+`apm_link::connect()`、自己的通知循环、自己的 `start_capture()` / `stop_capture()` / `disconnect()`；
+共用的只有 `apm_app::Pipeline`（解码、丢块、毛刺抑制）与 `apm_app::report`。
+
+后果不是纯文档问题：本轮这个"开流前 STOP"就得在**两处**各改一遍，正是 §12 决定 D1 想避免的分叉。
+要真正统一，`apm-app` 需要一个能覆盖"不落 WAV / 不枚举声卡 / 自定义时长"的会话入口，
+`record` 与 `sink` 都改成调它。**这属于重构，另开一轮，别顺手做。**
+
+### 14.10 G2 第二次尝试：链路全绿，欠载仍有 4 次（2026-11-05 13:29–13:39）
+
+加了 §14.9 的"开流前预置 STOP"之后重跑。这次是**同一台机器、同一设备、GUI 全程前台**：
+
+| 指标 | 10 min 时读数 | 口径 | 结论 |
+| --- | --- | --- | --- |
+| 块数 | **46949 / 939.0 s = 50.00 块/秒**（收尾统计；10 min 采样点是 30922/618 s） | 50/s | PASS |
+| 丢块 / 跳变 | **0 / 0** | 0 | PASS |
+| 设备侧丢弃 | **0** | 0 | PASS（对比 §14.8 的 3992） |
+| 缓冲存量 | 77–90 ms（目标 80） | 不触底 | PASS |
+| 漂移补偿 | +12 ~ +99 ppm | ±5000 内 | PASS |
+| 欠载 / 静音帧 | **13 次 / 1351 帧（≈84 ms）**（10 min 时是 4 次） | 0 | **FAIL**（同 KI-006） |
+| 锁定失败 / 溢出 | 1 / 0 | 0 | 锁定失败 1 次可忽略 |
+| 前端 ≥ 30 fps | 未测 | ≥30 | 未测（没有采集手段） |
+| CPU / 内存 | 见下 | CPU < 8%、内存 < 150 MB | 部分 |
+
+**内存（活动监视器实测，按进程拆开）**：
+
+| 进程 | 内存 | 线程 |
+| --- | --- | --- |
+| AI Passport Mic Graphics and Media | 76.4 MB | 9 |
+| tauri://localhost（WebView） | 58.5 MB | 7 |
+| AI Passport Mic（主进程） | **26.0 MB** | 27 |
+| AI Passport Mic Networking | 6.0 MB | 4 |
+| **合计** | **166.9 MB** | — |
+
+⚠️ **"内存 < 150 MB"这条口径必须写死按哪个数**：按主进程 26 MB 算宽松通过；按 App 全家桶
+合计 166.9 MB 算超了 16.9 MB。Tauri 的 WebView 与音视频 helper 是独立进程，只看主进程会漏掉
+83% 的占用。建议后续口径改成"全部相关进程 RSS 合计"。
+
+**CPU（活动监视器 %CPU，采样于推流稳定期）**：
+
+| 进程 | % CPU | % GPU |
+| --- | --- | --- |
+| AI Passport Mic Graphics and Media | **11.4** | 2.6 |
+| tauri://localhost（WebView） | **6.1** | 0.0 |
+| AI Passport Mic（主进程） | **3.2** | 0.0 |
+| AI Passport Mic Networking | 0.0 | 0.0 |
+| **合计** | **20.7** | — |
+
+⚠️ 同内存那条：**按主进程 3.2% 算 PASS，按全家桶 20.7% 算 FAIL（超 `CPU < 8%` 口径 2.6 倍）**。
+占比最大的是 Graphics and Media helper——电平表 60 fps canvas 渲染 + 音频回调。
+要压下来得从"电平表只在窗口可见时按 60 fps 画、后台降到 5 fps"这类地方下手，
+现在无论窗口是否可见都在全速渲染。
+
+**结论**：这一跑证明了 §14.9 的修复有效——同样的 GUI 操作路径，设备侧丢弃从 3992 变成 0，
+块率从 28/s 回到 50.03/s。**G2 的实测结论（按"全家桶"口径）**：
+
+| 口径 | 实测 | 结论 |
+| --- | --- | --- |
+| 块率 / 丢块 / 设备侧丢弃 | 50.03/s、0、0 | PASS |
+| 缓冲 / 漂移 | 77–90 ms、+94 ppm | PASS |
+| 0 欠载 / 0 静音帧 | 4 次 / 142 帧 | **FAIL**（KI-006） |
+| CPU < 8% | 主进程 3.2% / 全家桶 20.7% | **FAIL**（全家桶口径） |
+| 内存 < 150 MB | 主进程 26 MB / 全家桶 166.9 MB | **FAIL**（全家桶口径） |
+| 前端 ≥ 30 fps | 未测 | 未测 |
+
+也就是说：**链路和音质链路的四项全过，卡住的是"性能"与"偶发欠载"**，而不是功能。
+
+**这一跑的最终数字（以会话收尾统计为准，不是中途截图）**：第一段 **46949 块 / 939.0 s =
+50.00 块/秒**、欠载 13、静音 1351 帧（≈84 ms）、丢块 0、设备侧丢弃 0；
+第二段（点了停止后又点开始）987 块 / 19.7 s、欠载 2、同样 0 丢块。
+
+**欠载率对比**（同机同设备）：
+
+| 路径 | 时长 | 欠载 | 折合每分钟 |
+| --- | --- | --- | --- |
+| CLI `sink`（§KI-006） | 600 s | 10 | 1.0 次/min |
+| GUI（本节） | 939 s | 13 | 0.83 次/min |
+
+两条路径同一个量级，**说明 KI-006 与 GUI/WebView 无关**，是声卡回调或漂移控制器层面的问题。
+
+**另一个小发现**：点「停止」之后日志里还会出现 2 条 `收到音频块但当前未推流`——STOP 之后设备
+仍有余量在发（在途的块）。这属于预期，但会让人误以为"没用停"。若要干净，可以在 STOP 后
+把音频通知静默 200 ms 再退订。
+
+### 14.11 按键事件归并：15 → 6（2026-11-05，**已被 §14.12 取代**）
+
+**背景**：一台无线麦克风只有 UP / DOWN / OK 三个键，映射表却有 3 × 5 = 15 行
+（短按 / 双击 / 长按 / 按下 / 抬起）。用户记不住，固件还要维护双击窗口（180 ms）与
+长按阈值（500 ms）两套定时器，联调时每加一个手势就要重测一遍时序。
+
+**决定（项目负责人确认）**：归并到 **3 键 × 按下/抬起 = 6 个事件**，保留 PTT 的
+"按住说话、松手停"语义。没有采用"每键一个动作"的开关式方案——那会把 PTT 从
+按住改成切换，得同时改固件状态机。
+
+| 改动面 | 内容 |
+| --- | --- |
+| `apm_protocol::keymap` | `SCHEMA` → `ai-passport-mic-keymap-2`；`EVENTS` 常量改成 6 个（**唯一一份**事件表）；`is_supported_event` 只认 `press`/`release` |
+| v1 兼容 | 读 `keymap-1` 文件时**静默丢弃** `short`/`double`/`long`，其余照旧校验——整份拒绝等于把用户上次存的映射无声清空。落盘/导出即 v2 |
+| `apm_app::keymap_store` | `EVENTS` 不再本地硬编码 15 个字符串，直接取 `keymap::EVENTS`（v1 时两处各抄一份，差点只改一半） |
+| GUI | `EVENT_LABEL` 6 条；导入框提示改 v2；页面说明写明"注入层属于 M3，尚未实现" |
+| `config/README.md` | 重写「事件名」「迁移：v1 → v2」「与固件的关系」三节，`button-map.example.json` 换成 v2 样例（单测直接 `include_str!` 它，坏掉会当场红） |
+| **固件 / 协议** | **一行没改**。EVENT 帧仍然上报 5 种手势码（0..4），跨端向量、UUID、帧格式都不动；PC 端只消费 `PRESS`/`RELEASE` |
+
+**为什么不动固件**：改协议要同步 `ARCHITECTURE.md`、重生成 `config/protocol-vectors.json`、
+两端一起重测，收益只是省几帧通知。固件的 `buttons.c` 手势判定留着不碍事——
+它现在只是"多发了几种 PC 不认识的事件"。真要删，等下一版固件顺路做。
+
+**新的坑（已规避）**：v1 的 `up.short` 在 v2 里是**非法事件名**，会走 `UnknownEvent`。
+所以 `parse` 必须先在 schema 层判断版本，再决定"丢弃"还是"报错"——顺序反了就会让
+所有老用户打开就报错。
+
+### 14.12 再归并一步：6 → 3，一个键一个动作（2026-11-05）
+
+§14.11 归到 6 个之后，项目负责人要求**再减到 3 个**："每个键一个就行"。于是：
+
+| | v1 | v2（§14.11） | **v3（本节）** |
+| --- | --- | --- | --- |
+| 事件数 | 15 | 6 | **3** |
+| 事件名 | `up.short` … | `up.press` / `up.release` … | **`up` / `down` / `ok`** |
+| PTT | 按下开 / 抬起停 | 按下开 / 抬起停 | **按一下开、再按一下关（`ptt-toggle`）** |
+
+**这是一个语义变更，不只是删行。** 之前 OK 是"按住说话"，松手自动停；现在是 toggle，
+按一次开、再按一次关。好处是三个键三个动作，零手势记忆；代价必须写清楚：
+
+> **toggle 没有"松手自动停"。** 开着麦去接杯水，回来还在采。
+> M3 的注入层落地时必须同时做两件事：① 界面上永远能看到"正在采集"；
+> ② 一个超时兜底（例如连续 10 分钟自动停）。
+
+| 改动面 | 内容 |
+| --- | --- |
+| `apm_protocol::keymap` | `SCHEMA` → `ai-passport-mic-keymap-3`；`EVENTS = ["up","down","ok"]`；`PTT_TOGGLE` 取代 `ptt-start`/`ptt-stop`；错误类型 `PttStopMissing` → `PttToggleMissing` |
+| 迁移 | `Legacy::{None,V2,V1}` 三态：v2 的 `press` **优先**、`release` 仅在缺 press 时补位；v1 先丢手势再按 v2 规则走；两个旧动作名统一改写成 `ptt-toggle`。**迁移必须在事件名校验之前**，顺序反了老文件直接报错 |
+| `apm_app::keymap_store` | `locked` 从 `ok.release` 改成 `ok`；兜底强制回填 `ptt-toggle` |
+| GUI | `EVENT_LABEL` 3 条；页面说明改成"开关式 + 忘记关麦是真实风险" |
+| 配置 | `config/README.md` 重写（事件名 / 迁移 v1·v2 → v3 / 与固件的关系），`button-map.example.json` 换 v3 |
+| 固件 / 协议 | **仍然一行没改**：EVENT 帧照发 0..4 五种手势码，PC 只消费 `PRESS` |
+
+**已知副作用（写进 `ARCHITECTURE.md` 了）**：双击 = 两次 `PRESS`，在 toggle 下等于"开了又关"，
+看起来像没反应。三键方案必然的代价；真要双击语义，得单独加事件而不是指望 toggle 兼容。
+
+**测试**：v1 → v3、v2 → v3 两条迁移各有一格（`migrates_v1_by_dropping_gestures`、
+`migrates_v2_press_wins_over_release`），另有 `rejects_legacy_ptt_action_in_v3` 钉住
+"旧动作名写进 v3 必须报错，不能被悄悄放过"。
+
+### 14.13 注入层落地：开麦/关麦自动点按快捷键（2026-11-05）
+
+**需求原文**：「我需要对着麦克风说话的时候，同时触发快捷键」——确认后定型为
+**一次性点按，开麦与关麦各触发一个可配置的快捷键**。
+
+| 层 | 改动 |
+| --- | --- |
+| `apm_protocol::keymap` | schema → `keymap-4`；新增 `HOOK_EVENTS = ["capture.start","capture.stop"]` 与 `hooks` 表；钩子里禁止 `ptt-toggle`（开麦瞬间再 toggle 会自己关掉自己，错误类型 `HookCannotToggle`）；`resolve()` 统一查两张表 |
+| `apm_app::inject`（新模块） | CGEvent 键注入：键码表覆盖 `is_supported_key` 白名单里 macOS 真实存在的键（`printscreen`/`menu`/`insert` 没有，明确报"做不到"而不是静默丢弃）；修饰键走事件 flags，**不单独发修饰键事件**，因此不存在"按下去没松开" |
+| `apm_app::core` | `fire_hook(event)`：开麦成功 → `capture.start`；手动停止 → `capture.stop`；**链路断开导致的收尾也要触发**（否则上次注入的"开"就永远没人复位）。注入跑在独立 std 线程（`apm-inject`），失败只记日志，**绝不影响音频路径**；每次现读映射表 |
+| `apm_app::keymap_store` | 界面上 3 按键 + 2 钩子一起展示（`all_events()`），存盘分流：按键进 `bindings`、钩子进 `hooks` |
+| GUI | `EVENT_LABEL` 加两行（"开麦时 · 注入" / "关麦时 · 注入"）；按键映射页顶部**权限引导横幅**：`inject_permission` 命令查 `AXIsProcessTrusted()`，缺权限时分步引导 + `open_accessibility_settings` 一键跳到系统设置的辅助功能面板，缺权限状态下每 2 s 自动复查，授权后横幅自动消失（无需重启） |
+
+**为什么钩子不能绑 `ptt-toggle`**：开麦那一刻注入一个"toggle 采集"，等于自己把自己关掉。
+`KeyMap::parse` 直接拒绝，错误文案解释原因。
+
+**权限的坑（macOS）**：没有辅助功能权限时 `CGEventPost` **不报错、静默丢弃**。
+所以注入前先 `AXIsProcessTrusted()` 探一次，没权限直接报
+「没有"辅助功能"权限：系统设置 → 隐私与安全性 → 辅助功能，把本 App 打开后重试」，
+而不是让用户以为功能坏了。**这个权限需要人工去系统设置里勾**，应用内无法替代——
+能做的是把人送到那一页（按键映射页的引导横幅）并在勾完之后自动感知。
+
+**测试**：`ptt-toggle` 不可注入、白名单键码全覆盖校验、钩子 round-trip 不丢、
+钩子禁 `ptt-toggle`。（真机端到端——键真的落到目标应用——需要人工授权限后验证，尚未做。）
+
+### 14.14 设备按键直连：OK 开关采集，up/down 注入（2026-11-05）
+
+真机验收发现：设备按键事件到 PC 后**只记了日志、没有任何动作**（`handle_notification`
+的 `Notification::Event` 分支），用户按 OK"没反应"——钩子触发的开/关其实都是界面按钮
+触发的。本次把 M3 的「按键事件直连」补上：
+
+| 项 | 说明 |
+| --- | --- |
+| PRESS 分发 | `Notification::Event` 且 `event == msg::EVENT_PRESS` 时进 `handle_button_press`：`button_name()` 映射 0/1/2 → `up`/`down`/`ok`，现读映射表解析动作 |
+| `ok`（`ptt-toggle`） | `toggle_ptt`：没在推流就 `start_stream`（用当前设置的 save_wav），在推流就 `stop_stream`——与界面按钮同一条路径，钩子照常触发 |
+| `up` / `down` | 配了普通键 → `inject_in_background` 点按注入；未绑定 = 不动作 |
+| 防抖 | `ptt_switching: AtomicBool`：切换进行中再来的 PRESS 忽略。DOUBLE 的两次 PRESS 相隔约 180 ms，落在切换窗口内只算一次动作——修复了 ARCHITECTURE 里"开了又关"的已知副作用 |
+| 日志 | 动作结果落 `button` 源：`PTT 开麦完成` / `关麦完成` / busy 记 debug / 失败记 warn |
+
+### 14.15 启动自动连接上次设备（2026-11-05）
+
+**需求原文**：「每次重启之后都要重新去搜索、连接这个设备，能不能自动连接」。
+
+| 层 | 改动 |
+| --- | --- |
+| `apm_app::settings` | 新增 `last_device_id` / `last_device_name`（连接成功即写盘，手动断开不清除）与 `auto_connect` 开关（默认开）；旧 settings.json 无新字段时反序列化回默认值，不炸 |
+| `apm_app::core` | `connect()` 成功后记住设备；新增 `auto_connect()`：仅在 `idle` 且开关打开时复用 `connect()`（同一套状态机/超时/监控派生），**失败不算事故**——落回 `idle` 记 warn，不弹错误横幅；新增 `set_auto_connect()` |
+| GUI 启动 | `setup` 的后台任务在 `detect_adapter` 成功后调 `auto_connect()`，不阻塞界面；状态经 `state-changed` 事件照常驱动前端 |
+| GUI 界面 | 设备卡头部新增「自动连接」勾选框（`set_auto_connect` 命令）；idle 且有记录时显示"上次连接：X，启动时自动连接" |
+
+**为什么可行**：macOS 的 `PeripheralId` 是 CoreBluetooth identifier，跨进程重启稳定；
+`apm_link::connect(Some(id))` 自带扫描循环（10 s 窗口），设备已上电并广播即可直连，
+不依赖"先扫描过一次"。
+
+**边界（如实声明）**：设备没上电/不在广播时自动连接 10 s 后放弃，回到待连接；
+自动重连（运行中掉链后自己重连）**未做**，仍要手动扫一次。真机验收未跑（需人工接设备）。

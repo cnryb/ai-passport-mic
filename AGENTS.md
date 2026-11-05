@@ -5,15 +5,21 @@
 
 ## 当前状态（务必先接受这个事实）
 
-本仓库是 **AI Passport Mic**：固件落到 M1 并已在真机上跑通采集与 BLE 链路，桌面端落到 M2 的一部分。
+本仓库是 **AI Passport Mic**：固件落到 M1 并已在真机上跑通采集与 BLE 链路；
+桌面端 M2 主链路（BLE → 解码 → 虚拟声卡）已实测可用，GUI 落到 G1–G5（代码完成，
+真机验收未做）。
 
 - 有：`docs/`、`config/`（按键映射 + **跨端协议向量**）、`scripts/`、`device/`（ESP-IDF 工程）、
   `desktop/`（Rust workspace：protocol / link / sink / app / cli / gui）。
-- **没有**：按键注入、GUI 的电平表与推流界面（G2）。GUI 只到 G0：骨架 + 蓝牙权限 + 设备发现。
-  所以"录 WAV 并分析""推虚拟声卡"靠 `apmctl`，"点界面连设备"靠 `apm-gui`。
-- **编排只迁了一半**：`detect_adapter` / `scan` / `connect` 已在 `apm-app`，
-  `record` / `sink` 仍在 `crates/cli/src/cmd.rs`（`apm-app` 尚未依赖 `apm-sink`）。
-  GUI 的 G2 之前必须迁完，否则两个前端各长一套编排。
+- **有**：GUI 的 G1–G5——状态机、实时电平与推流、声卡选择与会话 WAV、音质报告、按键映射编辑。
+- **有**：按键注入（M3，macOS：CGEvent 点按 + 采集钩子 `capture.start` / `capture.stop`，
+  左右 Alt `lalt` / `ralt`，**设备按键直连**——OK 键开关采集、up/down 注入映射键、
+  切换窗口防抖，映射页内置辅助功能权限引导横幅；**真机端到端验收未做**）。
+- **没有**：G3b 回环自动验收（`--verify` 仍在
+  `apmctl`）、G6 签名公证（只有 ad-hoc）、GUI 的 `run_selftest`、Windows 注入（SendInput）。
+- **编排只有一份**：`detect_adapter` / `scan` / `connect` / `start_stream` / `stop_stream`
+  / 采集解码写声卡全在 `apm-app`（`core` / `session` / `pipeline`）。`cli` 与 `gui` 都只调它，
+  「录 WAV 并分析」用 `apmctl` 或界面都行，走的是同一条管线与同一份报告。
 - 门禁现状（不要假设更多）：
   - `./scripts/verify.sh` —— 结构 / 文档内链 / 脚本权限 / 协议单测 / 向量新鲜度 /
     `cargo test` / 环境快照。
@@ -23,8 +29,16 @@
     改固件后自己跑一次并在交付里如实报告。
   - `./scripts/build-gui.sh` —— 前端构建 + `tauri build --bundles app` + 校验 Info.plist
     的蓝牙/麦克风用途声明。**不在** verify 里（首次要拉 400+ crate）。
+  - `./scripts/test-sink.sh` —— 真声卡冒烟（`session_with_real_sink`，默认 `#[ignore]`）。
+    没装虚拟声卡时明说 SKIP，不假装测过。**不在** verify 里（要硬件）。
   - `cargo test` 用 workspace 的 `default-members`，**不含** `crates/gui`；GUI 要单跑
     `cargo test -p apm-gui` 或 `./scripts/build-gui.sh`。
+  - 最近一次全绿（2026-11-05）：`verify.sh` 七项全 PASS（协议 44 passed）、
+    `cargo test` **93 passed / 0 failed / 1 ignored**、`clippy --all-targets` **0 警告**、
+    `vue-tsc` 与 `npm run build` 通过、`build-gui.sh` 出包 30.29 MiB 且 Info.plist 校验通过、
+    `test-sink.sh` 在有 BlackHole 的机器上 PASS。明细见
+    [`docs/GUI.md`](docs/GUI.md) §14.2。**这些只说明"编得过、单测过、打得出来"，
+    不说明 G1–G5 已验收**——真机项仍要人接设备、点授权。
 
 ## 硬规则
 
@@ -69,6 +83,7 @@ source ./scripts/activate-idf.sh # 当前 shell 激活 ESP-IDF
 ./scripts/gen-protocol-vectors.sh --check  # 跨端向量是否与 C 实现一致
 ./scripts/build-firmware.sh      # 固件编译 + 合并镜像（需要 ESP-IDF，约 1-2 分钟）
 ./scripts/build-gui.sh           # 前端构建 + 打包 .app + 校验 Info.plist 用途声明
+./scripts/test-sink.sh           # 真声卡冒烟（默认 #[ignore]），没虚拟声卡就明说 SKIP
 ./scripts/apmctl-macos.sh scan   # macOS 上跑 apmctl 的唯一正道（bundle + 蓝牙权限）
 ./scripts/apmctl-macos.sh ping --count 20  # 链路往返时延（PING/PONG），不是端到端声学延迟
 cd desktop && cargo test         # 桌面端测试，含与 C 实现的逐字节对拍
@@ -86,6 +101,7 @@ GUI build (.app + Info.plist): PASS / FAIL / SKIP
 GUI (G0-G6): PASS / FAIL / SKIP（写当前真实到哪一期，不要写"GUI 好了"）
 Firmware build: PASS / FAIL / SKIP（IDF 不可用时写 SKIP，不要写成 PASS）
 Env: PASS / FAIL（缺失项列出）
-Unverified: 尚未验证的能力（按键手势逐项核对、链路 RTT、端到端声学延迟、GUI 首次授权与推流；
-            毛刺根因未定位见 docs/KNOWN_ISSUES.md KI-001，不要写成已验证）
+Unverified: 尚未验证的能力（按键手势逐项核对、端到端声学延迟、G2 的"0 欠载"、G1 断连、G3 对拍；
+            毛刺根因未定位见 docs/KNOWN_ISSUES.md KI-001，设备异常断开后不恢复见 KI-005，
+            10 min 长测 10 次欠载见 KI-006，都不要写成已验证）
 ```
