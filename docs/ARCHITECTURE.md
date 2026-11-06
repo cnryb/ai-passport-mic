@@ -14,7 +14,7 @@
 │   ▼                                                                          │
 │ 320 samples ──► IMA-ADPCM ──► [seq][predictor][index][nibbles] ──► BLE notify │
 │                                                                              │
-│ UP / DOWN / OK ──► event queue ──► HID keyboard + custom GATT event           │
+│ UP / DOWN / OK ──► event queue ──► custom GATT event（无 HID 路径）           │
 └──────────────────────────────────────────────────────────────────────────────┘
                                       │ BLE
                                       ▼
@@ -96,7 +96,8 @@ Battery Service，不占用自定义协议帧：
   "没电了还持续点亮背光"与省电目标冲突，已明确否掉。
 - 充电口旁的充电指示灯由充电 IC **硬件直驱**（充电时常亮、充满熄灭），MCU 未接线，
   固件不可控、不可变色；上游 BSP 能力契约也没有 LED 接口。
-- 旧固件没有该服务时，PC 端静默降级：电量显示不出现，其余链路不受影响。
+- 旧固件没有该服务时，PC 端把电量标记为"不可用"并在界面上显示「电量不可用」——
+  **不静默隐藏、也不显示 0%**（0% 会被误读成没电），其余链路不受影响。
 
 控制帧：
 
@@ -154,6 +155,14 @@ STATUS 载荷：`state u8, flags u8, dropped u16-LE, sent u32-LE`。
 - `flags`：bit0 BLE 已连接、bit1 AUDIO 已订阅、bit2 PTT 按住、bit3 音频错误、
   **bit4 `LINK_SLOW`**（实际连接间隔 > 40 ms，链路撑不住 50 块/秒 —— 这种会话的
   欠载/漂移数字是链路假象，不能当音质结论用，见 [KI-005](KNOWN_ISSUES.md)）
+
+  PC 侧对 `LINK_SLOW` 的处置是硬约束，不是建议（2026-11-06 落地）：
+
+  - 一旦在本场会话里见到 bit4，就**粘住整场**（`Pipeline::link_slow`）。慢档期间产生的
+    欠载/漂移无法事后剔除，中途恢复正常也不能洗白；
+  - `Telemetry.link_slow` 推给界面，指标条显示「链路慢档」并把"欠载/漂移是假象"说清楚；
+  - `SessionSummary` / `SessionRecord` 带上该标记，`analyze_session` **直接拒绝出音质报告**
+    （错误码 `capture_not_starting`）。给一份"软件分析通过"比不给更糟 —— 它会被当成版本对比基线。
 - `dropped` / `sent` 是**本会话**计数（设备在每次 START 或 PTT 首次按下时归零），
   不是自设备启动起的累计值。
 
@@ -171,9 +180,10 @@ STATUS 载荷：`state u8, flags u8, dropped u16-LE, sent u32-LE`。
 
 `ev`：`0` PRESS / `1` CLICK / `2` DOUBLE / `3` LONG / `4` RELEASE。
 
-**键位映射只用 `PRESS`**（`keymap-3` 起，一个键一个动作）。`RELEASE` / `CLICK` /
-`DOUBLE` / `LONG` 仍然照旧上报——这是跨端协议，改它要动帧格式、UUID 与共享向量，
-收益只是省几帧通知——但 PC 端不再为它们提供映射项。
+**键位映射只用 `PRESS`**（`keymap-3` 起，一个键一个动作；当前 schema 是 `keymap-4`，
+在 v3 上加了两个采集钩子）。`RELEASE` / `CLICK` / `DOUBLE` / `LONG` 仍然照旧上报——
+这是跨端协议，改它要动帧格式、UUID 与共享向量，收益只是省几帧通知——但 PC 端不再为它们
+提供映射项。
 
 副作用要知道：**双击 = 两次 `PRESS`**，在 OK 的 toggle 语义下等于"开了又关"。
 PC 端有切换窗口防抖（`apm_app::core` 的 `ptt_switching`）：开/关麦进行中（约几百毫秒）
@@ -198,10 +208,10 @@ PC 端有切换窗口防抖（`apm_app::core` 的 `ptt_switching`）：开/关�
 | --- | --- | --- |
 | `protocol` | 帧、载荷、ADPCM 编解码、按键映射 schema、WAV/音质指标 | 已实现 `desktop/crates/protocol`，含与 C 实现逐字节对拍的测试 |
 | `link` | BLE 扫描/连接、特征值订阅 | 已实现 `desktop/crates/link`（btleplug），已在真机跑通（MTU 247） |
-| `apmctl` | 扫描、状态、录音与音质分析命令行（验收工具） | 已实现 `scan` / `status` / `record` / `sink` / `probe` / `analyze` / `selftest` |
-| 虚拟声卡输出 | 把解码后的 PCM 写进 BlackHole / VB-CABLE，带抖动缓冲 | 已实现 `desktop/crates/sink`（cpal 0.15，40–80 ms 自适应抖动缓冲）；已验证到会议软件端到端可用，回环探针受麦克风权限限制 |
-| GUI 应用 | 设备状态、按键映射、虚拟声卡选择、实时电平与音质报告 | G0 已落地 `desktop/crates/gui`（Tauri 2 + Vue 3：骨架、蓝牙权限、设备扫描）；方案与后续分期见 [`GUI.md`](GUI.md) |
-| `app` 内核 | 状态机、设备发现/连接编排、指标聚合、事件广播、诊断日志 | 部分实现 `desktop/crates/app`（`apm-app`，**不依赖任何 GUI 框架**）：`detect_adapter` / `scan` / `connect` 已在内核；`record` / `sink` 的编排仍在 `crates/cli/src/cmd.rs`，**待迁入**（[`GUI.md`](GUI.md) 决定 D1） |
+| `apmctl` | 扫描、状态、录音与音质分析命令行（验收工具） | 已实现 `scan` / `status` / `battery` / `record` / `sink` / `ping` / `probe` / `analyze` / `selftest` / `firmware ports\|probe\|flash` |
+ | 虚拟声卡输出 | 把解码后的 PCM 写进 BlackHole / VB-CABLE，带抖动缓冲 | 已实现 `desktop/crates/sink`（cpal 0.18.2，40–80 ms 自适应抖动缓冲）；已验证到会议软件端到端可用，回环探针受麦克风权限限制 |
+| GUI 应用 | 设备状态、按键映射、虚拟声卡选择、实时电平与音质报告 | G0–G5 已落地 `desktop/crates/gui`（Tauri 2 + Vue 3，五个 tab）；G3b/G6 未做；真机验收见 [`GUI.md`](GUI.md) §10 |
+| `app` 内核 | 状态机、设备发现/连接编排、指标聚合、事件广播、诊断日志 | 已实现 `desktop/crates/app`（`apm-app`，**不依赖任何 GUI 框架**）：`detect_adapter` / `connect` / `start_stream` / `stop_stream` / 采集解码写声卡全在内核（`core` / `session` / `pipeline`）；GUI 只调它。**CLI 只有 `firmware` / `analyze` / `selftest` 走内核**，`scan` / `record` / `sink` / `ping` / `status` 仍直接调 `apm_link`（[`GUI.md`](GUI.md) 决定 D1 与 §14.9 的补充说明，待重构） |
 | `firmware` | USB 设备枚举、版本比对、分段烧写、回读校验 | 已实现 `desktop/crates/app/src/firmware.rs`（用 `espflash` 4.7 作库，不调外部命令、不需要装 ESP-IDF）；单元测试覆盖镜像解析、分区表守卫、MD5 向量；**真机烧写 2026-11-06 已通**（检测 + 写入 + FlashMd5 校验），空片首烧仍未验。见「固件烧写与版本比对」 |
 
 跨端一致性不靠"两份实现看起来一样"：`device/test/gen_vectors.c` 从 C 实现导出
@@ -236,7 +246,7 @@ AI Passport -> PC app -> BlackHole/VB-CABLE -> Zoom/Meet/OBS
 
 | 方案 | 结论 |
 | --- | --- |
-| USB（esptool 协议） | **采用**。ROM bootloader 在芯片内，空片可用；8 MB 镜像约 10–20 s |
+| USB（esptool 协议） | **采用**。ROM bootloader 在芯片内，空片可用；约 0.7 MB 的镜像在 921600 波特率下 10–20 s 量级 |
 | BLE 自定义 OTA | 不采用。前提是设备已有能跑起来的固件（裸片没有）；要双分区；分钟级；断连即失败 |
 | 只做升级不做首烧 | 不成立。裸片没有任何固件，OTA 的前提不存在 |
 
@@ -301,7 +311,7 @@ macOS 上 `serialport::available_ports()` 会把同一个 USB 串口的 callout�
 **不要**在分区表变了之后还按旧常量硬切。
 
 **本机实测（2026-11-06，`device/build/ai-passport-mic-merged.bin`）**：镜像总长
-`0xAEB60`，`0x9000`–`0xFFFF` 整段是 `0xFF` 填充（nvs 与 phy_init 的位置）。
+`0xAFE40`（720448 字节），`0x9000`–`0xFFFF` 整段是 `0xFF` 填充（nvs 与 phy_init 的位置）。
 "整段写会清配置"不是理论风险，是每次都会发生。
 
 ### 版本比对（不改协议、不要求设备有固件）
@@ -316,10 +326,11 @@ macOS 上 `serialport::available_ports()` 会把同一个 USB 串口的 callout�
   后者是 ROM 专用命令，stub 起来之后直接被拒（真机报 `The bootloader returned an error`）。
 - 读不到、全 `0xFF`、magic 不对 → 按"空片或未知"处理，转烧写。
 
-前提是 `version` 必须可比较。ESP-IDF 默认用 `git describe` 填这个字段，当前产物是
+前提是 `version` 必须可比较。ESP-IDF 默认用 `git describe` 填这个字段，历史产物是
 `7552506-dirty`——带 git hash 和 `-dirty`（说明构建时工作区有未提交改动），既不能对外
-显示，也没法做版本序比较。**必须固定成 semver**（`device/CMakeLists.txt` 的
-`PROJECT_VER`）。
+显示，也没法做版本序比较。**已在 `device/CMakeLists.txt` 固定成 semver**
+（`set(PROJECT_VER "0.1.0")`）。改版本号要同步 `docs/ROADMAP.md` 的 M6 段并重跑
+`./scripts/build-firmware.sh`。
 
 **本机实测（2026-11-06，固定 `PROJECT_VER=0.1.0` 后重建）**：
 
@@ -327,7 +338,7 @@ macOS 上 `serialport::available_ports()` 会把同一个 USB 串口的 callout�
 | --- | --- |
 | `merged[0x10020..0x10024]` | `32 54 CD AB`（magic 正确） |
 | `merged[0x10030..0x10050]` | `0.1.0` |
-| `merged[0x10000..]` 与单独构建的 `ai-passport-mic.bin` | 逐字节相同（650080 字节） |
+| `merged[0x10000..]` 与单独构建的 `ai-passport-mic.bin` | 逐字节相同（654912 字节） |
 
 也就是说**版本字段和 app 段都能纯离线从镜像里读出来**，不需要连设备。
 
@@ -400,11 +411,18 @@ MD5 比对。不用"整段回读再算"是因为回读 650 KB 要十几秒，而
 - 音频块按序号检测丢失和乱序；报告记录丢块数，不用“音频能播”掩盖链路质量。
 - 设备断连后 PC 端必须停止向虚拟声卡写入旧缓冲，避免会议软件持续收到静音伪装成在线。
 - 设备与声卡各有一颗晶振，"16 kHz" 不是同一个数（实测 20 s 差约 84 ms）。PC 端必须做
-  长期漂移补偿：按缓冲区存量趋势做单样本插删（上限 1%），**不允许**靠周期性欠载或整帧
-  丢弃兜底。实现见 `desktop/crates/sink/src/playout.rs`。
+  长期漂移补偿：按**墙钟 + 推入帧数**估计漂移，再按该速率做单样本插删（上限 1%），
+  **不允许**靠周期性欠载或整帧丢弃兜底。实现见 `desktop/crates/sink/src/playout.rs`。
+  **不能用缓冲存量估漂移**：CoreAudio 每隔几秒会停一下回调（实测 3–4 s 一次、几十毫秒），
+  存量随之堆高，用存量估漂移就会把"消费端停顿"误判成"设备时钟快"，
+  进而用删除真实音频的方式去纠正一个已经过去的事件（2026-11-06 实测：10 min 删掉
+  39347 帧 ≈ 2.5 s 人声，而真漂移是 0）。停摆积压另由**延迟守卫**一次性丢弃旧数据，
+  与漂移补偿是两件事。
 - 采集端偶发满量程逐样本变号的瞬态读出，两端各拦一次：固件编码前压成静音（
   `apm_pcm_is_corrupt`），PC 端解码后再兜一层（`apm_protocol::glitch`）。判据与口径见
   [`SOUND_QUALITY.md`](SOUND_QUALITY.md) 的「毛刺」。
-- 快捷键注入必须使用按下/抬起配对，异常路径要释放 Ctrl / Alt / Shift / Win。
+- 快捷键注入用 CGEvent 的"完整事件 + flags"一次性发出（修饰键写在事件 flags 里），
+  不单独发修饰键按下/抬起，因此不存在"修饰键按下后没释放"的残留状态；
+  设备侧 PRESS 走点按（down 紧接 up），hold 语义仍未实现。
 - 修改设备名时保留旧蓝牙名别名，避免已配对设备因名称缓存失效。
 - 固件构建与真机验证分开报告；没有硬件证据不得宣称通过。

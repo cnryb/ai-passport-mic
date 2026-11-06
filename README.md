@@ -17,11 +17,12 @@
 > 真机已验证：烧录、ES8311 16 kHz 采集、MTU 247、scan / status / record / sink、
 > USB 侧检测与烧写（0.1.0 ↔ 设备版本吻合、MD5 一致、烧完自行复位回应用模式），
 > 以及**会议软件里当麦克风用**（虚拟声卡输出已实现并实测）。
-> 仍未验证：按键手势逐项核对、端到端声学延迟、长时间（>10 分钟）稳定性、
+> 仍未验证：三键判定逐项核对（UP/DOWN/OK 各按一次看事件）、端到端声学延迟、
+> 长时间（>10 分钟）稳定性、
 > GUI 首次蓝牙授权、**GUI G1–G5 的每一条实测验收**（拔电源回 idle、10 min 0 欠载、
 > GUI 与 CLI 同时录对拍），以及 **M6 的空片首烧与烧写中断后重插恢复**。
-> 已知硬件问题：电量计读到 `SOC=0 / VCELL=0`（详见 KI-007），界面上的"电量 0%，请充电"
-> 是照实显示，不是界面算错。
+> 电量计曾读到 `SOC=0 / VCELL=0`（KI-007），**根因已定位并解决**（CW2017 BATINFO 全 0，
+> 补写官方电池 profile 后 SOC 实测 77–79%）；界面上的百分比是设备真实读数。
 > 已拦但待真机复测：时钟漂移（单样本插删补偿）、满量程毛刺（固件压静音 + PC 端静音替换）。
 > **未解决的问题**（毛刺根因、待复测项、缺失的声学回环）集中在
 > [`docs/KNOWN_ISSUES.md`](docs/KNOWN_ISSUES.md)，不散落在各处。
@@ -36,7 +37,7 @@
 | --- | --- |
 | 音频传输 | BLE 自定义 GATT，16 kHz / 16-bit / mono，IMA-ADPCM，20 ms 一块 |
 | PC 输出 | 写入系统虚拟声卡（macOS: BlackHole / Loopback；Windows: VB-CABLE） |
-| 设备按键 | UP / DOWN / OK 可配置快捷键；OK 的按下/松开保留为 PTT |
+| 设备按键 | UP / DOWN / OK 可配置快捷键；OK 固定为 PTT 开关（按下触发一次开/关切换） |
 | 音质评估 | WAV 客观指标 + 固定场景录音 + 主观评分 + 延迟/稳定性记录 |
 | 麦克风即系统输入 | 通过虚拟声卡实现，不在第一版实现蓝牙 HFP 或系统音频驱动 |
 | 固件烧写 | 走 USB（C3 内置 USB-Serial-JTAG，免驱、不用按 BOOT）；只写 bootloader / 分区表 / app 三段，**不擦 NVS**；写完用 `FlashMd5` 校验 |
@@ -48,10 +49,10 @@
 
 | 路径 | 内容 | 状态 |
 | --- | --- | --- |
-| [`device/`](device/) | 固件工作区（ESP-IDF 5.5.3 / ESP32-C3 / 8 MB Flash / 无 PSRAM） | M1 已实现并真机跑通（按键手势未逐项核对）；见 `device/README.md` |
+| [`device/`](device/) | 固件工作区（ESP-IDF 5.5.3 / ESP32-C3 / 8 MB Flash / 无 PSRAM） | M1 已实现并真机跑通（三键判定未逐项核对）；见 `device/README.md` |
 | [`desktop/`](desktop/) | PC 软件工作区（Rust workspace：protocol / link / sink / app / cli / gui） | 协议 + 链路 + 声卡输出 + CLI + GUI（G1–G5 + M6 设备烧写页）已实现；G3b/G6 未做，见 `desktop/README.md` |
 | [`config/`](config/) | 按键映射样例、字段说明、跨端协议向量 | 样例 + 说明 + `protocol-vectors.json`（由 C 实现导出） |
-| [`docs/`](docs/) | [产品](docs/PRODUCT.md)、[架构](docs/ARCHITECTURE.md)、[环境](docs/ENVIRONMENT.md)、[音质](docs/SOUND_QUALITY.md)、[路线图](docs/ROADMAP.md)、[参考实现](docs/REFERENCES.md)、[GUI 方案](docs/GUI.md)、[已知问题](docs/KNOWN_ISSUES.md) | 已就绪；未解决项集中在新加的 `KNOWN_ISSUES.md` |
+| [`docs/`](docs/) | [产品](docs/PRODUCT.md)、[架构](docs/ARCHITECTURE.md)、[环境](docs/ENVIRONMENT.md)、[音质](docs/SOUND_QUALITY.md)、[路线图](docs/ROADMAP.md)、[参考实现](docs/REFERENCES.md)、[GUI 方案](docs/GUI.md)、[已知问题](docs/KNOWN_ISSUES.md)、[待办清单](docs/TODO.md)、[待决策事项](docs/DECISIONS_NEEDED.md) | 已就绪；未解决项看 `TODO.md`，证据链看 `KNOWN_ISSUES.md`，需要人拍板的看 `DECISIONS_NEEDED.md` |
 | [`scripts/`](scripts/) | 环境体检、IDF 激活、基线自检、协议单测与向量导出、固件构建、GUI 打包、macOS app-bundle 运行器 | 可用 |
 
 ## 环境
@@ -69,7 +70,7 @@ source ./scripts/activate-idf.sh
 # 3. 基线自检：结构、文档内链、脚本可执行位、协议单测、环境快照
 ./scripts/verify.sh
 
-# 4. 只验证协议层（不需要 ESP-IDF）：CRC / 控制帧 / ADPCM 共 27 项
+# 4. 只验证协议层（不需要 ESP-IDF）：CRC / 控制帧 / ADPCM 共 44 项
 ./scripts/test-protocol.sh
 
 # 5. 桌面端：协议层 + 与固件的逐字节对拍
@@ -87,12 +88,16 @@ cd desktop && cargo test
 
 示例配置见 [`config/button-map.example.json`](config/button-map.example.json)，
 字段说明见 [`config/README.md`](config/README.md)。映射是**一个键一个动作**（UP / DOWN / OK，
-共 3 个事件，`keymap-3`），可叠加 Ctrl / Shift / Alt / Win 修饰键。OK 默认是 PTT 开关
+共 3 个事件，schema `keymap-4`；除按键外还有 `capture.start` / `capture.stop` 两个采集钩子），
+可叠加 Ctrl / Shift / Alt / Win 修饰键。OK 默认是 PTT 开关
 （按一下开、再按一下关），不能在没有替代停止机制时移除。
 
 > 两端代码都有了：固件把按键手势编码成 BLE 事件发出去，PC 端 `apm-protocol` 能解析并
 > 校验映射表（含 PTT 约束），GUI 的「按键映射」页能编辑、导入导出、恢复默认。
-> **但还没有把事件翻译成实际按键注入** —— 那是 M3 的事，所以现在改映射不会真的敲键盘。
+> **注入层（M3）已实现并已在真机验证**：macOS 上用 CGEvent 点按注入，设备 UP / DOWN 的
+> PRESS 会直接落到前台应用，OK 键开关采集，另有两个采集钩子在开/关麦时各注入一次快捷键。
+> 2026-11-06 真机验收 PASS（授权后注入生效、未授权时明确报错而不是静默丢弃）；
+> 未做的只有「按住不放 (hold)」，见 [`docs/TODO.md`](docs/TODO.md)。
 > 实现时以 `config/README.md` 为准，不要静默改动字段名。
 
 ## 声音质量评估
@@ -110,7 +115,7 @@ cd desktop && cargo test
 ```text
 AI Passport (ESP32-C3)
   microphone -> 16 kHz PCM -> IMA-ADPCM -> BLE GATT notify
-                                      \-> BLE HID button events
+                                      \-> BLE GATT event（按键 press/…，不是 HID）
                                                    |
                                                    v
 PC: 设备链路 -> ADPCM 解码 -> 虚拟声卡 -> 会议软件

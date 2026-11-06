@@ -1,7 +1,8 @@
 # device/ —— 固件（M1 已实现，真机链路已验证）
 
 ESP32-C3 上的采集与 BLE 传输固件。**代码已落地，能编译、能烧录，采集与 BLE 链路已在
-真机上跑通**；按键手势只做到"能发事件"，没有逐项核对过。逐条证据见文末「验证状态」，
+真机上跑通**；三键的按下判定只间接验过一次（按 OK 能在 PC 侧看到 PRESS），
+UP / DOWN 还没逐项核对过。逐条证据见文末「验证状态」，
 未验证的项在那里明确标着「未验证」，不要当成"已通过"。
 
 ## 技术栈
@@ -29,7 +30,7 @@ device/
     audio.c/.h            # ES8311 + I2S 全双工，16 kHz / 16-bit / mono；共享 I2C 总线
     battery.c/.h          # CW2017 电量计 + 低电量背光呼吸指示（阈值 20%）
     link.c/.h             # NimBLE GATT、广播、MTU 协商、通知、标准 Battery Service
-    buttons.c/.h          # 单 ADC 三键手势判定（去抖 / 单击 / 双击 / 长按 / PTT）
+    buttons.c/.h          # 单 ADC 三键判定（去抖 / 单击 / 双击 / 长按 / 按下抬起；PC 只消费 PRESS）
     board.h               # 引脚与硬件常量（唯一事实来源）
   test/
     test_protocol.c       # 主机侧单测，不依赖 ESP-IDF
@@ -57,9 +58,8 @@ idf.py merge-bin -o "$PWD/build/ai-passport-mic-merged.bin"   # -o 相对 build/
 
 ```text
 ES8311 ──I2S──► 320 samples ──IMA-ADPCM──► [seq][predictor][index][nibbles] ──► AUDIO notify
-                                                    ▲
-OK 按下/抬起 ──► PTT 开关 ──────────────────────────┘
-按键事件 ──► EVENT notify（press/click/double/long/release）
+OK 按下/抬起 ──► PTT 采集开关（固件侧 s_ptt_held；PC 侧映射成 ptt-toggle）
+按键事件 ──► EVENT notify（press/click/double/long/release；PC 只消费 press）
 1 s 心跳 ──► STATUS notify（state + flags + 丢块数 + 已发块数）
 ```
 
@@ -98,17 +98,18 @@ OK 按下/抬起 ──► PTT 开关 ──────────────
 
 | 项 | 状态 |
 | --- | --- |
-| `idf.py build`（esp32c3 / IDF 5.5.3） | 通过，0 warning；app 637,440 B |
-| `idf.py merge-bin` | 通过，合并镜像 702,976 B |
+| `idf.py build`（esp32c3 / IDF 5.5.3） | 通过，0 warning；app 654,912 B |
+| `idf.py merge-bin` | 通过，合并镜像 720,448 B（`0xAFE40`） |
 | 协议主机单测（44 项） | 通过；稳态 ADPCM 往返 SNR 32.89 dB；含毛刺判据与 PING/PONG 长度校验 |
 | 真机烧录（esptool / 460800） | 通过，hash 校验通过，复位后 app 名 `ai-passport-mic` |
 | 按键 ADC 初始化 | 通过（curve fitting 校准）。曾因 `APM_BTN_ADC_UNIT` 写成 1 命中 `ADC_UNIT_2` 而失败，已修为 0 |
-| 按键手势判定 | **未逐项验证**（未在真机上依次按 UP/DOWN/OK 核对事件） |
+| 按键手势判定 | **三键未逐项核对**。间接旁证只有 OK：`docs/GUI.md` §14.14 记录过"用户按 OK 没反应"，说明 OK 的 PRESS 到过 PC。UP / DOWN 无任何真机证据 |
 | ES8311 采集出声 | 通过：真机 15 s 连续录音 748 块、0 丢块、长度异常 0 |
 | BLE 连接 / MTU / 通知 | 通过：MTU 247（需求 ≥168），音频/状态/事件三路订阅均建立 |
 | 连接间隔 | 实测由主机决定：macOS 落到 **30 ms**；固件请求常被拒（host 554，疑似与主机自身参数更新冲突），压到 15–20 ms 也被拒 |
-| PING/PONG 回包 | 代码已落地（`0x04 PING` → `0x83 PONG`，4 字节原样回显），**真机未测**；PC 端 `apmctl ping` 已在同一批提交里实现 |
-| 链路往返时延 | **未测量**（需要烧新固件后跑 `apmctl ping`） |
+| PING/PONG 回包 | **真机已测（2026-11-05）**：20 发 20 收、0 超时；RTT 中位 38.2 ms / p95 41.5 ms / 抖动 3.0 ms |
+| 链路往返时延 | **已测量**（同上）。口径是链路，见 `docs/SOUND_QUALITY.md` |
 | 端到端声学延迟 | **未测量**：ping 只覆盖链路，声学回环卡在宿主麦克风权限（见 `../docs/KNOWN_ISSUES.md` KI-003） |
+| 电量计（CW2017） | **已解决（2026-11-06 真机）**：BATINFO 全 0 导致 SOC 无效；写入官方 UTL 520 mAh profile 后 SOC 实测 77–79%。见 KI-007 |
 
 真机验证顺序见 [`../docs/ROADMAP.md`](../docs/ROADMAP.md) 的 M1，测完再往这张表里填数字。

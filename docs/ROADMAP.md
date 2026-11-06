@@ -10,7 +10,7 @@
 
 > M0 的定义是「仓库能交给下一个人接手」，不是「软件能用」。
 
-## M1：固件最小链路（真机链路已通过，按键手势待核对）
+## M1：固件最小链路（真机链路已通过，三键判定待核对）
 
 - [x] ESP-IDF 工程骨架 + 8 MB 分区表 + USB-Serial-JTAG 控制台。
 - [x] ES8311 采集：16 kHz / 16-bit / mono（**真机通过**：15 s 连续录音 748 块、0 丢块）。
@@ -21,8 +21,11 @@
 - [ ] ~~本地 HID 键盘路径~~ → **第一版不做**，理由见下面的说明。
 - [x] 烧录、MTU 与通知、块丢失统计：MTU 247（需求 ≥168），音频/状态/事件三路订阅均建立。
 - [x] PTT 启停：`apmctl record` 走 CTRL START/STOP 强制采集，不依赖 OK 键。
-- [ ] **按键电压窗口标定 + 手势逐项核对**：UP/DOWN/OK × 短按/双击/长按/按下/抬起共 12 个
-      事件，没有在真机上依次按过。换板要改 `main/board.h` 后重新标定。
+- [ ] **三键判定核对**：UP / DOWN / OK 各按一次，`apmctl status` 能打出对应的
+      `按键: <键>.press`；换板要改 `main/board.h` 后重新标定 150 / 447 / 1900 mV 三个窗口。
+      现有旁证只有 OK（`GUI.md` §14.14），UP / DOWN 没有任何真机证据。
+- [ ] **15 个手势码对拍（低优先）**：3 键 × press / click / double / long / release。
+      这是协议层证据，不是产品验收——PC 从 `keymap-3` 起只消费 `PRESS`，另外四码只记日志。
 - [x] **延迟测量手段（链路）**：控制帧 `0x04 PING` / `0x83 PONG` 两端落地，
       `apmctl ping` 输出 RTT 的 min / 中位 / p95 / max 与抖动，支持 `--json`。
       口径是**链路往返**，不能当端到端延迟用。**真机已测（2026-11-05）：中位 38.2 ms /
@@ -69,7 +72,9 @@
 - [x] **设备异常断开后不恢复**：块率从 50/s 崩到 1.5/s。根因不是"设备停了"，而是
       **连接间隔跑偏 + 断链不清采集态**（序号推算证明采集循环全程 50/s），见
       [`KNOWN_ISSUES.md`](KNOWN_ISSUES.md) **KI-005**。固件侧已修（首选参数广播、
-      参数更新重试、断链兜底、`LINK_SLOW` 标志），**真机未复测**。
+      参数更新重试、断链兜底、`LINK_SLOW` 标志）；**2026-11-06 真机复测**：正常会话
+      itvl=30 ms / 0 拥塞、断链清采集态 → `ready`、异常断开后再录仍 50/s 均 PASS；
+      慢间隔自愈日志本机未触发；PC 侧早停 / `LINK_SLOW` UI 仍未做。
 
 ## M2.5：GUI（G1–G5 代码已落地，G3b/G6 未做）
 
@@ -78,13 +83,23 @@ Tauri 2 + Vue 3，分期 G0–G6，各期单独验收。完整方案见 [`GUI.md
 已定决策（2026-11-04，见 `GUI.md` §12）：CLI 保留为诊断通道、首发仅 macOS、
 会话 WAV 默认不落盘、按键映射进首发但不卡前期、不做托盘常驻。
 
-本轮门禁（2026-11-05）：`./scripts/verify.sh` 全绿、`cargo test` 89 passed / 0 failed、
+本轮门禁（2026-11-05，历史记录）：`./scripts/verify.sh` 全绿、`cargo test` 93 passed / 1 ignored、
 `./scripts/build-gui.sh` 通过（`.app` 30.29 MiB）。明细见 `GUI.md` §14.2；
 它证明的是"能编译、单测过、打得出来"，**不等于** G1–G5 已验收。
 
-- [x] **前置：把 `record` / `sink` 的编排迁进 `apm-app`。** 采集、解码、丢块统计、
+**2026-11-07 复核**：`./scripts/verify.sh` 七项全 PASS（协议 C 44 passed）；
+`cargo test` 实为 **130 passed / 0 failed / 2 ignored**（7 个有测试的目标，含 `apm-app` 自身的
+两个 `#[ignore]`：真声卡冒烟与真机按键注入）。上一行的 93 是 11-05 的旧快照、
+11-06 记的 117 也已过时（新增 KI-007/008/009、M6 与 cpal 0.18 的测试后未回填），
+这里按实测更正。门禁明细以 `desktop/README.md` 的验证状态表为准。
+
+- [~] **前置：把 `record` / `sink` 的编排迁进 `apm-app`。** 采集、解码、丢块统计、
       声卡写入、指标聚合现在只有一份实现（`crates/app/src/{session,pipeline}.rs`），
       `cli` 只解析参数与打印，GUI 走同一条管线。
+      **2026-11-07 更正**：只有 `firmware` / `analyze` / `selftest` 与 `record`/`sink` 的
+      **解码落声卡那一段**走内核；CLI 的 `scan` / `connect` / `start_capture` / `stop_capture` /
+      `ping` / `status` 仍直接调 `apm_link`，"开流前 STOP"因此在两处各有一份实现。
+      **未完成，仍是重构项**（见 `GUI.md` §12 第 1 条与 §14.9 的补充说明）。
 - [x] G0 骨架 + macOS 蓝牙/麦克风权限（后续所有阶段的前置门槛）。
       `.app` 构建、ad-hoc 签名、Info.plist 用途声明、无 TCC abort 启动均已验证；
       **2026-11-05 真机 PASS**：授权弹窗正常、6 s 扫到 7 个设备（目标在列）、
@@ -110,10 +125,11 @@ Tauri 2 + Vue 3，分期 G0–G6，各期单独验收。完整方案见 [`GUI.md
 - [ ] G3b 用 GUI 自身身份恢复回环自动验收。**未实现**（`--verify` 仍在 CLI）。
 - [x] G4 音质报告视图（代码）：报告构造只有一份（`apm_app::report`），
       GUI 的表格与「复制 JSON」都出自它，未测字段是 null。
-- [x] G5 按键映射（代码）：**3 个事件**（一个键一个动作；2026-11-05 两步归并
-      15 → 6 → 3，schema 升到 `keymap-3`，v1/v2 都能迁移）的编辑、导入、导出、
-      恢复默认、落盘；
-      `ok.release` 强制回填 `ptt-stop`。**注入层（M3）未实现，改了映射不会真的敲键盘**。
+- [x] G5 按键映射（代码）：**3 个事件**（一个键一个动作）+ 2 个采集钩子（`keymap-4`；
+      2026-11-05 两步归并 15 → 6 → 3，随后加钩子升到 4，v1–v3 都能迁移）的编辑、导入、
+      导出、恢复默认、落盘；`ok` 强制为 `ptt-toggle`。
+      **注入层（M3）已实现**（见下面的 M3），"改了映射不会敲键盘"这句已作废；
+      缺的是**真机端到端验收**（要人工授辅助功能权限）。
 - [ ] G6 签名打包公证。**未做**，需要 Apple 开发者证书，当前只有 ad-hoc 签名。
 
 
@@ -124,19 +140,30 @@ Tauri 2 + Vue 3，分期 G0–G6，各期单独验收。完整方案见 [`GUI.md
       固件仍上报 5 种手势码，PC 端只消费 PRESS；协议与跨端向量都不动。
       **OK 变成开关式后少了"松手自动停"**，M3 注入层必须补超时兜底。
 - [x] 配置持久化、恢复默认、导入/导出（schema 见 `config/README.md`）。
-- [x] 保证 OK 的 PTT 停止路径不会被配置破坏（`ok.release` 保存时强制回填 `ptt-stop`）。
+- [x] 保证 OK 的 PTT 停止路径不会被配置破坏（`ok` 被强制回填 `ptt-toggle`，
+      见 `keymap_store::save_bindings_at` 的兜底逻辑）。
 - [x] **注入层（macOS 点按）已实现（2026-11-05）**：`apm-app::inject` 用 CGEvent
-      把映射动作发到当前前台应用；按键事件（`up`/`down`）由采集钩子机制承接——
-      目前按键事件本身**尚未接到采集状态**，先落地的是采集钩子
-      （开麦/关麦各注入一次，见 `hooks.capture.start/stop`）。
+      把映射动作发到当前前台应用。
+- [x] **采集钩子**：开麦 → `capture.start`、关麦 → `capture.stop`（含断链导致的自动收尾），
+      各注入一次可配置快捷键；钩子里禁止 `ptt-toggle`。
 - [x] **修饰键释放**：注入用"事件自带 flags"的方式发，不单独发修饰键事件，
       不存在"按下去没松开"的状态（单测覆盖 `ptt-toggle` 不可注入）。
-- [ ] **权限引导**：没有辅助功能权限时 CGEventPost 会静默丢弃；现在只记日志，
-      要补"界面上给出权限指引 + 一键打开系统设置"。
-- [ ] **按键事件接到采集**：`up` / `down` 的映射动作现在只在钩子路径生效，
-      按键事件 → 注入的直连还没接。
-- [ ] **超时兜底**：toggle 语义下忘记关麦是真实风险（连续 10 分钟自动停）。
-- [ ] **"按住不放"模式**：微信/钉钉"按住说话"类应用需要 hold，尚未做。
+- [x] **权限引导**：映射页内置辅助功能权限横幅（`inject_permission` 轮询 +
+      `open_accessibility_settings` 一键跳系统设置），授权后横幅自动消失。
+- [x] **按键事件直连（2026-11-05，`GUI.md` §14.14）**：设备 PRESS → 动作。
+      `ok` 走 `toggle_ptt`（开关采集，与界面按钮同一条 `start_stream` / `stop_stream`）；
+      `up` / `down` 走 `inject_in_background` 点按注入。切换窗口内防抖（`ptt_switching`）。
+- [ ] **真机端到端验收**：辅助功能授权后，设备 UP / DOWN 真的落到前台应用、OK 真的开关采集。
+      代码齐、单测齐（含 `real_tap_ralt_to_frontmost_app`），但**没人按过**。
+- [ ] **超时兜底**：toggle 语义下忘记关麦是真实风险。**10 分钟是定稿口径，不是建议**
+      （`PRODUCT.md` / `config/README.md` 都写成必做）。落点在 PC 侧 `apm_app`，且必须走
+      `stop_stream()` —— 它负责触发 `capture.stop` 钩子并收尾 WAV；只发 CTRL STOP 会漏掉这两件事。
+      注意固件侧 `s_ptt_held` 在 OK 抬手时就清零了，管不到 CTRL START 驱动的会话，
+      所以这个兜底**不能**做进固件。
+- [ ] **"按住不放"模式**：微信/钉钉"按住说话"类应用需要 hold。
+      **固件侧已经具备条件**：PRESS / RELEASE 两路事件都在上报，`s_ptt_held` 也是按下置位、
+      抬起清零（`app_main.c`）。缺的是 PC 端消费 `RELEASE`（现在 `core.rs` 只认 `EVENT_PRESS`）
+      并加一个 hold 映射项。不是重做固件。
 
 ## M4：音质验收
 
@@ -170,24 +197,27 @@ Tauri 2 + Vue 3，分期 G0–G6，各期单独验收。完整方案见 [`GUI.md
 - [ ] **硬件前提核对**：板子的 USB 口接 C3 原生 USB D-/D+（GPIO18/19），不是走 CH340 的
       UART。固件已开 `CONFIG_ESP_CONSOLE_USB_SERIAL_JTAG`，但**必须与量产板实物对一遍**——
       一旦改成外置串口芯片，"免驱 + 不用按 BOOT"两个前提同时失效，整个方案的体验假设作废。
-- [ ] **固件版本固定为 semver**：当前 app 描述符里是 `7552506-dirty`（IDF 默认取
-      `git describe`），不能对外，也没法做版本比对。要在 `device/CMakeLists.txt` 固定。
+- [x] **固件版本固定为 semver（已完成）**：`device/CMakeLists.txt` 里 `set(PROJECT_VER "0.1.0")`，
+      产出的 app 描述符版本就是 `0.1.0`（真机 probe 已读出）。此前是 IDF 默认的
+      `git describe`，产出过 `7552506-dirty` 这种值。改版本号时同步本文件与 `ARCHITECTURE.md`。
 - [x] `apm-app::firmware`：设备枚举、读 `0x10020` 解析 app 描述符、与内置镜像比对、
-      分段烧写、回读校验。逻辑全在无 UI 的内核里；**GUI 已接，CLI 尚未暴露子命令**。
-      **代码完成，8 项单测过（含用真实产物验证偏移常量）；真机烧写未验。**
+      分段烧写、回读校验。逻辑全在无 UI 的内核里；**GUI 与 CLI 都已接**
+      （`apmctl firmware ports|probe|flash`）。
+      **8 项单测过（含用真实产物验证偏移常量）；真机烧写 2026-11-06 已通。**
 - [x] 空片识别：整片 `0xFF` 判空，按 `DeviceState::Blank` 出首烧文案。
       **逻辑有，真裸片没上过电。**
 - [x] 中断恢复：烧写失败不进终态，重插可继续（ROM bootloader 在芯片内）。
       **物理上成立，未在真机上故意拔线复现。**
 - [x] 回读校验：用 esptool 的 `FlashMd5` 让设备自己算 app 分区 MD5，与本地比对；
-      不一致返回 `FlashVerifyFailed`，不返回成功。**未真机验证。**
+      不一致返回 `FlashVerifyFailed`，不返回成功。
+      **真机已验（2026-11-06）**：`apmctl firmware flash` 的 MD5 与本地一致。
 - [x] NVS 保护：只写 `0x0` / `0x8000` / `0x10000` 三段，中间 `0x9000`–`0xFFFF` 不碰；
       写前核对分区表偏移，对不上直接拒绝。**镜像侧已实测（该段整段是 `0xFF`），
-      真机上"配对是否保留"未验。**
+      真机侧也验证了：重新烧写后配对仍在、能自动连回。**
 - [x] **GUI 开箱向导**：`设备烧写` 页——扫描 → 检测版本 → 一键烧写（带进度条）→
       结果与重试指引。**界面没在真机上走查过。**
 - [x] 镜像随包分发：`build-gui.sh` 复制进 `crates/gui/resources/` 并在产物里校验，
-      已实测 `.app` 的 `Contents/Resources/firmware/` 里有 715616 字节。
+      已实测 `.app` 的 `Contents/Resources/firmware/` 下有该镜像且字节数与源文件一致。
 
 未验证 / 风险：
 
@@ -196,7 +226,8 @@ Tauri 2 + Vue 3，分期 G0–G6，各期单独验收。完整方案见 [`GUI.md
 - **空片首烧没在真裸片上跑过**：本机验证用的是已有固件的板子（走的"版本覆盖"路径），
   真正"整片 `0xFF`"的板子还没上过电。
 - **GUI 开箱页没在真机上走查**：只验到"编得过、类型检查过、打得出来、镜像进包"。
-- **包体积涨了**：`.app` 从 30.29 MiB 涨到 37.81 MiB（`espflash` + `serialport`）。
+- **包体积涨了**：debug `.app` 从 30.29 MiB 涨到 37.81 MiB（`espflash` + `serialport`）；
+  **release 只有 12.2 MiB**（`strip = true` + `lto = "thin"`），对外发布看后者。
   还能接受，但如果日后要压，可以把烧写拆成可选组件。
 - 量产板换 USB 走线后，本机所有结论作废，要重新走查。
 

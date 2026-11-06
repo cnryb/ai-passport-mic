@@ -14,7 +14,8 @@
 - **有**：GUI 的 G1–G5——状态机、实时电平与推流、声卡选择与会话 WAV、音质报告、按键映射编辑。
 - **有**：按键注入（M3，macOS：CGEvent 点按 + 采集钩子 `capture.start` / `capture.stop`，
   左右 Alt `lalt` / `ralt`，**设备按键直连**——OK 键开关采集、up/down 注入映射键、
-  切换窗口防抖，映射页内置辅助功能权限引导横幅；**真机端到端验收未做**）。
+  切换窗口防抖，映射页内置辅助功能权限引导横幅；**真机端到端 2026-11-06 已验 PASS**）。
+  未做的只有 **hold（按住不放）**：固件侧 PRESS/RELEASE 齐，缺 PC 端消费 RELEASE。
 - **没有**：G3b 回环自动验收（`--verify` 仍在
   `apmctl`）、G6 签名公证（只有 ad-hoc）、GUI 的 `run_selftest`、Windows 注入（SendInput）。
 - **编排只有一份**：`detect_adapter` / `scan` / `connect` / `start_stream` / `stop_stream`
@@ -31,14 +32,17 @@
     的蓝牙/麦克风用途声明。**不在** verify 里（首次要拉 400+ crate）。
   - `./scripts/test-sink.sh` —— 真声卡冒烟（`session_with_real_sink`，默认 `#[ignore]`）。
     没装虚拟声卡时明说 SKIP，不假装测过。**不在** verify 里（要硬件）。
+  - `./scripts/test-longrun.sh` —— G2/KI-006 长测：真机跑 600 s，自动判「0 欠载 + 链路干净」
+    并打印可粘贴的报告。**不在** verify 里（要硬件 + 10 分钟）。
   - `cargo test` 用 workspace 的 `default-members`，**不含** `crates/gui`；GUI 要单跑
     `cargo test -p apm-gui` 或 `./scripts/build-gui.sh`。
-  - 最近一次全绿（2026-11-05）：`verify.sh` 七项全 PASS（协议 44 passed）、
-    `cargo test` **93 passed / 0 failed / 1 ignored**、`clippy --all-targets` **0 警告**、
-    `vue-tsc` 与 `npm run build` 通过、`build-gui.sh` 出包 30.29 MiB 且 Info.plist 校验通过、
-    `test-sink.sh` 在有 BlackHole 的机器上 PASS。明细见
-    [`docs/GUI.md`](docs/GUI.md) §14.2。**这些只说明"编得过、单测过、打得出来"，
-    不说明 G1–G5 已验收**——真机项仍要人接设备、点授权。
+  - 最近一次全绿（2026-11-07 复核）：`verify.sh` 七项全 PASS（协议 44 passed）、
+    `cargo test` **130 passed / 0 failed / 2 ignored**（7 个有测试的目标）、
+    `clippy --all-targets` **0 警告**、`vue-tsc` 与 `npm run build` 通过、
+    `build-gui.sh` 出包且 Info.plist 校验通过、
+    `test-sink.sh` 在有 BlackHole 的机器上 PASS。门禁明细见
+    [`docs/GUI.md`](docs/GUI.md) §14.2（那份是 2026-11-05 的快照：93 passed / `.app` 30.29 MiB）。
+    **这些只说明"编得过、单测过、打得出来"，不说明 G1–G5 已验收**——真机项仍要人接设备、点授权。
 
 ## 硬规则
 
@@ -61,7 +65,7 @@
 ```text
 device/   固件（ESP-IDF 5.5.3、ESP32-C3）。落地后在此目录内自带 AGENTS.md 管子树。
 desktop/  PC 软件（Rust workspace：protocol / link / sink / app / cli / gui；
-          GUI = Tauri 2 + Vue 3，当前只到 G0）。
+          GUI = Tauri 2 + Vue 3，G0–G6 已到 G5，G3b/G6 未做）。
 config/   按键映射 schema 与样例。
 docs/     产品、架构、环境、音质、路线图、参考实现、GUI 方案、已知问题（KNOWN_ISSUES.md）。
 scripts/  环境与校验入口。
@@ -84,6 +88,7 @@ source ./scripts/activate-idf.sh # 当前 shell 激活 ESP-IDF
 ./scripts/build-firmware.sh      # 固件编译 + 合并镜像（需要 ESP-IDF，约 1-2 分钟）
 ./scripts/build-gui.sh           # 前端构建 + 打包 .app + 校验 Info.plist 用途声明
 ./scripts/test-sink.sh           # 真声卡冒烟（默认 #[ignore]），没虚拟声卡就明说 SKIP
+./scripts/test-longrun.sh        # G2/KI-006 长测：真机 600 s，判「0 欠载」并出报告
 ./scripts/apmctl-macos.sh scan   # macOS 上跑 apmctl 的唯一正道（bundle + 蓝牙权限）
 ./scripts/apmctl-macos.sh ping --count 20  # 链路往返时延（PING/PONG），不是端到端声学延迟
 cd desktop && cargo test         # 桌面端测试，含与 C 实现的逐字节对拍
@@ -101,7 +106,10 @@ GUI build (.app + Info.plist): PASS / FAIL / SKIP
 GUI (G0-G6): PASS / FAIL / SKIP（写当前真实到哪一期，不要写"GUI 好了"）
 Firmware build: PASS / FAIL / SKIP（IDF 不可用时写 SKIP，不要写成 PASS）
 Env: PASS / FAIL（缺失项列出）
-Unverified: 尚未验证的能力（按键手势逐项核对、端到端声学延迟、G2 的"0 欠载"、G1 断连、G3 对拍；
-            毛刺根因未定位见 docs/KNOWN_ISSUES.md KI-001，设备异常断开后不恢复见 KI-005，
-            10 min 长测 10 次欠载见 KI-006，都不要写成已验证）
+Unverified: 尚未验证的能力（三键电压窗口万用表复核、hold 按住不放、端到端声学延迟、
+            G2 的"0 欠载"、G4 音质场景矩阵、KI-005 慢间隔自愈与"拦得住"那一半、
+            M6 空片首烧与中断恢复；
+            毛刺根因未定位见 docs/KNOWN_ISSUES.md KI-001，
+            10 min 长测仍欠载见 KI-006——根因 2026-11-07 已定位为"链路到达抖动突破 80 ms 上限"，
+            但修法待决策、**不要写成已验证**）
 ```

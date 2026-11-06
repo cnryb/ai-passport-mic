@@ -8,8 +8,9 @@ firmware ports|probe|flash）、`apm-gui` 的
 G0–G5（骨架 + 权限 + 设备发现 + 状态机 + 实时电平与推流 + 声卡选择与会话 WAV +
 音质报告 + 按键映射编辑），以及 M6 的固件烧写（`apm-app::firmware` + GUI `设备烧写` 页）。
 音频编排只有一份：`crates/app`，CLI 与 GUI 都只调它。
-**未实现**：G3b 回环自动验收（`--verify` 仍在 CLI）、G6 签名公证、按键注入（M3）、
-GUI 的 `run_selftest`（bundle 里没有向量文件，协议自检仍归 `apmctl selftest`）。
+**未实现**：G3b 回环自动验收（`--verify` 仍在 CLI）、G6 签名公证、GUI 的 `run_selftest`
+（bundle 里没有向量文件，协议自检仍归 `apmctl selftest`）。按键注入（M3）**已实现**
+（macOS 点按 + 设备按键直连），只差真机端到端验收；Windows 的 SendInput 未做。
 链路与声卡输出都在真机上跑通，并**在会议软件里实测可用**（用户确认：选中 BlackHole 2ch
 当麦克风，说话有电平）。回环自动验收仍受限：宿主的麦克风权限被系统拒绝，读回来是数字静音。
 macOS 上蓝牙**必须走 .app bundle 才能拿到权限**，见文末「macOS 上的蓝牙权限」。
@@ -35,8 +36,9 @@ desktop/
   rust-toolchain.toml
   crates/
     protocol/         # 帧、CRC、ADPCM、按键映射 schema、WAV 读写、音质指标
-      src/{crc,frame,adpcm,keymap,wav,metrics}.rs
+      src/{crc,frame,adpcm,keymap,wav,metrics,glitch,lib}.rs
       tests/c_vectors.rs   # 读 C 侧导出的共享向量，逐字节对拍
+      tests/glitch_repro.rs # 毛刺抑制的复现用例
     link/             # btleplug 封装：扫描 / 连接 / 订阅 / 通知解析
       src/device.rs
     sink/             # 抖动缓冲 + 写虚拟声卡（cpal），含回环探针
@@ -46,8 +48,8 @@ desktop/
       src/session.rs  # 声卡线程（cpal Stream 是 !Send，只能线程内自持）+ WAV 增量写 + 指标
       src/pipeline.rs # 音频块 → 长度校验/序号跳变/解码 → 声卡或文件（CLI 与 GUI 唯一入口）
       src/report.rs   # 音质报告（与 apmctl analyze --json 同一份）
-      src/firmware.rs # 固件烧写：USB 枚举 / 读 0x10030 版本 / 三段切片写 / FlashMd5 校验
-      src/{state,events,log,settings,keymap_store}.rs
+      src/firmware.rs # 固件烧写：USB 枚举 / 读 0x10020 描述符（版本在 0x10030）/ 三段切片写 / FlashMd5 校验
+      src/{state,events,log,settings,keymap_store,inject,lib}.rs
     cli/              # apmctl
       src/{main,cmd}.rs
     gui/              # apm-gui：Tauri 2 主程序 + Info.plist 权限声明
@@ -82,7 +84,9 @@ cargo build --release # 产出 target/release/apmctl
 - 电平表是 canvas 手绘，数据来自后端 5 Hz `telemetry`；**前端不算任何指标**。
 - 推流前会先检查有没有选声卡、声卡是否原生支持 16 kHz；不满足直接报错，不先开流再报错。
 - 会话 WAV 默认不落盘，勾选后写到 `~/Library/Application Support/com.cnryb.ai-passport-mic/sessions/`。
-- 按键映射页只改映射表；**注入层（M3）没实现，改完不会真的敲键盘**，页面里写明了。
+- 按键映射页改的是映射表，落盘后**设备按键会真的生效**（M3 已实现并已真机验证：`up`/`down`
+  注入映射键、`ok` 开关采集）；前提是已授过**辅助功能**权限，页面顶部有引导横幅。
+  未做的只有「按住不放 (hold)」（见 `../docs/TODO.md`）。
 - 设备烧写页：扫描 → 读版本 → 分段写入 → 回读 MD5 校验。**不擦 NVS**，配对与映射保留；
   烧写会复位设备，正在推流时别点。首次启动（没有上次设备记录）会默认落到这一页。
 
@@ -112,12 +116,18 @@ open "desktop/target/debug/bundle/macos/AI Passport Mic.app"   # 必须经 Launc
 
 ## apmctl
 
-> **macOS 上不要直接跑 `./target/release/apmctl`。** 裸二进制调 CoreBluetooth 会被系统 abort，
-> 必须经 `scripts/apmctl-macos.sh` 以 app bundle 身份启动（它会自动生成 bundle、签名、
-> 并用 `--log` 把输出回传）。下面是等价的子命令写法。
+> **要碰蓝牙（或麦克风回环）的子命令不要直接跑 `./target/release/apmctl`。** 裸二进制调
+> CoreBluetooth 会被系统 abort，必须经 `scripts/apmctl-macos.sh` 以 app bundle 身份启动
+> （它会自动生成 bundle、签名、并用 `--log` 把输出回传）。**纯离线命令**（`selftest` /
+> `analyze` / `firmware ports`）不碰 TCC，直接跑裸二进制即可，也免掉那层包装的 cwd 问题。
 
 ```bash
-./scripts/apmctl-macos.sh selftest                     # 用共享向量自检协议层，不需要硬件
+# 不碰蓝牙的子命令直接跑裸二进制，不需要 bundle：
+./desktop/target/release/apmctl selftest                # 用共享向量自检协议层（17 项）
+./desktop/target/release/apmctl analyze test.wav        # 分析 WAV，输出客观指标
+./desktop/target/release/apmctl analyze test.wav --json # ai-passport-mic-quality-report-1
+
+# 要碰蓝牙 / 麦克风的必须走 bundle 包装：
 ./scripts/apmctl-macos.sh scan --timeout 6             # 扫附近的设备
 ./scripts/apmctl-macos.sh status --timeout 10          # 连接并打印 STATUS / 按键事件
 ./scripts/apmctl-macos.sh record test.wav --seconds 10 # 录 10 秒到 WAV，打印丢块与电平
@@ -125,9 +135,11 @@ open "desktop/target/debug/bundle/macos/AI Passport Mic.app"   # 必须经 Launc
 ./scripts/apmctl-macos.sh sink --to "BlackHole 2ch" --seconds 30  # 实时推进虚拟声卡
 ./scripts/apmctl-macos.sh sink --to "BlackHole 2ch" --tone --verify # 推正弦并回读
 ./scripts/apmctl-macos.sh probe --device 麦克风 --seconds 4        # 只读输入电平
-apmctl analyze test.wav             # 分析 WAV 不碰蓝牙，可以直接跑
-apmctl analyze test.wav --json      # 输出 ai-passport-mic-quality-report-1
 ```
+
+⚠️ **`selftest` 不要走 `apmctl-macos.sh`**：包装层经 LaunchServices 启动，进程 cwd 变成 `/`，
+而 `selftest` 靠 cwd 找 `config/protocol-vectors.json`，会报"找不到向量文件"。
+它本来也不需要蓝牙权限，直接跑裸二进制即可（要指定路径用 `selftest --vectors <path>`）。
 
 `record` 会发 CTRL START 强制采集（不依赖 OK 键），结束时发 STOP。
 序号跳变累计成"丢失块数"单独报出来 —— 不用"能听到声音"掩盖链路质量。
@@ -154,10 +166,11 @@ min / 中位 / p95 / max 与抖动（`--json` 出 `ai-passport-mic-ping-report-1
    （断连与未订阅已在 STATUS 与 `record` 的错误路径里体现；声卡那项已随 `crates/sink`
    落地——`Sink::open` 打不开就失败并列出可用设备，GUI 侧的提示语留到 G3。）
 3. 序号跳变计数并上报。
-4. 按键注入失败或异常退出时，释放所有按下的修饰键（M3）。
+4. 按键注入失败或异常退出时，释放所有按下的修饰键（M3，已实现：注入用事件自带 flags，
+   不单独发修饰键事件）。
 5. 长期时钟漂移用单样本插删补偿，**不允许**靠周期性欠载或整帧丢弃兜底。
 6. 满量程毛刺必须被静音替换后才推进声卡，不允许把 ±32767 交替噪声直接放出去。
-7. 不实现烧录、ASR、文字注入。
+7. 不实现 ASR、文字注入（烧写是开箱流程的一部分，走 USB，见 `../docs/ARCHITECTURE.md`）。
 
 ## 已知限制
 
@@ -168,13 +181,14 @@ min / 中位 / p95 / max 与抖动（`--json` 出 `ai-passport-mic-ping-report-1
 - **`--verify` 在本机不可用**：探针要读输入，而本机给 WorkBuddy 启动的任何进程都不给
   麦克风权限（同一台机器上用 ffmpeg 录默认麦克风也是全静音）。当前靠人工看系统声音面板
   的电平条验收；等 GUI 用正规 bundle 申请权限后，`--verify` 才能回到自动验收。
-- **时钟漂移已补偿，但只在仿真里验过**：`crates/sink/src/playout.rs` 用单样本插删吸收长期
+- **时钟漂移已补偿，仿真与真机都验过**：`crates/sink/src/playout.rs` 用单样本插删吸收长期
   漂移（比例控制，上限 1%）。仿真里 15933 Hz 生产 / 16000 Hz 消费跑 60 s 零欠载、零超容量
-  丢弃；真机上"20 s 差 84 ms"这个数还没用新代码复测。
+  丢弃；**真机 60 s 已复测（2026-11-05）**：−57 ppm、0 丢块、0 欠载、缓冲 55–95 ms。
+  10 min 也跑过（毛刺 0 段、跳变 0），但欠载 10 次 → KI-006 仍 FAIL。
 - **GUI 缺 G3b/G6**：回环自动验收仍在 CLI（`apmctl sink --verify`），签名只有 ad-hoc。
-- **编排还没全部进 `apm-app`**：`detect_adapter` / `scan` / `connect` 已在 `apm-app`，
-  编排已迁进 `apm-app`（`session` / `pipeline`），CLI 里只剩参数解析与打印，
-  GUI 走同一条管线（见 `../docs/GUI.md` 决定 D1）。
+- **编排只有一份，全在 `apm-app`**：`detect_adapter` / `scan` / `connect` / `start_stream` /
+  `stop_stream` / 采集解码写声卡都在 `apm-app`（`core` / `session` / `pipeline`），
+  CLI 里只剩参数解析与打印，GUI 走同一条管线（见 `../docs/GUI.md` 决定 D1）。
 - **裸二进制不能用蓝牙**：macOS TCC 要求 bundle + 用途声明，直接 `./target/release/apmctl record`
   会被系统 abort，见上文「macOS 上的蓝牙权限」。
 - **满量程毛刺：根因未定位，只做了两端拦截**（`../docs/KNOWN_ISSUES.md` KI-001）。
@@ -192,9 +206,9 @@ min / 中位 / p95 / max 与抖动（`--json` 出 `ai-passport-mic-ping-report-1
 
 | 项 | 状态 |
 | --- | --- |
-| `cargo test`（workspace，63 项） | 通过；protocol 31 + 向量对拍 5 + 毛刺复现 3 + link 3 + sink 5 + app 13 + cli 4；无 warning |
+| `cargo test`（workspace，`default-members` 不含 gui） | **通过（2026-11-07 复核）**：**130 passed / 0 failed / 2 ignored**，7 个有测试的目标——`apm-app` 69（+2 ignored）、`apm-protocol` 37、`c-vectors` 5、`glitch_repro` 3、`apm-link` 5、`apm-sink` 7、`apmctl` 4；无 warning |
 | `cargo build`（workspace） | 通过 |
-| `apmctl selftest` | 通过（同一份向量，15 项） |
+| `apmctl selftest` | 通过（同一份向量，**17 项**）。注意：它**不需要蓝牙**，直接跑 `./desktop/target/release/apmctl selftest` 即可；走 `apmctl-macos.sh` 反而会因为 cwd 变成 `/` 而找不到向量文件 |
 | `apmctl analyze` | 用合成 WAV 与真机 WAV 都跑过 |
 | `scan` | **真机通过**：扫到 `AI Passport Mic`（RSSI -48 dBm，`本项目服务=yes`） |
 | `status` | **真机通过**：连接成功，`state=ready ble=是 audio=是`，首个 STATUS 读失败但通知正常 |
@@ -204,16 +218,16 @@ min / 中位 / p95 / max 与抖动（`--json` 出 `ai-passport-mic-ping-report-1
 | 会议软件端到端 | **通过**（用户实测：会议软件选 `BlackHole 2ch`，说话时麦克风电平跟随） |
 | 毛刺抑制（单测 + 合成 WAV） | 通过：`crates/protocol` 5 项单测 + `analyze` 正确识别 1 段 / 799.6 ms 并判 fail |
 | 漂移补偿（仿真 60 s） | 通过：±5000 ppm 两个方向均 0 欠载 / 0 超容量丢弃，ppm 估计误差 < 400 |
-| 上述两项的**真机复测** | **未做**（需要重新烧录固件 + 跑 60 s `sink`），见 KI-002 |
-| `ping`（单测 + 统计口径） | 代码通过：4 项统计单测（最近秩 p95 / 抖动按发送顺序 / 单样本）；**真机未测**，需烧新固件 |
+| 上述两项的**真机复测** | **已做（2026-11-05）**：60 s `sink` 跑出 −57 ppm（补 1805 / 丢 1750 样本）、0 丢块、0 欠载、缓冲 55–95 ms、毛刺 0 段；10 min（KI-001 口径）也跑过：毛刺 0 段、跳变 0，但欠载 10 次 → KI-006 仍 FAIL。明细见 KI-002 |
+| `ping`（单测 + 统计口径） | 代码通过：4 项统计单测（最近秩 p95 / 抖动按发送顺序 / 单样本）；**真机已测（2026-11-05）**：20 发 20 收 0 超时，中位 38.2 ms / p95 41.5 ms / 抖动 3.0 ms |
 | `sink --tone` | 声卡流正常消费（480000 帧写入）；**用户在「系统设置 → 声音 → 输入」看到电平条随信号跳动**，证明进程→声卡这一段通了 |
 | `probe` | 内置麦克风与 BlackHole 输入端都读到 -120 dBFS（1 LSB 抖动）→ 麦克风权限被拒，探针不可用 |
-| GUI 构建（`scripts/build-gui.sh`） | **通过**：`.app` 37.81 MiB（+7.5 MiB 来自 espflash/serialport），ad-hoc 签名有效，Info.plist 内含 `NSBluetooth*` / `NSMicrophone*`，bundle id `com.cnryb.ai-passport-mic` |
+| GUI 构建（`scripts/build-gui.sh`） | **通过**：ad-hoc 签名有效，Info.plist 内含 `NSBluetooth*` / `NSMicrophone*`，bundle id `com.cnryb.ai-passport-mic`。体积要按 profile 看：**debug 37.81 MiB**（2026-11-06 接入 espflash/serialport 后的数字），**release 12.2 MiB**（`strip = true` + `lto = "thin"`）。别把 debug 的体积当发布体积 |
 | GUI 启动（`open` 启动、无 TCC abort） | **通过**：进程存活、webview 已加载、诊断日志有启动记录 |
 | GUI 适配器探测超时保护 | **通过**：授权未点/蓝牙关闭时 6 s 落到 `no_adapter` 并给出可执行提示，不再无限挂起 |
-| GUI 首次蓝牙授权 + 扫描到设备 | **未验证**：需要人在系统弹窗点「允许」。本轮两次启动都停在等待授权（屏幕处于锁屏/休眠，无法确认弹窗是否被点） |
+| GUI 首次蓝牙授权 + 扫描到设备 | **通过（2026-11-05 真机，人在场那一轮）**：授权弹窗出现并手动点「允许」，6 s 扫到 7 个设备、目标在列、RSSI 与 `apmctl scan` 都是 −50 dBm。明细见 `../docs/GUI.md` §14.7。**无人值守那一轮**（§14.2 启动冒烟）停在等授权（屏幕锁屏），那是环境限制，不是功能缺陷 |
 | 固件镜像解析（`cargo test -p apm-app firmware`） | **通过**：8 项——版本解析、短镜像/错 magic 拒绝、分区表守卫（含 nvs 被挪位必须拒绝）、MD5 向量、**用真实 `merged.bin` 验偏移常量** |
-| 随包固件进 `.app` | **通过**：`Contents/Resources/firmware/ai-passport-mic-merged.bin` 715616 字节；`build-gui.sh` 缺镜像会直接失败 |
+| 随包固件进 `.app` | **通过**：`Contents/Resources/firmware/ai-passport-mic-merged.bin` 存在且 `build-gui.sh` 校验字节数（当前产物 720448 字节；数字随固件改动而变，脚本只断言存在且非空） |
 | 串口枚举去重 | **通过（2026-11-06 真机）**：macOS 上同一台设备原本被列成 `/dev/cu.usbmodem11301` 与 `/dev/tty.usbmodem11301` 两条，修完只剩一条 |
 | `apmctl firmware probe` | **通过（真机）**：`esp32c3`，设备 `7552506-dirty` → 镜像 `0.1.0` → `Mismatch`；复位进下载模式读描述符，退出时自动复位回应用模式 |
 | `apmctl firmware flash` | **通过（真机）**：三段写入（bootloader / 分区表 / app）4.9–5.0 s，`FlashMd5` 与本地一致；烧完设备自行复位、BLE 重新广播，旧版本 `7552506-dirty` → `0.1.0` |
