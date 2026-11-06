@@ -46,10 +46,21 @@ static volatile bool s_ptt_held;
 static volatile bool s_forced_capture;
 static volatile uint32_t s_blocks_sent;
 static volatile uint16_t s_blocks_dropped;
+static volatile uint32_t s_blocks_congested;
 static volatile uint32_t s_blocks_muted;
 static volatile bool s_audio_error;
 
 static bool capture_on(void) { return s_forced_capture || s_ptt_held; }
+
+// 一条会话 = 从开始采集到停止采集。计数器按会话归零，否则 STATUS 里的
+// dropped / sent 是**自设备启动起**的累计值，PC 端会把上一场的丢块算到这一场头上
+// （KI-005 附录里踩过这个坑）。
+static void reset_session_counters(void)
+{
+    s_blocks_sent = 0;
+    s_blocks_dropped = 0;
+    s_blocks_congested = 0;
+}
 
 // ---------------------------------------------------------------------------
 // 按键回调：只入队
@@ -86,6 +97,29 @@ static void on_ctrl(uint8_t type, const uint8_t *payload, uint16_t len)
     if (xQueueSend(s_evt_q, &e, 0) != pdTRUE) {
         ESP_LOGW(TAG, "事件队列满，丢弃 CTRL type=0x%02X", type);
     }
+}
+
+// ---------------------------------------------------------------------------
+// 链路状态回调：断链 = 上一条会话结束
+// ---------------------------------------------------------------------------
+// 这一段是 KI-005 的直接解药。以前 CTRL STOP 是唯一能清 s_forced_capture 的路径，
+// 所以 PC 被 pkill / 蓝牙掉线 / 用户关掉 GUI 时，设备会带着 START 一直"在采集"：
+//   - 新客户端一订阅 AUDIO 就收到音频，而它还没发 START（GUI 那次 450 ms 16 条告警）；
+//   - STATUS 一直报 CAPTURING，PC 侧状态机对不上；
+//   - 每 20 ms 白编码一块再去撞一个注定失败的 notify。
+// 断链就该回 idle，不等 STOP。
+static void on_link_state(bool connected)
+{
+    if (connected) {
+        ESP_LOGI(TAG, "链路已连接，等待 CTRL START 或 PTT");
+        return;
+    }
+    if (s_forced_capture || s_ptt_held) {
+        ESP_LOGW(TAG, "断链：清掉采集态（START=%d PTT=%d），不等 STOP",
+                 (int)s_forced_capture, (int)s_ptt_held);
+    }
+    s_forced_capture = false;
+    s_ptt_held = false;
 }
 
 // ---------------------------------------------------------------------------
@@ -156,11 +190,14 @@ static void audio_task(void *arg)
         block[1] = (uint8_t)((seq >> 8) & 0xFF);
         seq++;
 
-        if (apm_link_notify_audio(block, APM_AUDIO_BLOCK_LEN) == 0) {
+        int rc = apm_link_notify_audio(block, APM_AUDIO_BLOCK_LEN);
+        if (rc == APM_LINK_TX_OK) {
             s_blocks_sent++;
         } else {
             // 序号仍然递增：PC 端据此看到跳变，能区分"没说话"和"丢了块"。
             if (s_blocks_dropped < UINT16_MAX) s_blocks_dropped++;
+            // 单独统计"协议栈推不动"：这是链路/连接参数的证据，不是设备没采。
+            if (rc == APM_LINK_TX_CONGESTED) s_blocks_congested++;
         }
     }
 }
@@ -183,6 +220,8 @@ static uint8_t current_flags(void)
     if (apm_link_audio_ready()) flags |= APM_FLAG_AUDIO_SUBSCRIBED;
     if (s_ptt_held) flags |= APM_FLAG_PTT_HELD;
     if (!apm_audio_ready() || s_audio_error) flags |= APM_FLAG_AUDIO_ERROR;
+    // 连接间隔撑不住 50 块/秒时提前告诉 PC：这种会话的数据不能当音质/漂移结论用（KI-005）。
+    if (apm_link_conn_itvl_ms() > APM_CONN_ITVL_OK_MS) flags |= APM_FLAG_LINK_SLOW;
     return flags;
 }
 
@@ -195,6 +234,7 @@ static void handle_event(const apm_evt_t *e)
         if (btn == APM_BTN_OK) {
             // OK 的按下/抬起默认就是 PTT 开关（见 config/README.md 的硬约束）。
             if (ev == APM_BTN_EV_PRESS) {
+                if (!capture_on()) reset_session_counters();
                 s_ptt_held = true;
             } else if (ev == APM_BTN_EV_RELEASE) {
                 s_ptt_held = false;
@@ -206,8 +246,10 @@ static void handle_event(const apm_evt_t *e)
 
     switch (e->ctrl_type) {
     case APM_MSG_START:
+        if (!capture_on()) reset_session_counters();
         s_forced_capture = true;
-        ESP_LOGI(TAG, "CTRL START");
+        ESP_LOGI(TAG, "CTRL START（连接间隔 %u ms，MTU %u）",
+                 apm_link_conn_itvl_ms(), apm_link_mtu());
         break;
     case APM_MSG_STOP:
         s_forced_capture = false;
@@ -253,9 +295,32 @@ static void event_task(void *arg)
 static void status_task(void *arg)
 {
     (void)arg;
+    uint32_t last_congested = 0;
+    uint32_t last_log_ms = 0;
+
     for (;;) {
+        // 心跳顺带做两件事：把跑偏的连接间隔拉回快速档；把"推不动"的证据打到串口。
+        // KI-005 之所以查了两轮还只能靠猜，就是因为设备侧没有任何一行日志能说明
+        // "块是采到了、编好了，卡在发不出去"。
+        apm_link_ensure_fast_conn();
+
         apm_link_notify_status(current_state(), current_flags(),
                                s_blocks_dropped, s_blocks_sent);
+
+        uint32_t now = (uint32_t)(xTaskGetTickCount() * portTICK_PERIOD_MS);
+        uint32_t congested = s_blocks_congested;
+        if (congested != last_congested) {
+            if (now - last_log_ms >= 5000) {
+                ESP_LOGW(TAG, "发送拥塞：累计 %u 块丢在协议栈（连接间隔 %u ms，MTU %u）",
+                         (unsigned)congested, apm_link_conn_itvl_ms(), apm_link_mtu());
+                last_congested = congested;
+                last_log_ms = now;
+            }
+        } else {
+            // 没拥塞时把窗口一直往后推，下一次拥塞第一秒就能报出来。
+            last_log_ms = now;
+        }
+
         vTaskDelay(pdMS_TO_TICKS(1000));
     }
 }
@@ -285,6 +350,7 @@ void app_main(void)
 
     // 先挂回调再启动 NimBLE：主机任务起来之后随时可能收到 CTRL 写。
     apm_link_set_ctrl_cb(on_ctrl);
+    apm_link_set_conn_cb(on_link_state);
     err = apm_link_start(APM_DEVICE_NAME);
     if (err != ESP_OK) {
         ESP_LOGE(TAG, "BLE 启动失败: %s", esp_err_to_name(err));

@@ -32,6 +32,11 @@ CONFIG_BT_NIMBLE_NVS_PERSIST=y
 # MTU 247：165 字节音频块单包发送（需 >= 168），余量留给 STATUS / EVENT。
 CONFIG_BT_NIMBLE_ATT_PREFERRED_MTU=247
 
+# MSYS 池：一条音频通知占 2 块（ATT 头 + 165 字节载荷），默认 12 块 = 最多 6 条在途。
+# 链路一慢就变成"6 块一组"的尖峰，第 7 块起全部 ENOMEM（KI-005 的 1.5–2 块/秒）。
+# 24 块 = 12 条在途，给连接事件之间的抖动留一倍余量；代价是 +3 KB RAM。
+CONFIG_BT_NIMBLE_MSYS_1_BLOCK_COUNT=24
+
 # ---- 音频 ----
 # esp_codec_dev 由组件管理器按 main/idf_component.yml 拉取。
 CONFIG_ESP_MAIN_TASK_STACK_SIZE=4096

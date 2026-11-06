@@ -60,6 +60,9 @@ typedef enum {
 #define APM_FLAG_AUDIO_SUBSCRIBED 0x02
 #define APM_FLAG_PTT_HELD        0x04
 #define APM_FLAG_AUDIO_ERROR     0x08
+// bit4：实际连接间隔 > 40 ms，链路撑不住 50 块/秒（KI-005）。
+// 置位时音频块会大量丢在协议栈里，这一场的数据不能当音质/漂移结论用。
+#define APM_FLAG_LINK_SLOW       0x10
 
 // EVENT.payload
 typedef enum {

@@ -9,6 +9,7 @@
 #include "board.h"
 
 #include "esp_log.h"
+#include "esp_timer.h"
 #include "host/ble_hs.h"
 #include "host/util/util.h"
 #include "nimble/nimble_port.h"
@@ -23,6 +24,19 @@ static const char *TAG = "apm_link";
 // 单包含下 165 字节音频块：MTU 至少 168。取 247 留出 STATUS/EVENT 的余量。
 #define APM_BLE_MTU            247
 #define APM_BLE_MIN_AUDIO_MTU  (APM_AUDIO_BLOCK_LEN + 3)
+
+// ---- 连接参数（KI-005 的根因就在这一段）------------------------------------
+// 50 块/秒 × 165 字节 = 8.25 KB/s。这个速率只有在 15–30 ms 的连接间隔下才推得动；
+// 间隔一旦被主机放到 500 ms 量级，协议栈里每次能塞进去的块屈指可数，notify 大面积
+// 失败，PC 侧看到的就是"设备几乎不发"（实测 1.5–2 块/秒）。
+//
+// 所以这里做三件事：广播里带上从机首选参数、连上后延时请求、失败退避重试。
+#define APM_CONN_ITVL_MIN_MS     15
+#define APM_CONN_ITVL_MAX_MS     30
+#define APM_CONN_UPD_FIRST_MS    600   // 连上立刻请求常被主机拒绝，先等一拍
+#define APM_CONN_UPD_RETRY_MS    1000
+#define APM_CONN_UPD_MAX_TRIES   6
+#define APM_CONN_UPD_WATCHDOG_MS 5000  // 运行中每隔这么久检查一次实际间隔
 
 // a7c52e00-31d4-4d2a-8f6b-5e9c1b3f7aNN（文本序）；BLE 侧按 LSB-first 存 16 字节。
 // 展开成裸字节列表，才能直接喂给 BLE_UUID128_INIT（多一对花括号会变成标量初始化）。
@@ -57,6 +71,16 @@ static bool     s_sub_event;
 static const char *s_name = APM_DEVICE_NAME;
 
 static apm_ctrl_cb_t s_ctrl_cb;
+static apm_conn_cb_t s_conn_cb;
+
+// 实际协商到的连接间隔（1.25 ms 为单位）；0 = 还没读到。
+static uint16_t s_itvl_125us;
+// 上次请求参数更新的时刻与次数，用于重试节流。
+static uint32_t s_upd_req_ms;
+static uint8_t  s_upd_tries;
+static esp_timer_handle_t s_upd_timer;
+
+static uint32_t now_ms(void) { return (uint32_t)(esp_timer_get_time() / 1000); }
 
 static uint8_t  s_status_payload[8];
 static uint16_t s_status_len;
@@ -209,6 +233,11 @@ static int gatt_access(uint16_t conn_handle, uint16_t attr_handle,
 // ---------------------------------------------------------------------------
 // 广播
 // ---------------------------------------------------------------------------
+// 0x0d「从机首选连接间隔」：min/max 各 2 字节小端，单位 1.25 ms。
+// 12 = 15 ms、24 = 30 ms。放在广播里，主机在建连那一刻就有据可依，
+// 不用等第一条 CTRL —— KI-005 的坏会话都是从"建连时参数就偏了"开始的。
+static const uint8_t s_pref_itvl_range[4] = { 12, 0, 24, 0 };
+
 static int advertise(void)
 {
     struct ble_hs_adv_fields fields = { 0 };
@@ -216,6 +245,7 @@ static int advertise(void)
     fields.name = (const uint8_t *)s_name;
     fields.name_len = (uint8_t)strlen(s_name);
     fields.name_is_complete = 1;
+    fields.slave_itvl_range = s_pref_itvl_range;
 
     int rc = ble_gap_adv_set_fields(&fields);
     if (rc != 0) {
@@ -250,6 +280,58 @@ static int advertise(void)
 }
 
 // ---------------------------------------------------------------------------
+// 连接参数
+// ---------------------------------------------------------------------------
+static void refresh_itvl(void)
+{
+    struct ble_gap_conn_desc desc;
+    if (s_conn == BLE_HS_CONN_HANDLE_NONE) {
+        s_itvl_125us = 0;
+        return;
+    }
+    if (ble_gap_conn_find(s_conn, &desc) == 0) s_itvl_125us = desc.conn_itvl;
+}
+
+static void schedule_update(uint32_t delay_ms)
+{
+    if (!s_upd_timer) return;
+    esp_timer_stop(s_upd_timer);
+    if (esp_timer_start_once(s_upd_timer, (uint64_t)delay_ms * 1000) != ESP_OK) {
+        ESP_LOGW(TAG, "连接参数重试定时器启动失败");
+    }
+}
+
+static void request_fast_conn(void)
+{
+    if (s_conn == BLE_HS_CONN_HANDLE_NONE) return;
+
+    struct ble_gap_upd_params up = {
+        .itvl_min = BLE_GAP_CONN_ITVL_MS(APM_CONN_ITVL_MIN_MS),
+        .itvl_max = BLE_GAP_CONN_ITVL_MS(APM_CONN_ITVL_MAX_MS),
+        .latency  = 0,
+        .supervision_timeout = 400,  // 4 s
+    };
+    s_upd_req_ms = now_ms();
+    s_upd_tries++;
+
+    int rc = ble_gap_update_params(s_conn, &up);
+    if (rc == 0) {
+        ESP_LOGI(TAG, "请求连接参数 %d-%d ms（第 %u 次）",
+                 APM_CONN_ITVL_MIN_MS, APM_CONN_ITVL_MAX_MS, s_upd_tries);
+    } else {
+        ESP_LOGW(TAG, "连接参数请求失败: %d（第 %u 次）", rc, s_upd_tries);
+        // 主机拒绝/忙的时候不能一次就放弃：KI-005 的坏会话就是"没重试"躺了一整场。
+        if (s_upd_tries < APM_CONN_UPD_MAX_TRIES) schedule_update(APM_CONN_UPD_RETRY_MS);
+    }
+}
+
+static void on_update_timer(void *arg)
+{
+    (void)arg;
+    request_fast_conn();
+}
+
+// ---------------------------------------------------------------------------
 // GAP
 // ---------------------------------------------------------------------------
 static int gap_event(struct ble_gap_event *event, void *arg)
@@ -260,19 +342,15 @@ static int gap_event(struct ble_gap_event *event, void *arg)
     case BLE_GAP_EVENT_CONNECT:
         if (event->connect.status == 0) {
             s_conn = event->connect.conn_handle;
-            ESP_LOGI(TAG, "已连接 conn=%u", s_conn);
+            s_itvl_125us = 0;
+            s_upd_tries = 0;
+            refresh_itvl();
+            ESP_LOGI(TAG, "已连接 conn=%u itvl=%u ms", s_conn, apm_link_conn_itvl_ms());
+            if (s_conn_cb) s_conn_cb(true);
 
-            // 低延迟参数：15–30 ms 间隔、无 slave latency。
-            // 实测（macOS 15.3.1）：请求 15–30 时主机接受并落到 30 ms；
-            // 改成 15–20 会被主机拒绝（host 返回 554），因此上限别随手压。
-            struct ble_gap_upd_params up = {
-                .itvl_min = BLE_GAP_CONN_ITVL_MS(15),
-                .itvl_max = BLE_GAP_CONN_ITVL_MS(30),
-                .latency  = 0,
-                .supervision_timeout = 400,  // 4 s
-            };
-            int rc = ble_gap_update_params(s_conn, &up);
-            if (rc != 0) ESP_LOGW(TAG, "连接参数更新请求失败: %d", rc);
+            // 建连瞬间就请求参数更新，macOS 大概率拒（见 docs/GUI.md 实测），
+            // 先等 APM_CONN_UPD_FIRST_MS 再发，失败由 request_fast_conn 退避重试。
+            schedule_update(APM_CONN_UPD_FIRST_MS);
         } else {
             ESP_LOGW(TAG, "连接失败 status=%d，重新广播", event->connect.status);
             advertise();
@@ -283,7 +361,12 @@ static int gap_event(struct ble_gap_event *event, void *arg)
         ESP_LOGI(TAG, "断开 reason=0x%02X", event->disconnect.reason);
         s_conn = BLE_HS_CONN_HANDLE_NONE;
         s_mtu = 0;
+        s_itvl_125us = 0;
+        s_upd_tries = 0;
+        if (s_upd_timer) esp_timer_stop(s_upd_timer);
         s_sub_audio = s_sub_status = s_sub_event = false;
+        // 先告诉应用层"会话没了"，再重新广播：应用层要在这里清掉 START/PTT。
+        if (s_conn_cb) s_conn_cb(false);
         advertise();
         return 0;
 
@@ -314,14 +397,23 @@ static int gap_event(struct ble_gap_event *event, void *arg)
 
     case BLE_GAP_EVENT_CONN_UPDATE: {
         if (event->conn_update.status == 0) {
+            refresh_itvl();
+            s_upd_tries = 0;  // 生效了，把重试预算还回去，留给运行中的看门狗
             struct ble_gap_conn_desc desc;
             if (ble_gap_conn_find(event->conn_update.conn_handle, &desc) == 0) {
                 ESP_LOGI(TAG, "连接参数已更新 itvl=%.1f ms latency=%u timeout=%u ms",
                          desc.conn_itvl * 1.25, desc.conn_latency,
                          (unsigned)desc.supervision_timeout * 10);
             }
+            if (apm_link_conn_itvl_ms() > APM_CONN_ITVL_OK_MS) {
+                ESP_LOGW(TAG, "连接间隔 %u ms 仍然超过 %d ms，50 块/秒会推不动",
+                         apm_link_conn_itvl_ms(), APM_CONN_ITVL_OK_MS);
+            }
         } else {
-            ESP_LOGW(TAG, "连接参数更新被拒: %d", event->conn_update.status);
+            refresh_itvl();
+            ESP_LOGW(TAG, "连接参数更新被拒: %d（当前 %u ms，第 %u 次）",
+                     event->conn_update.status, apm_link_conn_itvl_ms(), s_upd_tries);
+            if (s_upd_tries < APM_CONN_UPD_MAX_TRIES) schedule_update(APM_CONN_UPD_RETRY_MS);
         }
         return 0;
     }
@@ -358,9 +450,13 @@ static int notify(uint16_t attr, const uint8_t *data, size_t len)
 
 int apm_link_notify_audio(const uint8_t *block, size_t len)
 {
-    if (!s_sub_audio) return -1;
-    if (s_mtu && s_mtu < APM_BLE_MIN_AUDIO_MTU) return -4;
-    return notify(s_h_aud, block, len);
+    if (!s_sub_audio) return APM_LINK_TX_NO_SINK;
+    if (s_mtu && s_mtu < APM_BLE_MIN_AUDIO_MTU) return APM_LINK_TX_MTU;
+
+    int rc = notify(s_h_aud, block, len);
+    if (rc == 0) return APM_LINK_TX_OK;
+    // -1 = 连接在两次检查之间断了；其余（mbuf 取不到 / 协议栈拒收）都算拥塞。
+    return rc == -1 ? APM_LINK_TX_NO_SINK : APM_LINK_TX_CONGESTED;
 }
 
 int apm_link_notify_event(apm_btn_t btn, apm_btn_ev_t ev, uint8_t flags)
@@ -447,7 +543,23 @@ esp_err_t apm_link_start(const char *device_name)
 {
     if (device_name) s_name = device_name;
 
+    // 连接参数重试用的单次定时器（任务上下文，允许在回调里再启动自己）。
+    if (!s_upd_timer) {
+        const esp_timer_create_args_t args = {
+            .callback = on_update_timer,
+            .arg      = NULL,
+            .name     = "apm_conn_upd",
+        };
+        esp_err_t terr = esp_timer_create(&args, &s_upd_timer);
+        if (terr != ESP_OK) {
+            ESP_LOGW(TAG, "连接参数定时器创建失败: %s（退化为只在建连时请求一次）",
+                     esp_err_to_name(terr));
+            s_upd_timer = NULL;
+        }
+    }
+
     esp_err_t err = nimble_port_init();
+
     if (err != ESP_OK) {
         ESP_LOGE(TAG, "nimble_port_init 失败: %s", esp_err_to_name(err));
         return err;
@@ -478,6 +590,32 @@ esp_err_t apm_link_start(const char *device_name)
 }
 
 void apm_link_set_ctrl_cb(apm_ctrl_cb_t cb) { s_ctrl_cb = cb; }
+
+void apm_link_set_conn_cb(apm_conn_cb_t cb) { s_conn_cb = cb; }
+
+uint16_t apm_link_conn_itvl_ms(void)
+{
+    if (s_itvl_125us == 0) return 0;
+    // 1.25 ms 为单位：ms = itvl * 5 / 4（四舍五入）
+    return (uint16_t)((s_itvl_125us * 5u + 2u) / 4u);
+}
+
+void apm_link_ensure_fast_conn(void)
+{
+    if (s_conn == BLE_HS_CONN_HANDLE_NONE) return;
+    refresh_itvl();
+
+    uint16_t ms = apm_link_conn_itvl_ms();
+    if (ms == 0 || ms <= APM_CONN_ITVL_OK_MS) return;
+    // 已经有重试挂在定时器上就别叠一层，否则每次心跳都在发同一个请求。
+    if (s_upd_timer && esp_timer_is_active(s_upd_timer)) return;
+    if (now_ms() - s_upd_req_ms < APM_CONN_UPD_WATCHDOG_MS) return;
+
+    ESP_LOGW(TAG, "连接间隔 %u ms 撑不住 50 块/秒，重新请求快速参数", ms);
+    s_upd_tries = 0;
+    request_fast_conn();
+}
+
 
 bool apm_link_connected(void) { return s_conn != BLE_HS_CONN_HANDLE_NONE; }
 
