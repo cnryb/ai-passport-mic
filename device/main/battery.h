@@ -11,6 +11,11 @@
 // 设备端按任意键时背光短闪 3 次（平时背光恒灭，零功耗）。
 #define APM_BATTERY_LOW_SOC_PCT 20
 
+// 单节锂电的欠压参考线。低于 2.5 V 已进入深度过放区（正常保护板会在 2.5–3.0 V 切断），
+// 现场读到 1.0 V 基本就是"电池没接 / 保护板锁死 / 电芯已废"。
+// 只用于日志判断，不参与电量换算——界面显示的永远是 SOC，不是这个电压。
+#define APM_BATTERY_UNDERVOLT_MV 2500
+
 // 初始化电量计设备句柄并触发一次 SOC 重算。依赖共享 I2C 总线
 // （apm_audio_i2c_bus()），总线没起来时返回 ESP_ERR_INVALID_STATE。可重复调用。
 esp_err_t apm_battery_init(void);
