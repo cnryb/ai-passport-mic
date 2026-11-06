@@ -64,6 +64,13 @@ pub const FLAG_BLE_CONNECTED: u8 = 0x01;
 pub const FLAG_AUDIO_SUBSCRIBED: u8 = 0x02;
 pub const FLAG_PTT_HELD: u8 = 0x04;
 pub const FLAG_AUDIO_ERROR: u8 = 0x08;
+/// 实际连接间隔 > 40 ms，链路撑不住 50 块/秒。
+///
+/// 固件在建连后协商到慢档、或运行中被降档时置位（`device/main/link.c`）。
+/// **这种会话的欠载/漂移数字是链路假象，不能当音质结论用** ——
+/// PC 侧必须据此提示并拒绝把这一场写进音质对比，见 `docs/ARCHITECTURE.md`
+/// 的 STATUS 节与 `docs/KNOWN_ISSUES.md` KI-005。
+pub const FLAG_LINK_SLOW: u8 = 0x10;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum FrameError {
@@ -191,6 +198,10 @@ impl Status {
     pub fn audio_error(&self) -> bool {
         self.flags & FLAG_AUDIO_ERROR != 0
     }
+    /// 链路慢档：实际连接间隔 > 40 ms。这一场的数据不能当音质结论。
+    pub fn link_slow(&self) -> bool {
+        self.flags & FLAG_LINK_SLOW != 0
+    }
 }
 
 /// EVENT 的 3 字节载荷。
@@ -265,6 +276,31 @@ mod tests {
         let (frame, _) = decode(&bytes).unwrap();
         let decoded = Status::decode(frame.payload).unwrap();
         assert_eq!(decoded, status);
+    }
+
+    #[test]
+    fn status_flag_bits_match_firmware() {
+        // 与 device/main/protocol.h 的 APM_FLAG_* 一一对应；改这里必须同时改固件与
+        // ARCHITECTURE.md 的 STATUS 节，否则两端对"这一场脏不脏"的判断会分叉。
+        let s = Status {
+            state: state::CAPTURING,
+            flags: FLAG_LINK_SLOW,
+            dropped: 0,
+            sent: 0,
+        };
+        assert!(s.link_slow(), "bit4 是 LINK_SLOW");
+        assert!(!s.audio_error());
+        assert_eq!(FLAG_LINK_SLOW, 0x10);
+
+        // 干净会话：其余位都在、bit4 不在，不能误判成慢链路。
+        let clean = Status {
+            state: state::CAPTURING,
+            flags: FLAG_BLE_CONNECTED | FLAG_AUDIO_SUBSCRIBED | FLAG_PTT_HELD,
+            dropped: 0,
+            sent: 0,
+        };
+        assert!(!clean.link_slow());
+        assert_eq!(clean.flags, 0x07, "BLE + AUDIO + PTT，bit4 必须为 0");
     }
 
     #[test]

@@ -88,6 +88,12 @@ pub struct SessionRecord {
     pub session_id: String,
     pub wav_path: Option<String>,
     pub started_ms: u64,
+    /// 这一场设备报过 `LINK_SLOW`（连接间隔 > 40 ms）。
+    ///
+    /// 收尾时才回填（`start_stream` 时还不知道）。**为真时禁止出音质报告**：
+    /// 慢档会话的欠载/漂移/丢块全是链路假象，拿它跟别的版本对比会得出反向结论。
+    /// 见 `docs/ARCHITECTURE.md` 的 STATUS 节与 `docs/KNOWN_ISSUES.md` KI-005。
+    pub link_slow: bool,
 }
 
 /// 声卡的界面视图。字段够用来判断"能不能选"，不暴露 cpal 类型。
@@ -832,6 +838,8 @@ impl AppCore {
                 session_id: session_id.clone(),
                 wav_path: wav_path.as_ref().map(|p| p.display().to_string()),
                 started_ms,
+                // 还不知道；收尾时按 `SessionSummary.link_slow` 回填。
+                link_slow: false,
             });
             while inner.sessions.len() > SESSIONS_KEPT {
                 inner.sessions.pop_front();
@@ -1004,15 +1012,26 @@ impl AppCore {
     }
 
     /// 对某次会话的 WAV 出音质报告。没有录音时明确报错，不给空报告。
+    ///
+    /// **设备报过 `LINK_SLOW` 的会话直接拒绝**：那种场景下设备只在 1.5–2 块/秒地发，
+    /// WAV 里是声卡补的静音，算出来的 RMS/削波/毛刺全是链路假象。给一份"软件分析通过"
+    /// 比不给更糟——它会被当成版本对比的基线（见 KI-005 / `ARCHITECTURE.md` 的 STATUS 节）。
     pub fn analyze_session(&self, session_id: &str) -> Result<QualityReport, AppError> {
-        let path = {
+        let (path, link_slow) = {
             let inner = self.lock_inner();
-            inner
-                .sessions
-                .iter()
-                .find(|s| s.session_id == session_id)
-                .and_then(|s| s.wav_path.clone())
+            let rec = inner.sessions.iter().find(|s| s.session_id == session_id);
+            (rec.and_then(|s| s.wav_path.clone()), rec.map(|s| s.link_slow).unwrap_or(false))
         };
+        if link_slow {
+            return Err(AppError::new(
+                ErrorCode::CaptureNotStarting,
+                format!(
+                    "会话 {session_id} 期间设备报了 LINK_SLOW（连接间隔 > 40 ms），\
+                     这一场的欠载与漂移是链路假象，不出音质报告。\
+                     复位设备后重连，重新录一遍再分析"
+                ),
+            ));
+        }
         let path = path.ok_or_else(|| {
             AppError::internal(format!(
                 "会话 {session_id} 没有录音（开始推流时没勾选「同时保存 WAV」）"
@@ -1218,6 +1237,26 @@ impl AppCore {
                             summary.underruns, summary.silent_frames
                         ),
                     );
+                }
+                // `LINK_SLOW` 的会话回填进记录：音质报告要据此拒绝出结论。
+                // 同时明说一句，别让人以为是声卡坏了。
+                if summary.link_slow {
+                    self.record(
+                        LogLevel::Warn,
+                        "sink",
+                        format!(
+                            "本场设备报过 LINK_SLOW（连接间隔 > 40 ms）：欠载 {}、漂移 {:+.0} ppm 是链路假象，本场不进音质对比",
+                            summary.underruns, summary.ppm
+                        ),
+                    );
+                    let mut inner = self.lock_inner();
+                    if let Some(rec) = inner
+                        .sessions
+                        .iter_mut()
+                        .find(|r| r.session_id == summary.session_id)
+                    {
+                        rec.link_slow = true;
+                    }
                 }
                 self.emit(AppEvent::SessionDone {
                     summary: summary.clone(),
@@ -1631,6 +1670,57 @@ mod tests {
         let err = core.analyze_session("nope").unwrap_err();
         assert_eq!(err.code, ErrorCode::Internal);
         assert!(err.detail.contains("没有录音"), "{}", err.detail);
+    }
+
+    /// LINK_SLOW 的会话必须拒绝出音质报告，而且要给出"重录一遍"的指引，
+    /// 不能让用户以为只是软件抽风。
+    #[test]
+    fn analyze_rejects_link_slow_session() {
+        let core = quiet_core("apm-app-test-linkslow");
+        // 直接塞一条脏会话记录：真正跑一遍需要设备，而这条判据只看记录上的标记。
+        {
+            let mut inner = core.lock_inner();
+            inner.sessions.push_back(SessionRecord {
+                session_id: "dirty".into(),
+                // 路径可以不存在：link_slow 的判据在 open 文件**之前**，
+                // 所以这个用例不需要真 WAV。顺序错了就会先报"文件打不开"，
+                // 掩盖掉真正的拒绝原因。
+                wav_path: Some("/nonexistent/dirty.wav".into()),
+                started_ms: 0,
+                link_slow: true,
+            });
+        }
+        let err = core.analyze_session("dirty").unwrap_err();
+        assert_eq!(err.code, ErrorCode::CaptureNotStarting);
+        assert!(err.detail.contains("LINK_SLOW"), "{}", err.detail);
+        assert!(
+            err.detail.contains("重连"),
+            "要告诉用户怎么办，不能只说不能做：{}",
+            err.detail
+        );
+    }
+
+    /// 干净会话不该被这条护栏误伤：同样是不存在的 WAV，报的必须是"没录音/打不开"，
+    /// 而不是 LINK_SLOW。
+    #[test]
+    fn analyze_does_not_reject_clean_session() {
+        let core = quiet_core("apm-app-test-clean");
+        {
+            let mut inner = core.lock_inner();
+            inner.sessions.push_back(SessionRecord {
+                session_id: "clean".into(),
+                wav_path: Some("/nonexistent/clean.wav".into()),
+                started_ms: 0,
+                link_slow: false,
+            });
+        }
+        let err = core.analyze_session("clean").unwrap_err();
+        assert_ne!(
+            err.code,
+            ErrorCode::CaptureNotStarting,
+            "干净会话被 LINK_SLOW 误判了：{}",
+            err.detail
+        );
     }
 
     #[test]

@@ -42,6 +42,8 @@ const sink = ref<string | null>(null)
 const targetMs = ref(80)
 const saveWav = ref(false)
 const autoConnect = ref(false)
+/** 关麦兜底时长（分钟）。默认 10，可在界面上改。 */
+const autoStopMin = ref(10)
 const lastDevice = ref<string | null>(null)
 
 const telemetry = ref<Telemetry | null>(null)
@@ -129,6 +131,14 @@ const metrics = computed(() => {
     { label: '漂移', value: `${t.ppm >= 0 ? '+' : ''}${t.ppm.toFixed(0)} ppm` },
   ]
 })
+
+/**
+ * 本场是否处于链路慢档（设备报 LINK_SLOW）。
+ *
+ * 慢档下设备只有 1.5–2 块/秒，声卡在狂补静音：界面上的欠载/漂移数字**全是假的**。
+ * 必须显式说出来，否则用户会以为是声卡或漂移补偿出了问题（KI-005 / KI-006 的口径陷阱）。
+ */
+const linkSlow = computed(() => telemetry.value?.link_slow === true)
 
 function flash(message: string) {
   toast.value = message
@@ -224,6 +234,12 @@ async function onSinkChange() {
 
 async function onBufferChange() {
   await handle(() => api.setBufferTarget(targetMs.value))
+}
+
+/** 关麦兜底时长。改完立即生效（看门狗每轮现读配置），不用重开流。 */
+async function onAutoStopChange() {
+  await handle(() => api.setAutoStopMin(autoStopMin.value))
+  flash(`连续采集 ${autoStopMin.value} 分钟会自动关麦`)
 }
 
 async function onSaveWavChange() {
@@ -378,6 +394,7 @@ onMounted(async () => {
     targetMs.value = snap.settings.target_ms
     saveWav.value = snap.settings.save_wav
     autoConnect.value = snap.settings.auto_connect
+    autoStopMin.value = snap.settings.auto_stop_min
     lastDevice.value = snap.settings.last_device
     sink.value = snap.settings.sink
     // 电量先按快照回填：自动连接时后端可能在监听注册之前就读完了，
@@ -425,9 +442,16 @@ onMounted(async () => {
       telemetry.value = event.telemetry
     } else if (event.type === 'session-done') {
       summary.value = event.summary
+      // 会话结束就清掉实时指标：否则 linkSlow / 欠载这些数字会粘在界面上，
+      // 下次开流前看着像"这一场也有问题"。
+      telemetry.value = null
     } else if (event.type === 'battery') {
       battery.value = event.pct
       batteryKnown.value = true
+    } else if (event.type === 'stream-aborted') {
+      // 内核主动中止了推流（开流后迟迟没音频）。状态已经回 ready，用户能直接重试，
+      // 所以这里只弹横幅说明原因，不占用状态机的 error 分支。
+      error.value = { code: event.code, detail: event.detail }
     }
   })
 })
@@ -514,8 +538,16 @@ onUnmounted(() => {
         <div class="card-head">
           <h2>电平与指标</h2>
           <span class="spacer" />
+          <span v-if="linkSlow" class="tag tag-warn" title="设备报 LINK_SLOW：连接间隔 > 40 ms">
+            链路慢档
+          </span>
           <span class="tag" :data-live="streaming">{{ streaming ? 'LIVE' : '待机' }}</span>
         </div>
+        <p v-if="linkSlow" class="tip warn-tip">
+          设备报 <code>LINK_SLOW</code>（连接间隔 &gt; 40 ms），撑不住 50 块/秒。
+          <strong>下面的欠载与漂移是链路假象</strong>，不能当音质结论；本场也不会出音质报告。
+          复位设备后重连再试。
+        </p>
         <LevelMeter
           :rms-dbfs="telemetry?.rms_dbfs ?? null"
           :peak-dbfs="telemetry?.peak_dbfs ?? null"
@@ -559,6 +591,21 @@ onUnmounted(() => {
             @change="onBufferChange"
           />
           <span class="mono val">{{ targetMs }} ms</span>
+          <span class="spacer" />
+          <label for="auto-stop" title="连续采集这么久就自动关麦，防忘记。所有推流都生效">
+            关麦兜底
+          </label>
+          <input
+            id="auto-stop"
+            v-model.number="autoStopMin"
+            type="number"
+            min="1"
+            max="1440"
+            step="1"
+            class="num"
+            @change="onAutoStopChange"
+          />
+          <span class="mono val">分钟</span>
           <span class="spacer" />
           <button v-if="!streaming" class="primary" :disabled="!canStart" @click="startStream">
             开始
@@ -822,6 +869,25 @@ onUnmounted(() => {
   background: #3ddc970f;
 }
 
+/* 链路慢档：用警告色，但不像 error banner 那样抢眼——它是"这份数据别信"，
+   不是"出故障了"。 */
+.tag-warn {
+  color: #f0b429;
+  border-color: #f0b42955;
+  background: #f0b4290f;
+}
+
+.warn-tip {
+  color: #f0b429;
+  padding: 0 2px 6px;
+}
+
+.warn-tip code {
+  background: #f0b42918;
+  padding: 0 3px;
+  border-radius: 3px;
+}
+
 .metrics {
   display: flex;
   flex-wrap: wrap;
@@ -894,6 +960,18 @@ input[type='range'] {
 .val {
   color: var(--muted);
   min-width: 48px;
+}
+
+/* 关麦兜底的数字输入：宽度够放 4 位数（1440 分钟 = 24 h）。 */
+.num {
+  width: 62px;
+  padding: 3px 6px;
+  border: 1px solid var(--line);
+  border-radius: 6px;
+  background: var(--bg);
+  color: var(--fg);
+  font-family: var(--mono, ui-monospace, monospace);
+  font-size: 12px;
 }
 
 .tip {

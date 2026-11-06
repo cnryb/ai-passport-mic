@@ -112,6 +112,8 @@ pub enum ErrorCode {
     FlashFailed,
     /// 回读校验不一致。
     FlashVerifyFailed,
+    /// 开流后迟迟收不到音频块：设备没开始发送，或链路被卡在慢档。
+    CaptureNotStarting,
     Busy,
     Internal,
 }
@@ -133,6 +135,9 @@ impl ErrorCode {
             Self::FirmwareImageInvalid => "安装包里的固件损坏或缺失，重新安装本软件",
             Self::FlashFailed => "重插设备后重试；反复失败可以按住 BOOT 键再插线（强制进下载模式）",
             Self::FlashVerifyFailed => "写入的内容和镜像对不上，设备大概率还在下载模式，直接重试一次",
+            Self::CaptureNotStarting => {
+                "设备没开始发送音频（链路慢档或半死态）：复位设备后重连再试；反复出现见 KI-005"
+            }
             Self::Busy => "当前状态下不能这么做，先停止正在进行的操作",
             Self::Internal => "查看诊断日志；这属于未预期错误",
         }

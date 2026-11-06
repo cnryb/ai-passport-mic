@@ -15,6 +15,7 @@ export type ErrorCode =
   | 'firmware_image_invalid'
   | 'flash_failed'
   | 'flash_verify_failed'
+  | 'capture_not_starting'
   | 'busy'
   | 'internal'
 
@@ -104,6 +105,8 @@ export interface SettingsView {
   auto_connect: boolean
   /** 上次连接的设备名（无记录为 null），只用于提示。 */
   last_device: string | null
+  /** 连续采集多少分钟后自动停（关麦兜底）。所有推流都生效。 */
+  auto_stop_min: number
 }
 
 export interface SessionRecord {
@@ -150,6 +153,8 @@ export interface Telemetry {
   glitch_events: number
   overflow_drops: number
   bad_len_blocks: number
+  /** 设备报过 LINK_SLOW：本场欠载/漂移是链路假象，不能当音质结论。 */
+  link_slow: boolean
 }
 
 export interface SessionSummary {
@@ -163,6 +168,8 @@ export interface SessionSummary {
   underruns: number
   silent_frames: number
   frames_dropped: number
+  /** 延迟守卫丢弃的最旧帧数（回调停摆积压），与 frames_dropped 分开计。 */
+  frames_trimmed: number
   lock_misses: number
   ppm: number
   frames_inserted: number
@@ -176,6 +183,8 @@ export interface SessionSummary {
   device_dropped: number
   bad_len_blocks: number
   overflow_drops: number
+  /** 设备报过 LINK_SLOW：本场数字是链路假象，音质报告会拒绝出结论。 */
+  link_slow: boolean
 }
 
 export interface SinkView {
@@ -246,6 +255,8 @@ export type AppEvent =
   | { type: 'telemetry'; telemetry: Telemetry }
   | { type: 'session-done'; summary: SessionSummary }
   | { type: 'battery'; pct: number | null }
+  /** 推流被内核主动中止（目前只有"开流后迟迟没音频"这一种）。状态仍回到 ready，可重试。 */
+  | { type: 'stream-aborted'; code: ErrorCode; detail: string }
 
 export const STATE_LABEL: Record<StateKind, string> = {
   no_adapter: '无蓝牙适配器',
@@ -274,6 +285,8 @@ export const ERROR_HINTS: Record<ErrorCode, string> = {
   firmware_image_invalid: '安装包里的固件损坏或缺失，重新安装本软件',
   flash_failed: '重插设备后重试；反复失败可以按住 BOOT 键再插线（强制进下载模式）',
   flash_verify_failed: '写入内容和镜像对不上，设备大概率还在下载模式，直接重试一次',
+  capture_not_starting:
+    '设备没开始发送音频（链路慢档或半死态）：复位设备后重连再试；反复出现见 KI-005',
   busy: '当前状态下不能这么做，先停止正在进行的操作',
   internal: '查看诊断日志；这属于未预期错误',
 }
