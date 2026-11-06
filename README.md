@@ -6,17 +6,22 @@
 
 > **当前状态：M1 固件真机跑通采集与 BLE 链路；M2 主链路打通——虚拟声卡能当麦克风用；
 > GUI 的 G1–G5 已落地（电平表 + 推流 + 声卡选择 + 会话 WAV + 音质报告 + 按键映射），
-> G3b（回环自动验收）与 G6（签名公证）未做。**
+> G3b（回环自动验收）与 G6（签名公证）未做；M6 的开箱烧写已落地
+> （`设备烧写` 页 + `apmctl firmware ports|probe|flash`：识别 → 比对版本 → 分段写入 →
+> FlashMd5 校验，固件随包分发），**真机写入与校验已通（2026-11-06），空片首烧未验**。**
 > `device/` 是完整的 ESP-IDF 工程：ES8311 采集、IMA-ADPCM 编码、自定义 GATT 传输、
 > 单 ADC 三键手势判定。能编译、能烧录、能在真机上连续采集。
 > `desktop/` 有协议层、BLE 链路、虚拟声卡输出、`apmctl` CLI（scan / status / battery /
-> record / sink / ping / probe / analyze / selftest）和 `apm-gui` 界面；音频编排只有一份
-> （`apm-app`），CLI 与 GUI 共用。协议与固件用同一份共享向量逐字节对拍。
-> 真机已验证：烧录、ES8311 16 kHz 采集、MTU 247、scan / status / record / sink，
+> record / sink / ping / probe / analyze / selftest / firmware）和 `apm-gui` 界面；
+> 音频编排只有一份（`apm-app`），CLI 与 GUI 共用。协议与固件用同一份共享向量逐字节对拍。
+> 真机已验证：烧录、ES8311 16 kHz 采集、MTU 247、scan / status / record / sink、
+> USB 侧检测与烧写（0.1.0 ↔ 设备版本吻合、MD5 一致、烧完自行复位回应用模式），
 > 以及**会议软件里当麦克风用**（虚拟声卡输出已实现并实测）。
-> 仍未验证：按键手势逐项核对、链路往返时延（`apmctl ping` 已实现，未烧新固件实测）、
-> 端到端声学延迟、长时间（>10 分钟）稳定性、GUI 首次蓝牙授权，以及
-> **GUI G1–G5 的每一条实测验收**（拔电源回 idle、10 min 0 欠载、GUI 与 CLI 同时录对拍）。
+> 仍未验证：按键手势逐项核对、端到端声学延迟、长时间（>10 分钟）稳定性、
+> GUI 首次蓝牙授权、**GUI G1–G5 的每一条实测验收**（拔电源回 idle、10 min 0 欠载、
+> GUI 与 CLI 同时录对拍），以及 **M6 的空片首烧与烧写中断后重插恢复**。
+> 已知硬件问题：电量计读到 `SOC=0 / VCELL=0`（详见 KI-007），界面上的"电量 0%，请充电"
+> 是照实显示，不是界面算错。
 > 已拦但待真机复测：时钟漂移（单样本插删补偿）、满量程毛刺（固件压静音 + PC 端静音替换）。
 > **未解决的问题**（毛刺根因、待复测项、缺失的声学回环）集中在
 > [`docs/KNOWN_ISSUES.md`](docs/KNOWN_ISSUES.md)，不散落在各处。
@@ -34,6 +39,7 @@
 | 设备按键 | UP / DOWN / OK 可配置快捷键；OK 的按下/松开保留为 PTT |
 | 音质评估 | WAV 客观指标 + 固定场景录音 + 主观评分 + 延迟/稳定性记录 |
 | 麦克风即系统输入 | 通过虚拟声卡实现，不在第一版实现蓝牙 HFP 或系统音频驱动 |
+| 固件烧写 | 走 USB（C3 内置 USB-Serial-JTAG，免驱、不用按 BOOT）；只写 bootloader / 分区表 / app 三段，**不擦 NVS**；写完用 `FlashMd5` 校验 |
 
 **不在第一版范围**：本地/云端语音识别、自动打字、AI Agent、Wi-Fi 推流、标准蓝牙耳机
 麦克风协议、iOS/Android App。
@@ -43,7 +49,7 @@
 | 路径 | 内容 | 状态 |
 | --- | --- | --- |
 | [`device/`](device/) | 固件工作区（ESP-IDF 5.5.3 / ESP32-C3 / 8 MB Flash / 无 PSRAM） | M1 已实现并真机跑通（按键手势未逐项核对）；见 `device/README.md` |
-| [`desktop/`](desktop/) | PC 软件工作区（Rust workspace：protocol / link / sink / app / cli / gui） | 协议 + 链路 + 声卡输出 + CLI + GUI（G1–G5）已实现；G3b/G6 未做，见 `desktop/README.md` |
+| [`desktop/`](desktop/) | PC 软件工作区（Rust workspace：protocol / link / sink / app / cli / gui） | 协议 + 链路 + 声卡输出 + CLI + GUI（G1–G5 + M6 设备烧写页）已实现；G3b/G6 未做，见 `desktop/README.md` |
 | [`config/`](config/) | 按键映射样例、字段说明、跨端协议向量 | 样例 + 说明 + `protocol-vectors.json`（由 C 实现导出） |
 | [`docs/`](docs/) | [产品](docs/PRODUCT.md)、[架构](docs/ARCHITECTURE.md)、[环境](docs/ENVIRONMENT.md)、[音质](docs/SOUND_QUALITY.md)、[路线图](docs/ROADMAP.md)、[参考实现](docs/REFERENCES.md)、[GUI 方案](docs/GUI.md)、[已知问题](docs/KNOWN_ISSUES.md) | 已就绪；未解决项集中在新加的 `KNOWN_ISSUES.md` |
 | [`scripts/`](scripts/) | 环境体检、IDF 激活、基线自检、协议单测与向量导出、固件构建、GUI 打包、macOS app-bundle 运行器 | 可用 |

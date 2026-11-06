@@ -1,16 +1,20 @@
-# desktop/ —— PC 端软件（M2 主链路 + GUI G1–G5）
+# desktop/ —— PC 端软件（M2 主链路 + GUI G1–G5 + M6 开箱烧写）
 
 把设备送上来的 BLE 音频解码后写入系统虚拟声卡，让会议软件把它当麦克风用。
 
 **已实现**：协议层、BLE 链路、虚拟声卡输出（抖动缓冲）、`apmctl` CLI
-（scan / status / record / sink / ping / probe / analyze / selftest）、`apm-gui` 的
+（scan / status / battery / record / sink / ping / probe / analyze / selftest /
+firmware ports|probe|flash）、`apm-gui` 的
 G0–G5（骨架 + 权限 + 设备发现 + 状态机 + 实时电平与推流 + 声卡选择与会话 WAV +
-音质报告 + 按键映射编辑）。音频编排只有一份：`crates/app`，CLI 与 GUI 都只调它。
+音质报告 + 按键映射编辑），以及 M6 的固件烧写（`apm-app::firmware` + GUI `设备烧写` 页）。
+音频编排只有一份：`crates/app`，CLI 与 GUI 都只调它。
 **未实现**：G3b 回环自动验收（`--verify` 仍在 CLI）、G6 签名公证、按键注入（M3）、
 GUI 的 `run_selftest`（bundle 里没有向量文件，协议自检仍归 `apmctl selftest`）。
 链路与声卡输出都在真机上跑通，并**在会议软件里实测可用**（用户确认：选中 BlackHole 2ch
 当麦克风，说话有电平）。回环自动验收仍受限：宿主的麦克风权限被系统拒绝，读回来是数字静音。
 macOS 上蓝牙**必须走 .app bundle 才能拿到权限**，见文末「macOS 上的蓝牙权限」。
+**烧写的真机路径（检测 / 写入 / 校验 / 烧完自动回应用模式）2026-11-06 已通**；
+空片首烧与"烧写中断后重插恢复"仍未验。
 
 ## 技术栈
 
@@ -21,6 +25,7 @@ macOS 上蓝牙**必须走 .app bundle 才能拿到权限**，见文末「macOS 
 | BLE | `btleplug` 0.11 | 已用（真机 scan / status / record / sink 均通过） |
 | 音频输出 | `cpal` 0.15 → 系统虚拟声卡（macOS BlackHole / Windows VB-CABLE） | 已实现 `crates/sink`：40–80 ms 抖动缓冲 + 单样本漂移补偿 |
 | GUI | Tauri 2 + Vue 3 + Vite + TS | 已落地 G0–G5；G3b/G6 未做（见 `../docs/GUI.md` §10） |
+| 固件烧写 | `espflash` 4.7 作库（`default-features = false` + `serialport`）+ `serialport` 4 | 已实现 `crates/app/src/firmware.rs`；不调外部命令，不需要装 ESP-IDF。**真机检测 + 写入 + FlashMd5 校验已通过（2026-11-06）** |
 
 ## 目录
 
@@ -41,6 +46,7 @@ desktop/
       src/session.rs  # 声卡线程（cpal Stream 是 !Send，只能线程内自持）+ WAV 增量写 + 指标
       src/pipeline.rs # 音频块 → 长度校验/序号跳变/解码 → 声卡或文件（CLI 与 GUI 唯一入口）
       src/report.rs   # 音质报告（与 apmctl analyze --json 同一份）
+      src/firmware.rs # 固件烧写：USB 枚举 / 读 0x10030 版本 / 三段切片写 / FlashMd5 校验
       src/{state,events,log,settings,keymap_store}.rs
     cli/              # apmctl
       src/{main,cmd}.rs
@@ -68,15 +74,17 @@ cargo build --release # 产出 target/release/apmctl
 
 改了 `device/main/protocol.c` 就必须重跑生成脚本，否则对拍会用旧向量。
 
-## GUI（apm-gui）—— G0–G5 已落地
+## GUI（apm-gui）—— G0–G5 + M6 已落地
 
-分期方案见 [`../docs/GUI.md`](../docs/GUI.md)。界面四个 tab：实时（设备 / 电平表 / 指标条 /
-声卡与缓冲 / 开始停止 / 同时保存 WAV）、音质报告、按键映射、诊断。
+分期方案见 [`../docs/GUI.md`](../docs/GUI.md)。界面五个 tab：实时（设备 / 电平表 / 指标条 /
+声卡与缓冲 / 开始停止 / 同时保存 WAV）、设备烧写、音质报告、按键映射、诊断。
 
 - 电平表是 canvas 手绘，数据来自后端 5 Hz `telemetry`；**前端不算任何指标**。
 - 推流前会先检查有没有选声卡、声卡是否原生支持 16 kHz；不满足直接报错，不先开流再报错。
 - 会话 WAV 默认不落盘，勾选后写到 `~/Library/Application Support/com.cnryb.ai-passport-mic/sessions/`。
 - 按键映射页只改映射表；**注入层（M3）没实现，改完不会真的敲键盘**，页面里写明了。
+- 设备烧写页：扫描 → 读版本 → 分段写入 → 回读 MD5 校验。**不擦 NVS**，配对与映射保留；
+  烧写会复位设备，正在推流时别点。首次启动（没有上次设备记录）会默认落到这一页。
 
 ```bash
 ./scripts/build-gui.sh                 # 前端构建 + tauri build --bundles app + 校验 Info.plist
@@ -200,10 +208,16 @@ min / 中位 / p95 / max 与抖动（`--json` 出 `ai-passport-mic-ping-report-1
 | `ping`（单测 + 统计口径） | 代码通过：4 项统计单测（最近秩 p95 / 抖动按发送顺序 / 单样本）；**真机未测**，需烧新固件 |
 | `sink --tone` | 声卡流正常消费（480000 帧写入）；**用户在「系统设置 → 声音 → 输入」看到电平条随信号跳动**，证明进程→声卡这一段通了 |
 | `probe` | 内置麦克风与 BlackHole 输入端都读到 -120 dBFS（1 LSB 抖动）→ 麦克风权限被拒，探针不可用 |
-| GUI 构建（`scripts/build-gui.sh`） | **通过**：`.app` 28.3 MiB，ad-hoc 签名有效，Info.plist 内含 `NSBluetooth*` / `NSMicrophone*`，bundle id `com.cnryb.ai-passport-mic` |
+| GUI 构建（`scripts/build-gui.sh`） | **通过**：`.app` 37.81 MiB（+7.5 MiB 来自 espflash/serialport），ad-hoc 签名有效，Info.plist 内含 `NSBluetooth*` / `NSMicrophone*`，bundle id `com.cnryb.ai-passport-mic` |
 | GUI 启动（`open` 启动、无 TCC abort） | **通过**：进程存活、webview 已加载、诊断日志有启动记录 |
 | GUI 适配器探测超时保护 | **通过**：授权未点/蓝牙关闭时 6 s 落到 `no_adapter` 并给出可执行提示，不再无限挂起 |
 | GUI 首次蓝牙授权 + 扫描到设备 | **未验证**：需要人在系统弹窗点「允许」。本轮两次启动都停在等待授权（屏幕处于锁屏/休眠，无法确认弹窗是否被点） |
+| 固件镜像解析（`cargo test -p apm-app firmware`） | **通过**：8 项——版本解析、短镜像/错 magic 拒绝、分区表守卫（含 nvs 被挪位必须拒绝）、MD5 向量、**用真实 `merged.bin` 验偏移常量** |
+| 随包固件进 `.app` | **通过**：`Contents/Resources/firmware/ai-passport-mic-merged.bin` 715616 字节；`build-gui.sh` 缺镜像会直接失败 |
+| 串口枚举去重 | **通过（2026-11-06 真机）**：macOS 上同一台设备原本被列成 `/dev/cu.usbmodem11301` 与 `/dev/tty.usbmodem11301` 两条，修完只剩一条 |
+| `apmctl firmware probe` | **通过（真机）**：`esp32c3`，设备 `7552506-dirty` → 镜像 `0.1.0` → `Mismatch`；复位进下载模式读描述符，退出时自动复位回应用模式 |
+| `apmctl firmware flash` | **通过（真机）**：三段写入（bootloader / 分区表 / app）4.9–5.0 s，`FlashMd5` 与本地一致；烧完设备自行复位、BLE 重新广播，旧版本 `7552506-dirty` → `0.1.0` |
+| 烧写（空片首烧 / 中断恢复 / 配对是否保留） | **未验证**：没有裸片，也没有故意拔线；重新烧写后配对仍可自动连接（NVS 未动），但"从空片烧起"这条路没走过 |
 
 ## macOS 上的蓝牙权限（实测坑）
 

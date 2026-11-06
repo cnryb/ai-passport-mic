@@ -51,6 +51,22 @@
 - AUDIO: `...7a05`
 - **Battery Service（标准）**: `0x180F` / Battery Level `0x2A19`（见下）
 
+### 连接参数：8.25 KB/s 是链路契约的一部分
+
+50 块/秒 × 165 字节 = **8.25 KB/s**。这个速率只在快速连接间隔下推得动，所以它跟帧格式
+一样属于跨端契约，不是固件的实现细节：
+
+- 设备广播里带 `0x0d`（从机首选连接间隔）= **15–30 ms**；建连后 600 ms 再主动发一次
+  参数更新，被拒按 1 s 退避重试，最多 6 次；
+- 运行中每次心跳检查实际间隔，**> 40 ms 就重新请求**（5 s 节流），并置 STATUS 的
+  `LINK_SLOW` 位；
+- 实测（macOS 15.3.1）：请求 15–30 ms 会被接受并落在 30 ms；请求 15–20 会被主机拒绝。
+  这段历史见 [`GUI.md`](GUI.md) §14.8 与 [`KNOWN_ISSUES.md`](KNOWN_ISSUES.md) KI-005。
+
+**为什么写进契约**：间隔一旦被主机放到 500 ms 量级，吞吐就掉到 ≈2 块/秒（每 500 ms
+才送得出一块），块率随之坍塌 —— 而设备侧的采集与编码完全正常。这种会话产出的欠载、
+漂移数字全是链路假象，不能当音质结论用。
+
 ### Battery Service（电量）
 
 电量来自设备 I2C 总线上的 CW2017 电量计（0x63，与 ES8311 共总线），走 **蓝牙标准**
@@ -58,7 +74,22 @@ Battery Service，不占用自定义协议帧：
 
 - 特征值 `0x2A19`（READ + NOTIFY）：1 字节 = 电量百分比（0..100），**裸值不套帧头**。
 - 设备每 1 s 采样一次 SOC，只在数值变化时通知；连接后 PC 端主动读一次。
-- **0xFF / ATT 错误 = 电量不可用**（旧固件或电量计缺失），PC 端不得显示成 0%。
+- **CW2017 没有内置电池模型，必须写入 80 字节 profile（BATINFO，`0x10–0x5F`）。**
+  profile 缺失时芯片**不会报错**，只会把 SOC 停在 `0xFFxx`：本板实测 `0xFF00 / 0xFEE8`，
+  而 VCELL 一直是正常的 3.9 V——KI-007 因此被误判成"电池坏了/芯片没醒"。
+  固件开机读 BATINFO 与随固件的官方 UTL 520 mAh profile 逐字节比对，不一致才写：
+  切 `CONFIG=0xF0`（sleep）→ 逐字节写 `0x10–0x5F` → 回读校验 → 置 `0x0B` 的 UPDATE 位（`0x80`）
+  → `0x30 → 0x00` 重启让芯片重新加载并重算。校验不过**不置** UPDATE 位：
+  宁可继续报"不可用"，也不要让芯片带着半份 profile 算出一个看似正常的错误百分比。
+  **换电芯必须重新标定**，写错 profile 不会报错、只会给出错误的百分比。
+  实现见 `device/main/battery.c` 的 `profile_matches` / `profile_install`。
+- **0xFF / ATT 错误 = 电量不可用**（旧固件、电量计缺失，或芯片回报 SOC 无效），
+  PC 端不得显示成 0%，**也不得静默隐藏**：GUI 顶栏显示「电量不可用」，
+  靠 `AppEvent::Battery { pct: None }` 传递（`pct: Some(0..100)` 才是真百分比）。
+  静默隐藏会让人以为这个功能没做——KI-007 现场就是这么误判的。
+- **设备端在电量无效时返回 `0xFF`，不回 ATT 错误。** 规范上两种都算"不可用"，
+  但 macOS 的 btleplug 遇到 ATT 错误时 `read()` 会永久挂起，PC 端若没给这一步设超时，
+  整个连接流程会卡在「连接中」不动（KI-008）。PC 端仍需自带 2 s 超时兜底。
 - 低电量阈值 20%（`device/main/battery.h` 的 `APM_BATTERY_LOW_SOC_PCT`）由设备端判定：
   GUI 状态栏高亮提示；设备端背光（GPIO21，LEDC PWM）做**被动查询式**指示——
   低电量时按任意键背光短闪 3 次，平时恒灭（零功耗）。不做常驻呼吸/闪烁：
@@ -120,7 +151,12 @@ codec 采集、20 ms 分块、抖动缓冲、声卡播放。口径见 [`SOUND_QU
 STATUS 载荷：`state u8, flags u8, dropped u16-LE, sent u32-LE`。
 
 - `state`：`0` IDLE / `1` READY / `2` CAPTURING / `3` ERROR
-- `flags`：bit0 BLE 已连接、bit1 AUDIO 已订阅、bit2 PTT 按住、bit3 音频错误
+- `flags`：bit0 BLE 已连接、bit1 AUDIO 已订阅、bit2 PTT 按住、bit3 音频错误、
+  **bit4 `LINK_SLOW`**（实际连接间隔 > 40 ms，链路撑不住 50 块/秒 —— 这种会话的
+  欠载/漂移数字是链路假象，不能当音质结论用，见 [KI-005](KNOWN_ISSUES.md)）
+- `dropped` / `sent` 是**本会话**计数（设备在每次 START 或 PTT 首次按下时归零），
+  不是自设备启动起的累计值。
+
 
 ### 音频块
 
@@ -166,6 +202,7 @@ PC 端有切换窗口防抖（`apm_app::core` 的 `ptt_switching`）：开/关�
 | 虚拟声卡输出 | 把解码后的 PCM 写进 BlackHole / VB-CABLE，带抖动缓冲 | 已实现 `desktop/crates/sink`（cpal 0.15，40–80 ms 自适应抖动缓冲）；已验证到会议软件端到端可用，回环探针受麦克风权限限制 |
 | GUI 应用 | 设备状态、按键映射、虚拟声卡选择、实时电平与音质报告 | G0 已落地 `desktop/crates/gui`（Tauri 2 + Vue 3：骨架、蓝牙权限、设备扫描）；方案与后续分期见 [`GUI.md`](GUI.md) |
 | `app` 内核 | 状态机、设备发现/连接编排、指标聚合、事件广播、诊断日志 | 部分实现 `desktop/crates/app`（`apm-app`，**不依赖任何 GUI 框架**）：`detect_adapter` / `scan` / `connect` 已在内核；`record` / `sink` 的编排仍在 `crates/cli/src/cmd.rs`，**待迁入**（[`GUI.md`](GUI.md) 决定 D1） |
+| `firmware` | USB 设备枚举、版本比对、分段烧写、回读校验 | 已实现 `desktop/crates/app/src/firmware.rs`（用 `espflash` 4.7 作库，不调外部命令、不需要装 ESP-IDF）；单元测试覆盖镜像解析、分区表守卫、MD5 向量；**真机烧写 2026-11-06 已通**（检测 + 写入 + FlashMd5 校验），空片首烧仍未验。见「固件烧写与版本比对」 |
 
 跨端一致性不靠"两份实现看起来一样"：`device/test/gen_vectors.c` 从 C 实现导出
 `config/protocol-vectors.json`，Rust 的 `tests/c_vectors.rs` 读同一份文件逐字节比对
@@ -175,8 +212,9 @@ PC 端有切换窗口防抖（`apm_app::core` 的 `ptt_switching`）：开/关�
 `device/main/protocol.c` 已按上面的契约实现了帧、CRC 与 ADPCM（编码 + 解码，解码用于主机
 单测和后续 PC 端对照）。PC 端的 Rust 实现必须能通过同一组测试向量，否则两端不算对齐。
 
-> 实现约束：桌面端**不要**引入固件烧录、语音识别、文字注入这类功能——它们不在第一版
-> 范围内（见 `docs/PRODUCT.md` 的非目标）。
+> 实现约束：桌面端**不要**引入语音识别、文字注入这类功能——它们不在第一版范围内
+> （见 `docs/PRODUCT.md` 的非目标）。**固件烧写是例外**：它属于开箱流程，走 USB 而不走
+> BLE，见下面的「固件烧写与版本比对」。
 
 ## 音频输出策略
 
@@ -187,6 +225,139 @@ AI Passport -> PC app -> BlackHole/VB-CABLE -> Zoom/Meet/OBS
 ```
 
 这样第一版可以控制采样率、抖动缓冲和丢块策略，且不依赖系统蓝牙音频栈。
+
+## 固件烧写与版本比对
+
+裸片出货意味着 PC 软件要自己完成首烧（口径见 [`PRODUCT.md`](PRODUCT.md) 的「开箱体验」）。
+这条路和 BLE 完全无关：它走 **USB**，用的是芯片 ROM 里固化的 bootloader，
+设备哪怕一片空白也能烧。
+
+### 为什么是 USB 而不是 BLE OTA
+
+| 方案 | 结论 |
+| --- | --- |
+| USB（esptool 协议） | **采用**。ROM bootloader 在芯片内，空片可用；8 MB 镜像约 10–20 s |
+| BLE 自定义 OTA | 不采用。前提是设备已有能跑起来的固件（裸片没有）；要双分区；分钟级；断连即失败 |
+| 只做升级不做首烧 | 不成立。裸片没有任何固件，OTA 的前提不存在 |
+
+### 硬件前提（不满足则整个体验假设作废）
+
+- 板子的 USB 口必须接 ESP32-C3 的**原生 USB** D-/D+（GPIO18/19），不是外置串口芯片。
+- 固件侧已开 `CONFIG_ESP_CONSOLE_USB_SERIAL_JTAG`（见 `device/sdkconfig`）。
+- 设备枚举为 VID `0x303A` / PID `0x1001`。这是乐鑫 USB-Serial-JTAG 的标识，
+  **不是** CH340（`0x1A86`）或 CP210x（`0x10C4`）。
+- 免驱范围：macOS / Linux 原生 CDC-ACM；Windows 10+ 走系统自带 usbser；Windows 7 不支持。
+- 烧写不需要按 BOOT：esptool 通过 USB 控制线（DTR/RTS 序列）软复位进下载模式。
+  **但这是"通常成立"，不是"物理保证"**——固件把 USB 外设配置乱掉时可能需要手动复位。
+
+### flash 布局与「NVS 不能碰」
+
+| 区域 | 偏移 | 烧写时 |
+| --- | --- | --- |
+| bootloader | `0x0` | 写 |
+| 分区表 | `0x8000` | 写 |
+| **nvs（用户配置）** | `0x9000` | **跳过** |
+| phy_init（RF 校准） | `0xF000` | **跳过** |
+| factory app | `0x10000` | 写 |
+
+**这一条最容易做错。** `idf.py merge-bin` 产出的是从 `0x0` 到 app 末尾的**连续**镜像，
+空隙用 `0xFF` 填满。如果拿它从 `0x0` 整段写下去，`0x9000` 的 NVS 与 `0xF000` 的 phy_init
+会一起被填成 `0xFF`——用户每插一次设备就丢一次按键映射和蓝牙配对；phy_init 被抹掉后
+射频还要重新校准。表现是"插上 USB 就掉配对"，很容易被误判成蓝牙问题。
+
+所以烧写必须**切片**，中间那段一个字都不写：
+
+```text
+[0x0000, 0x8000)  → 写到 0x0000    bootloader + 填充
+[0x8000, 0x9000)  → 写到 0x8000    分区表 + 填充
+[0x9000, 0x10000)                  不写（nvs + phy_init）
+[0x10000, EOF)    → 写到 0x10000   app
+```
+
+切之前先读镜像 `0x8000` 处的分区表（32 字节一条，magic `0x50AA`，在镜像里按小端存成
+`AA 50` 两个字节）核一遍：确实是 `nvs@0x9000` + `factory@0x10000` 才按上面的常量切；
+对不上就拒绝烧写。
+
+### 一次会话写完三段，校验要另开一次
+
+两条实现约束，改了就会坏（2026-11-06 真机撞出来的，记在这里防回退）：
+
+1. **三段必须一次 `write_bins_to_flash` 写完。** 它的收尾是 `finish(reboot = true)`，
+   每调用一次就复位一次设备；分三次调等于写完 bootloader 就让芯片跑起来，
+   第二段的 SPI attach 必然超时。
+2. **写完之后的校验必须重开一次连接。** 第一段会话结束时设备已经在跑应用，
+   旧连接上发 `FlashMd5` 没人应答（真机报 `Timeout while running FlashMd5 command`）。
+   重连会把它拉回下载模式，校验完再复位回应用模式。
+3. **退出时一定要复位。** espflash 的 `Flasher` 没有 `Drop`，进了下载模式没人负责退出；
+   读失败/写失败/提前 return 都要把设备放回应用模式，否则用户看到的是"设备不见了"。
+   实现里用 `ResetGuard` 兜住。
+
+### 串口枚举：一台设备只能出现一次
+
+macOS 上 `serialport::available_ports()` 会把同一个 USB 串口的 callout（`/dev/cu.*`）
+和 dialin（`/dev/tty.*`）各返回一条。不去重的话，界面就会"插了一台设备、列表里两台"，
+而且拿 dialin 那条去连必然失败（它等载波，不是给 esptool 用的）。
+`firmware::list_ports()` 按 VID/PID + 序列号去重并优先保留 `cu`。
+**不要**在分区表变了之后还按旧常量硬切。
+
+**本机实测（2026-11-06，`device/build/ai-passport-mic-merged.bin`）**：镜像总长
+`0xAEB60`，`0x9000`–`0xFFFF` 整段是 `0xFF` 填充（nvs 与 phy_init 的位置）。
+"整段写会清配置"不是理论风险，是每次都会发生。
+
+### 版本比对（不改协议、不要求设备有固件）
+
+- 每个 app 镜像在**镜像内偏移 `0x20`** 处有 `esp_app_desc_t`，magic `0xABCD5432`
+  （小端字节序 `32 54 CD AB`）。
+- `version[32]` 在描述符内偏移 `0x10`，即 **flash 绝对地址 `0x10030`**
+  （`0x10000` app 分区 + `0x20` 描述符 + `0x10` 版本字段）。
+- 读设备这 32 字节，与随包镜像同位置比对，就能判断"要不要烧"。
+  **不需要**新增 BLE 命令，也不需要设备能跑起来。
+- 读设备**必须走 `read_flash`（stub 路径）**，不能用 `read_flash_rom`：
+  后者是 ROM 专用命令，stub 起来之后直接被拒（真机报 `The bootloader returned an error`）。
+- 读不到、全 `0xFF`、magic 不对 → 按"空片或未知"处理，转烧写。
+
+前提是 `version` 必须可比较。ESP-IDF 默认用 `git describe` 填这个字段，当前产物是
+`7552506-dirty`——带 git hash 和 `-dirty`（说明构建时工作区有未提交改动），既不能对外
+显示，也没法做版本序比较。**必须固定成 semver**（`device/CMakeLists.txt` 的
+`PROJECT_VER`）。
+
+**本机实测（2026-11-06，固定 `PROJECT_VER=0.1.0` 后重建）**：
+
+| 检查项 | 结果 |
+| --- | --- |
+| `merged[0x10020..0x10024]` | `32 54 CD AB`（magic 正确） |
+| `merged[0x10030..0x10050]` | `0.1.0` |
+| `merged[0x10000..]` 与单独构建的 `ai-passport-mic.bin` | 逐字节相同（650080 字节） |
+
+也就是说**版本字段和 app 段都能纯离线从镜像里读出来**，不需要连设备。
+
+### 烧写后的校验
+
+写完必须**校验 app 分区的实际内容**，不能信任写操作的应答：供电不稳、劣质线材、
+无源 HUB 分线都可能静默丢字节，而 esptool 的应答早就返回了。
+
+实现用 esptool 的 `FlashMd5`：让设备自己算 app 分区的 MD5，与本地对同一段数据算的
+MD5 比对。不用"整段回读再算"是因为回读 650 KB 要十几秒，而 `FlashMd5` 只要一条命令——
+要验的不是"能不能读"，是"写进去的对不对"。
+
+校验不通过就报"未完成"，不允许报"已完成"让用户接着去连蓝牙。
+
+**真机验证（2026-11-06，ESP32-C3 实板）**：`apmctl firmware probe` 读出设备
+`0.1.0`、`apmctl firmware flash` 三段写入 5.0 s、FlashMd5 一致，写完后设备自行
+复位回应用模式并恢复 BLE 广播。
+
+### 失败与恢复
+
+- 烧写中途断线/断电：设备回到 ROM 下载模式，重插可继续。**不做一次性状态**，
+  也不要把"失败"写成终态。
+- 校验失败：明确提示重试，并保留设备仍在下载模式这一事实（用户不用拔插）。
+- **不提供 chip erase 入口**：整片擦除会连 NVS 与 RF 校准一起清掉，那是维修动作，
+  不是开箱动作。要清用户配置必须是独立的、用户显式点的"恢复出厂设置"。
+
+### 与 GUI 的关系
+
+烧写逻辑放 `apm-app::firmware`（无 UI，CLI 也能用），GUI 只负责显示状态、进度、结果。
+按 [`GUI.md`](GUI.md) 的决定 D1，不允许在 `crates/gui` 里再写一套。
 
 ## 分发与安装成本
 

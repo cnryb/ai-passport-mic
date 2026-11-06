@@ -148,10 +148,23 @@ Tab（右上角切换，不引 vue-router，条件渲染即可）：
 
 | Tab | 内容 | 依赖阶段 |
 | --- | --- | --- |
-| 实时（默认） | 上面这一屏 | G2 |
-| 诊断 | 事件日志列表（时间 / 级别 / 来源）、复制诊断包、`selftest` 结果 | G1 |
+| 实时（已连过设备时默认） | 上面这一屏 | G2 |
+| 设备烧写（首次启动默认） | 随包固件版本与 app 分区 MD5、USB 设备列表、读版本 / 一键烧写与进度、结果与重试指引 | M6 |
 | 音质报告 | 对会话 WAV 跑 `analyze`，表格 + JSON 导出，明确区分"软件通过 / 真机听感待定" | G4 |
-| 按键映射 | 12 个事件的键位编辑、导入导出、恢复默认 | G5（M3） |
+| 按键映射 | 3 个事件的键位编辑（一个键一个动作）、导入导出、恢复默认 | G5（M3） |
+| 诊断 | 事件日志列表（时间 / 级别 / 来源）、复制诊断包、`selftest` 结果 | G1 |
+
+「设备烧写」页的四条硬约束（口径见 [`PRODUCT.md`](PRODUCT.md) 的「开箱体验」）：
+
+- **只有用户点「检测」或「写入固件」才碰设备。** `probe` 会让设备复位进下载模式，
+  后台轮询等于把正在推流的设备偷偷断掉。
+- **不擦 NVS。** 只写 bootloader / 分区表 / app 三段；重新烧写不清配对与映射。
+- **校验失败不显示"完成"。** 后端返回 `Err` 时前端只能显示错误与重试指引。
+- **复位打断的 BLE 要自己接回来。** 检测/烧写必然复位设备，BLE 一定断——这是 esptool 的
+  机制，不是缺陷。但"点一次检测就得手动重连一次"不能算可接受的操作成本：
+  `firmware_probe` / `firmware_flash` 先记下当前连的是哪台，做完调
+  `AppCore::reconnect_after_reset`（等旧链路拆干净 → 带退避重连 5 次，中间失败不置
+  `Error` 状态，避免界面上闪红色横幅）。重连失败不影响检测结果本身。
 
 前端工程约束：
 
@@ -182,6 +195,9 @@ Tab（右上角切换，不引 vue-router，条件渲染即可）：
 | `analyze_session` | `session_id` | `QualityReport` | 未测字段写 null，不猜 |
 | `copy_diagnostics` | — | `String` | 生成一段可粘贴的纯文本（版本/设备/指标/最近 50 条事件） |
 | `reveal_log` | — | `()` | 打开日志目录 |
+| `firmware_status` | — | `FirmwareStatus` | 随包镜像（版本/大小/MD5）+ 候选串口。**不碰设备**，随便调 |
+| `firmware_probe` | `{ port }` | `ProbeResult` | **会让设备复位**。返回当前版本与 `up_to_date` / `blank` / `mismatch` / `unknown` |
+| `firmware_flash` | `{ port }` | `FlashReport` | 三段写 + `FlashMd5` 校验；进度走 `firmware-progress`；校验不通过返回 `Err` |
 
 事件（`emit`）：
 
@@ -191,9 +207,15 @@ Tab（右上角切换，不引 vue-router，条件渲染即可）：
 | `telemetry` | 5 Hz | `{ rms_dbfs, peak_dbfs, buffer_ms, blocks, lost_blocks, seq_jumps, device_dropped, underruns, silent_frames, lock_misses, bytes_written, elapsed_ms }` |
 | `event-log` | 边沿 | `{ ts_ms, level, source, message }` |
 | `session-done` | 边沿 | `SessionSummary` |
-| `battery` | 边沿 | `{ pct }`（0..100）。连接后读一次 + 设备数值变化时推送；电量计不可用时不发，`pct` 永不出 0FF/非法值 |
+| `battery` | 边沿 | `{ pct }`：`0..100` 或 `null`。连接后读一次 + 设备数值变化时推送；`null` = 设备明确报不可用（无 Battery Service / 读超时 / SOC 无效），界面显示「电量不可用」，不显示 0%、也不隐藏 |
+| `firmware-progress` | 写入期间连续 | `0..100`。按字节数折算，三段不是各占 33% |
 
 约定：`telemetry` 的 `ts_ms` 用**单调时钟**（`Instant`），不要用 `SystemTime` 或前端 `Date.now()` 做释放计时——前端计时器在后台会被节流。
+
+约定：**连接后的一次性结论不能只走事件。** 自动连接（`auto_connect`）会在前端注册监听之前
+就完成连接并读电量，Tauri 不重放事件，届时顶栏会永远空白（KI-009）。所以电量同时进
+`AppSnapshot.battery_pct` / `battery_known`，前端 `onMounted` 先按快照回填，
+事件的职责只是"之后的变化"。新增同类字段时照此办理。
 
 ## 7. 指标口径（必须写死，不然界面上两个数字会对不上）
 
@@ -259,6 +281,7 @@ GUI 必须放在同一个 workspace 里，否则 `link` / `sink` 的依赖会走
 | **G4 音质报告** | analyze 视图 + JSON 导出 | 报告字段与 `apmctl analyze --json` 逐字段一致；未测字段为 null | 代码完成：报告构造只有一份（`apm_app::report`），GUI 的 JSON 由后端同一函数生成；采样率提醒（`rate_note`）与下混标记已与 `apmctl` 对齐（2026-11-05） |
 | **G5 按键映射** | **3 个事件**（一个键一个动作）的编辑、导入导出、恢复默认 | 改成非默认键位 → 设备按键触发正确；OK 的 PTT 停止路径在任何配置下都可用 | 编辑/校验/落盘完成，`ok.release` 强制回填 `ptt-stop`；**"按键触发正确"依赖 M3 注入层，未实现**。事件表已于 2026-11-05 两次归并：15 → 6（§14.11）→ 3（§14.12） |
 | **G6 打包** | 签名、公证、版本号、崩溃日志脱敏 | 干净机器上从 dmg 装 → 首次启动授权 → 完成 G1~G3 验收 | **未做**：需要 Apple 开发者证书；当前只有 ad-hoc 签名 |
+| **M6 设备烧写页**（不在 G 系列，归 ROADMAP 的 M6） | 随包镜像信息、USB 设备枚举、读版本、分段写入、进度与结果 | 空片插上 → 一键写完 → 校验通过 → 能连上 BLE；重新烧写后配对与映射保留 | **真机已通（2026-11-06，`apmctl firmware probe/flash` 同一条内核路径）**：设备 `7552506-dirty` → `0.1.0`，三段写入 4.9 s、`FlashMd5` 一致、烧完自行复位回应用模式并恢复广播；烧写后配对仍在（NVS 未动）。**空片首烧未验**。约束见 §5 的「设备烧写」三条 |
 
 依赖关系：G0 → G1 → G2 → G3 串行；G3b、G4、G5 可并行；G6 等 G5。
 **G2 之前必须先完成 §12 第 1 条的编排迁移** —— `apm-app` 目前只接管了 `detect_adapter` /
@@ -424,9 +447,9 @@ GUI 必须放在同一个 workspace 里，否则 `link` / `sink` 的依赖会走
 不能拿早先一次 debug 包的授权成功来顶。`apmctl-macos.sh` 那套 `APMCTL.app` 是另一套
 bundle，因此 CLI 的授权与 GUI 的授权互不相干，两处都可能各弹一次。
 
-### 14.5 `--smoke-scan` 在这台机器上不生效（2026-11-05，未修）
+### 14.5 `--smoke-scan` 不生效 → 改成哨兵文件（2026-11-06 已修，入口打通）
 
-§14 第 4 条给的无人值守验收开关，本轮**用不了**：
+§14 第 4 条给的无人值守验收开关，2026-11-05 那轮**用不了**：
 
 | 尝试 | 结果 |
 | --- | --- |
@@ -436,9 +459,28 @@ bundle，因此 CLI 的授权与 GUI 的授权互不相干，两处都可能各�
 | `launchctl setenv APM_GUI_SMOKE scan` | 被系统拒绝：`Not privileged to set domain environment` |
 | 直接跑 `Contents/MacOS/apm-gui --smoke-scan` | **exit 134（SIGABRT）**——TCC 以缺蓝牙用途声明 abort，印证 §8 第 2 条"必须 LaunchServices 启动" |
 
-结论：**G0 的"扫到设备"这条目前只能人工点「扫描」验**，`run_smoke` 那条自动路径等于断了。
-要恢复它，参数得从别的地方进来（文件哨兵、`NSUserDefaults`、或者写进 `settings.json` 的
-一次性开关），不能再依赖 `open --args`。**G0 至今没有自动化证据，只有 §14 记的那次人工冒烟。**
+**修法（2026-11-06）**：参数改从**哨兵文件**进来，`open` 只负责用 LaunchServices 启动。
+
+```bash
+# 数据目录：~/Library/Application Support/com.cnryb.ai-passport-mic/
+printf firmware > ~/Library/Application\ Support/com.cnryb.ai-passport-mic/smoke
+open "/path/to/AI Passport Mic.app"
+```
+
+`smoke_mode()` 依次看：命令行 `--smoke-<mode>` → 环境变量 `APM_GUI_SMOKE` → 哨兵文件；
+**读到就删**（一次性，不会下次启动又跑）。当前支持两个模式：
+
+| mode | 干什么 | 退出码 |
+| --- | --- | --- |
+| `scan` | 检测适配器 → 扫描 6 s，统计带本项目服务的设备数 | 0 = 至少一台 |
+| `firmware` | 连接 → USB 检测（必然复位设备）→ 自动重连，验"检测不会把 BLE 永久打断" | 0 = 重连回 ready |
+
+**实测（2026-11-06）**：哨兵文件路径生效，日志出现 `FW_SMOKE ...` 并按退出码退出；
+`--args` 那条仍然无效，别再试。
+
+> ⚠️ 每次 `build-gui.sh` 重新 ad-hoc 签名都会让 TCC 的蓝牙授权失效，App 首次访问
+> CoreBluetooth 要**重新点一次「允许」**。冒烟前若日志里是
+> `适配器探测超时 / no_adapter`，先人工点授权，再跑冒烟。
 
 ### 14.6 GUI 与 CLI 不能同时占设备（不是 bug，但要写进流程）
 
@@ -529,6 +571,11 @@ btleplug 的 `CentralEvent::DeviceDisconnected`。
 为什么值得加：这是"设备停在半死态"的唯一低成本兜底。加之前，GUI 只要在 `ready` 上多停一会儿
 就必然半死（§14.8 实测块率 28/s、设备侧丢弃 3992）；加之后每次开流都先把设备打回 idle 再启动。
 代价是点"开始"到出声多 120 ms。
+
+**2026-11-05 深夜补充**：这一条现在只是**兜底**，不再是主解。KI-005 的根因已定位到
+"连接间隔跑偏 + 断链不清 START"，固件侧已修（首选参数广播、参数更新重试、断链回调、
+`LINK_SLOW` 标志）。`STOP` 预置保留——它对旧固件仍然有效，对修好的固件是一次幂等的
+120 ms 开销。详见 [`KNOWN_ISSUES.md`](KNOWN_ISSUES.md) KI-005 的「修复」小节。
 
 **顺带发现（文档与实现不一致，已记录未修）**：`AGENTS.md` 写的"编排只有一份——
 `connect` / `start_stream` / `stop_stream` 全在 `apm-app`，`cli` 只解析参数与打印"
