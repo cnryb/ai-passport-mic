@@ -640,11 +640,56 @@ pub async fn sink(
     // 先停写再断链：STOP 有一次 BLE 往返，期间声卡还在消费缓冲，
     // 拖到最后才 clear 会白掉一段静音（实测尾巴上多出 3 次欠载）。
     let written = pipeline.written_rms();
+    let (arrival_hist, arrival_max_ms, late_arrivals) = {
+        let (h, m, l) = pipeline.arrival_stats();
+        (*h, m, l)
+    };
     let summary = pipeline.finish();
     link.stop_capture().await.ok();
     link.disconnect().await.ok();
 
     print_summary(&summary);
+
+    // 块到达间隔：KI-006 的判据就在这里。平均 50 块/秒不够，要看**间隔的抖动**。
+    if arrival_hist.iter().sum::<u64>() > 0 {
+        let edges = apm_app::pipeline::ARRIVAL_BUCKETS_MS;
+        let mut line = String::new();
+        for (i, &count) in arrival_hist.iter().enumerate() {
+            if count == 0 {
+                continue;
+            }
+            let lo = if i == 0 { 0.0 } else { edges[i - 1] };
+            let hi = edges[i];
+            if hi.is_infinite() {
+                line.push_str(&format!(">{lo:.0}ms:{count}  "));
+            } else {
+                line.push_str(&format!("{lo:.0}-{hi:.0}ms:{count}  "));
+            }
+        }
+        println!("块到达间隔: 最大 {arrival_max_ms:.1} ms，超过 80 ms 缓冲上限 {late_arrivals} 次");
+        println!("到达间隔分布: {line}");
+        // 注意：迟到次数 ≠ 欠载次数。存量接近目标时，80–100 ms 的间隔大多被存量吸收，
+        // 只有尖峰（>100 ms）几乎必然欠载。2026-11-07 两轮实测：迟到 100/113 次，
+        // 欠载只有 14/15 次，而 >100 ms 的尖峰恰是 5/6 次。
+        if late_arrivals > 0 && summary.underruns > 0 {
+            println!(
+                "判定: 有 {late_arrivals} 次到达间隔 > 80 ms（尖峰最大 {arrival_max_ms:.0} ms），\
+                 欠载 {} 次 —— 欠载由**链路到达抖动突破缓冲上限**造成（KI-006 根因）",
+                summary.underruns
+            );
+            println!(
+                "      迟到次数远多于欠载次数是正常的：存量接近目标时 80–100 ms 的间隔能被吸收，\
+                 只有更长的尖峰才必然欠载"
+            );
+        } else if late_arrivals == 0 && summary.underruns > 0 {
+            println!(
+                "判定: 到达间隔始终 ≤ 80 ms，但仍有 {} 次欠载 —— 抖动不是主因，\
+                 需继续查 Pipeline → Playout 这一段（channel / 锁）",
+                summary.underruns
+            );
+        }
+    }
+
     if let Some(p) = probe {
         let looped = p.rms_dbfs();
         println!();
@@ -687,15 +732,16 @@ fn print_summary(summary: &SessionSummary) {
         summary.blocks, summary.lost_blocks, summary.seq_jumps, summary.bad_len_blocks, summary.device_dropped
     );
     println!(
-        "声卡: 已播 {:.2} s，欠载 {} 次（静音 {} 帧 ≈ {:.0} ms），超容量丢弃 {} 帧",
+        "声卡: 已播 {:.2} s，欠载 {} 次（静音 {} 帧 ≈ {:.0} ms），超容量丢弃 {} 帧，停摆修剪 {} 帧",
         summary.duration_s,
         summary.underruns,
         summary.silent_frames,
         summary.silent_frames as f64 * 1000.0 / AUDIO_SAMPLE_RATE as f64,
-        summary.frames_dropped
+        summary.frames_dropped,
+        summary.frames_trimmed
     );
     println!(
-        "漂移: 补偿 {:.0} ppm（补样本 {} / 丢样本 {}）；这四个数加起来应当约等于设备与声卡的时钟差",
+        "漂移: {:.0} ppm（墙钟法，与消费端无关；补偿补 {} / 丢 {} 样本）",
         summary.ppm, summary.frames_inserted, summary.frames_skipped
     );
     if summary.glitch_events > 0 {
@@ -715,8 +761,8 @@ fn print_summary(summary: &SessionSummary) {
             println!("提示: 有欠载说明缓冲不够或链路抖动；把 --target-ms 往上调（上限 80）再看。");
         } else {
             println!(
-                "提示: 目标缓冲已是上限 80 ms，欠载只能从链路抖动或声卡回调被抢占上找原因，\
-                 调参数没有余量了。"
+                "提示: 目标缓冲已是上限 80 ms，调参数没有余量了。\
+                 欠载的来源只能是链路抖动或声卡回调被系统停摆（KI-006）。"
             );
         }
     }
@@ -748,7 +794,24 @@ fn sink_tone(out: &mut apm_sink::Sink, seconds: u64, verify: bool) -> Result<()>
     println!("推 440 Hz 正弦（-20 dBFS）{} 秒...", seconds);
     let mut phase = 0.0f64;
     let mut pushed = 0u64;
-    for i in 0..(seconds * 50) {
+
+    // 按**绝对时刻**配速，不要用"每 5 块 sleep 100 ms"。
+    //
+    // 后者看着像实时（50 块/秒 = 320×50 = 16000 样本/秒），实际不是：一秒里睡满
+    // 1000 ms 之后还要**再加**生成 50 块的计算时间，于是每秒都落后一点、越落越多。
+    // 实测 180 s 的 `--tone`：推入 180.000 s、声卡取走 192.160 s、欠载 605 次
+    // （补静音 12.100 s，正好等于落后量）。
+    //
+    // 这个函数的存在理由就是"把声卡从 BLE 链路里剥离出来单独验"，它要是自己喂不上，
+    // 就会报出几百次假欠载，把排查方向指向声卡。必须按实时速率精确配速。
+    let started = std::time::Instant::now();
+    let blocks = seconds * 50;
+    // 记录配速本身的抖动：如果"相邻两次推入"的间隔偶尔超过缓冲目标，
+    // 欠载就是喂入端造成的，而不是声卡。tone 模式存在的意义就是分清这两件事。
+    let mut max_gap = Duration::ZERO;
+    let mut late_pushes = 0u64;
+    let mut last_push = Duration::ZERO;
+    for i in 0..blocks {
         let mut pcm = Vec::with_capacity(block);
         for _ in 0..block {
             pcm.push((amp * phase.sin()) as i16);
@@ -756,18 +819,130 @@ fn sink_tone(out: &mut apm_sink::Sink, seconds: u64, verify: bool) -> Result<()>
         }
         out.push(&pcm);
         pushed += block as u64;
-        if i % 5 == 4 {
-            std::thread::sleep(Duration::from_millis(100));
+
+        // 第 i 块应当在 (i+1) × 20 ms 之前喂进去；落后就立刻补，不落后才睡。
+        let deadline = Duration::from_micros((i + 1) * 20_000);
+        let elapsed = started.elapsed();
+        if deadline > elapsed {
+            std::thread::sleep(deadline - elapsed);
         }
+        let now = started.elapsed();
+        let gap = now.saturating_sub(last_push);
+        if gap > max_gap {
+            max_gap = gap;
+        }
+        // 超过 40 ms（两个块周期）就算这次喂入迟到了
+        if gap > Duration::from_millis(40) {
+            late_pushes += 1;
+        }
+        last_push = now;
     }
+    // 先量喂入耗时，**再**做末尾的收尾等待：后者不属于喂入配速，
+    // 把它算进 wall 会让实时率看起来永远是 0.998×（300 ms / 180 s），
+    // 从而把"配速没问题"误读成"发生器在拖后腿"。
+    let wall = started.elapsed().as_secs_f64();
+
+    // 关键：欠载统计要在**收尾等待之前**取。
+    //
+    // 喂入一停，缓冲里剩下的 80 ms 会被声卡按正常节奏抽干，抽干之后必然欠载——
+    // 那是"我们不再喂了"，不是"声卡停摆"。2026-11-07 的 `--tone` 就栽在这上面：
+    // 120 s 的跑法报 8 次欠载，欠载时刻是 120032/120064/…/120256 ms，
+    // 间隔 32 ms、共 256 ms，正好等于这句 `sleep(300ms)` 的长度。
+    let st = out.stats();
     std::thread::sleep(Duration::from_millis(300));
     out.clear();
 
-    let st = out.stats();
+    let st_drained = out.stats();
     println!(
-        "写入 {} 帧，声卡取走 {} 帧，欠载 {} 次",
-        pushed, st.frames_consumed, st.underruns
+        "写入 {} 帧（{:.2} s），声卡取走 {} 帧，运行期欠载 {} 次",
+        pushed,
+        pushed as f64 / rate,
+        st.frames_consumed,
+        st.underruns
     );
+    if st_drained.underruns > st.underruns {
+        println!(
+            "收尾阶段另有 {} 次欠载（喂入一停缓冲必然被抽干，属正常收尾，不计入运行期）",
+            st_drained.underruns - st.underruns
+        );
+    }
+    // 喂入速率与实时是否吻合，直接决定欠载数字有没有意义。不报这个数，
+    // 用户会把"发生器没喂够"当成"声卡不行"——2026-11-07 就踩过。
+    let expected = pushed as f64 / rate;
+    if wall > 0.0 {
+        println!(
+            "喂入速率: {:.2} s 的内容用了 {:.2} s 推完（实时率 {:.3}×；1.000× 才说明是实时喂入）",
+            expected,
+            wall,
+            expected / wall
+        );
+        if expected / wall < 0.98 {
+            println!(
+                "警告: 喂入慢于实时 {:.1}%，本次的欠载**不能**当作声卡的结论",
+                (1.0 - expected / wall) * 100.0
+            );
+        }
+    }
+    println!(
+        "喂入间隔: 最大 {:.1} ms，超过 40 ms 的迟到 {late_pushes} 次（目标缓冲 {} ms）",
+        max_gap.as_secs_f64() * 1000.0,
+        out.target_ms()
+    );
+
+    // 声卡回调的间隔分布 —— KI-006 的下一步要的原始数据。
+    // 没有这个直方图，"抬缓冲上限"只能靠猜。
+    if st.callbacks > 0 {
+        println!(
+            "声卡回调: {} 次，最大间隔 {:.1} ms，明显迟到（>1.5× 周期）{} 次",
+            st.callbacks, st.max_callback_gap_ms, st.stalled_callbacks
+        );
+        let edges = apm_sink::GAP_BUCKETS_MS;
+        let mut line = String::new();
+        for (i, &count) in st.gap_histogram.iter().enumerate() {
+            if count == 0 {
+                continue;
+            }
+            let lo = if i == 0 { 0.0 } else { edges[i - 1] };
+            let hi = edges[i];
+            if hi.is_infinite() {
+                line.push_str(&format!(">{lo:.0}ms:{count}  "));
+            } else {
+                line.push_str(&format!("{lo:.0}-{hi:.0}ms:{count}  "));
+            }
+        }
+        println!("回调间隔分布: {line}");
+    }
+    if st.underruns_logged > 0 {
+        let mut times = String::new();
+        for i in 0..st.underruns_logged {
+            times.push_str(&format!("{:.0} ", st.underrun_at_ms[i]));
+        }
+        println!("欠载时刻(ms，相对首次回调): {times}");
+    }
+    if max_gap > Duration::from_millis(out.target_ms() as u64) {
+        println!(
+            "结论: 有 {late_pushes} 次喂入间隔超过缓冲目标 —— 欠载由**喂入端**造成，不是声卡"
+        );
+    } else if st.underruns > 0 {
+        // 关键判据：欠载都发生在喂入结束之后，就是 `clear()` 收尾造成的，
+        // 不是运行期的真欠载。2026-11-07 的 `--tone` 全靠这一条才没被误读。
+        let tail = st.underrun_at_ms[0] >= expected * 1000.0 - 200.0;
+        if tail {
+            println!(
+                "结论: {} 次欠载全部发生在**喂入结束后的收尾阶段**（{:.0} ms 之后），\
+                 属于 clear() 造成的测量伪影，不记为运行期欠载",
+                st.underruns,
+                st.underrun_at_ms[0]
+            );
+        } else {
+            println!(
+                "结论: 喂入间隔始终小于缓冲目标，但仍有 {} 次欠载 —— 欠载由**声卡回调停摆**造成",
+                st.underruns
+            );
+        }
+    } else {
+        println!("结论: 0 欠载，声卡这一段是干净的");
+    }
     if let Some(p) = probe {
         println!(
             "回环: 输入端 {:.2} s，RMS {}，峰值 {}",
