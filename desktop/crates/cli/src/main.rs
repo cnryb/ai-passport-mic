@@ -113,6 +113,31 @@ enum Command {
         #[arg(long)]
         vectors: Option<PathBuf>,
     },
+    /// 固件烧写（走 USB，不走 BLE）：列串口 / 读版本 / 写入并校验
+    #[command(subcommand)]
+    Firmware(FirmwareCmd),
+}
+
+#[derive(Subcommand)]
+enum FirmwareCmd {
+    /// 列出疑似目标的串口。只读，不复位设备。
+    Ports,
+    /// 读设备当前固件版本。**会让设备复位**（正在推流会断）。
+    Probe {
+        /// 串口路径；只填一个候选时可以省略
+        #[arg(long)]
+        port: Option<String>,
+        /// 合并镜像；默认用 device/build/ai-passport-mic-merged.bin
+        #[arg(long)]
+        image: Option<PathBuf>,
+    },
+    /// 写入并回读校验。**会让设备复位**。不擦 NVS。
+    Flash {
+        #[arg(long)]
+        port: Option<String>,
+        #[arg(long)]
+        image: Option<PathBuf>,
+    },
 }
 
 fn main() -> anyhow::Result<()> {
@@ -126,6 +151,15 @@ fn main() -> anyhow::Result<()> {
         Command::Analyze { file, json } => cmd::analyze(&file, json),
         Command::Selftest { vectors } => cmd::selftest(vectors.as_deref()),
         Command::Probe { device, seconds } => cmd::probe(&device, seconds),
+        Command::Firmware(fw) => match fw {
+            FirmwareCmd::Ports => cmd::firmware_ports(),
+            FirmwareCmd::Probe { port, image } => {
+                cmd::firmware_probe(port.as_deref(), image.as_deref())
+            }
+            FirmwareCmd::Flash { port, image } => {
+                cmd::firmware_flash(port.as_deref(), image.as_deref())
+            }
+        },
         other => {
             let runtime = tokio::runtime::Builder::new_multi_thread()
                 .enable_all()

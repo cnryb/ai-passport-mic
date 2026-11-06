@@ -104,6 +104,14 @@ pub enum ErrorCode {
     ProtocolMismatch,
     /// 按键映射里出现了不支持的键名/修饰键/事件名，或 PTT 停止通道缺失。
     KeymapInvalid,
+    /// 没找到可烧写的设备：串口不在、VID/PID 不符，或芯片不是 ESP32-C3。
+    FlashNoDevice,
+    /// 随包固件镜像缺失或解析失败（安装包不完整）。
+    FirmwareImageInvalid,
+    /// 烧写过程失败，可重试。
+    FlashFailed,
+    /// 回读校验不一致。
+    FlashVerifyFailed,
     Busy,
     Internal,
 }
@@ -121,6 +129,10 @@ impl ErrorCode {
             Self::SinkRateUnsupported => "该声卡不支持 16 kHz，请换一个原生支持 16 kHz 的输出",
             Self::ProtocolMismatch => "固件与桌面端版本不一致，重新烧录同一版本",
             Self::KeymapInvalid => "键名或修饰键不在支持列表内；PTT 的停止通道不能删（见 config/README.md）",
+            Self::FlashNoDevice => "用数据线直连电脑（不要经无源 HUB），确认设备已上电，再换个 USB 口试一次",
+            Self::FirmwareImageInvalid => "安装包里的固件损坏或缺失，重新安装本软件",
+            Self::FlashFailed => "重插设备后重试；反复失败可以按住 BOOT 键再插线（强制进下载模式）",
+            Self::FlashVerifyFailed => "写入的内容和镜像对不上，设备大概率还在下载模式，直接重试一次",
             Self::Busy => "当前状态下不能这么做，先停止正在进行的操作",
             Self::Internal => "查看诊断日志；这属于未预期错误",
         }
@@ -169,6 +181,13 @@ impl std::error::Error for AppError {}
 /// 改动会同时改这里；比给链路层加错误枚举的改动面小得多。匹配不到就归 `Internal`，
 /// 不要猜成"设备没找到"——那会让用户去查一个不存在的硬件问题。
 pub fn classify(err: &anyhow::Error) -> AppError {
+    // 有些层（比如 `firmware`）直接构造 `AppError` 再 `into()` 成 anyhow 往上抛，
+    // 那里已经知道精确的错误码。原样取回，不要再按文本猜一遍——猜不中会降级成
+    // `Internal`，用户看到的就是"未预期错误"而不是"重插设备再试"。
+    if let Some(app) = err.downcast_ref::<AppError>() {
+        return app.clone();
+    }
+
     let text = format!("{err:#}");
     let lower = text.to_lowercase();
 
@@ -267,6 +286,10 @@ mod tests {
             ErrorCode::SinkRateUnsupported,
             ErrorCode::ProtocolMismatch,
             ErrorCode::KeymapInvalid,
+            ErrorCode::FlashNoDevice,
+            ErrorCode::FirmwareImageInvalid,
+            ErrorCode::FlashFailed,
+            ErrorCode::FlashVerifyFailed,
             ErrorCode::Busy,
             ErrorCode::Internal,
         ] {

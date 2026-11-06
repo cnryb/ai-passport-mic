@@ -5,6 +5,7 @@
 
 pub mod core;
 pub mod events;
+pub mod firmware;
 pub mod inject;
 pub mod keymap_store;
 pub mod log;
@@ -16,6 +17,7 @@ pub mod state;
 
 pub use core::{AppCore, AppSnapshot, SessionRecord, SinkView};
 pub use events::{AppEvent, LogEntry, LogLevel};
+pub use firmware::{FirmwareImage, FlashReport, ImageInfo, PortView, ProbeResult};
 pub use pipeline::Pipeline;
 pub use report::{QualityReport, ReportCheck};
 pub use session::{SessionOptions, SessionSummary, Telemetry};

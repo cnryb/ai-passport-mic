@@ -36,6 +36,90 @@ async fn run_smoke(core: Arc<AppCore>) {
     std::process::exit(code);
 }
 
+/// 无人值守冒烟：连接 → USB 检测（必然复位设备）→ 自动重连。
+///
+/// 验的是"点一次检测不会把 BLE 永久打断"这条回归：`firmware_probe` 命令里
+/// 就是 `probe` 成功后接 `reconnect_after_reset`，这里走同一串调用，
+/// 只是把结果写进诊断日志而不是画到界面上。
+/// 只读版本，不写 flash——冒烟不该改设备状态。
+async fn run_firmware_smoke(core: Arc<AppCore>) {
+    let fail = |reason: &str| -> ! {
+        core.record(LogLevel::Error, "smoke", format!("FW_SMOKE fail={reason}"));
+        std::process::exit(1);
+    };
+
+    if core.detect_adapter().await.is_err() {
+        fail("adapter=unavailable");
+    }
+
+    // 先把设备连上（用户平时就是这么连的）：优先自动连接，没记录就扫一遍。
+    let _ = core.auto_connect().await;
+    if core.snapshot().state.device().is_none() {
+        let _ = core.start_scan(6_000).await;
+        if let Some(id) = core
+            .devices()
+            .iter()
+            .find(|d| d.has_service)
+            .map(|d| d.id.clone())
+        {
+            let _ = core.connect(id).await;
+        }
+    }
+    let Some(device_id) = core.snapshot().state.device().map(|d| d.id.clone()) else {
+        fail("no_device_connected");
+    };
+
+    let Some(port) = apm_app::firmware::list_ports().into_iter().next() else {
+        fail("no_usb_port");
+    };
+
+    let image_path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("../../../device/build/ai-passport-mic-merged.bin");
+    let Ok(image) = apm_app::firmware::load_image(&image_path) else {
+        fail("no_image");
+    };
+
+    core.record(LogLevel::Info, "smoke", format!("FW_SMOKE probe port={}", port.path));
+    let probe = apm_app::firmware::probe(&port.path, &image);
+    let probe_note = match &probe {
+        Ok(r) => format!("{:?}/{}", r.state, r.chip),
+        Err(e) => format!("err={e}"),
+    };
+
+    let reconnected = core.reconnect_after_reset(&device_id).await.is_ok()
+        && core.snapshot().state.device().map(|d| d.id.clone()).as_deref()
+            == Some(device_id.as_str());
+
+    core.record(
+        LogLevel::Info,
+        "smoke",
+        format!("FW_SMOKE probe={probe_note} reconnect={reconnected}"),
+    );
+    std::process::exit(if reconnected { 0 } else { 1 });
+}
+
+/// 无人值守验收开关：`--smoke-scan` / `--smoke-firmware`，或
+/// `<数据目录>/smoke` 文件里写 `scan` / `firmware`。
+///
+/// **为什么还要文件这一条**：`open ... --args --smoke-scan` 在本机试过三种写法，
+/// 进程 argv 里都没有参数（见 `docs/GUI.md` §14.5）；直接跑 `Contents/MacOS/apm-gui`
+/// 又会被 TCC 以"缺蓝牙用途声明"abort。哨兵文件是这台机器上唯一验证可行的入口。
+/// 读到就删：一次性，不会下次启动又跑一遍。
+fn smoke_mode() -> Option<String> {
+    if let Some(mode) = std::env::args().find_map(|a| a.strip_prefix("--smoke-").map(str::to_string))
+    {
+        return Some(mode);
+    }
+    if let Ok(mode) = std::env::var("APM_GUI_SMOKE") {
+        return Some(mode);
+    }
+
+    let path = apm_app::settings::data_dir().join("smoke");
+    let mode = std::fs::read_to_string(&path).ok()?.trim().to_string();
+    let _ = std::fs::remove_file(&path);
+    (!mode.is_empty()).then_some(mode)
+}
+
 fn main() {
     let core = AppCore::new(None);
 
@@ -67,6 +151,9 @@ fn main() {
             commands::keymap_text,
             commands::inject_permission,
             commands::open_accessibility_settings,
+            commands::firmware_status,
+            commands::firmware_probe,
+            commands::firmware_flash,
             commands::diagnostics_text,
             commands::log_path,
             commands::reveal_log,
@@ -106,11 +193,16 @@ fn main() {
             // （`open -a ... --args`）启动才会以 App 自己的身份申请蓝牙权限；
             // 而 `open` 不方便传环境变量。
             let boot_core = Arc::clone(&core);
-            let smoke = std::env::args().any(|a| a == "--smoke-scan")
-                || std::env::var("APM_GUI_SMOKE").as_deref() == Ok("scan");
+            let smoke = smoke_mode();
+            let smoke_scan = smoke.as_deref() == Some("scan");
+            let smoke_firmware = smoke.as_deref() == Some("firmware");
             tauri::async_runtime::spawn(async move {
-                if smoke {
+                if smoke_scan {
                     run_smoke(boot_core).await;
+                    return;
+                }
+                if smoke_firmware {
+                    run_firmware_smoke(boot_core).await;
                     return;
                 }
                 // 适配器就绪后自动连接上次的设备。失败（设备没上电、不在广播）

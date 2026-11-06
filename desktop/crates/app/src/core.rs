@@ -397,6 +397,57 @@ impl AppCore {
 
     /// 连接并订阅，成功后状态为 `ready`，并派生通知监控任务。
     pub async fn connect(self: &Arc<Self>, device_id: String) -> Result<(), AppError> {
+        self.connect_inner(device_id, true).await
+    }
+
+    /// 设备被复位（检测/烧写必然复位）之后把它接回来。
+    ///
+    /// esptool 只能靠复位进下载模式工作，BLE 断掉是机制性的，不是缺陷；但"点一次检测
+    /// 就要手动重连一次"是不能接受的操作成本。这里等旧链路拆干净、设备重新广播，
+    /// 再带退避重连几次。
+    ///
+    /// 中间失败**不置 `Error` 状态**：那会让界面在重连过程中闪几下红色横幅，
+    /// 用户会以为检测失败了。只有全部尝试都失败才报错。
+    pub async fn reconnect_after_reset(self: &Arc<Self>, device_id: &str) -> Result<(), AppError> {
+        self.disconnect().await;
+        // 通知监控发现链路没了要 1–2 s。等到"没有设备挂着、也没有过渡状态"为止：
+        // 刚被复位打断时状态可能是 error / stopping，不一定是 idle，别死等 idle。
+        for _ in 0..30 {
+            let state = self.snapshot().state;
+            if state.device().is_none() && !state.is_busy() {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        }
+
+        let mut last: Option<AppError> = None;
+        for attempt in 0..5u32 {
+            if attempt > 0 {
+                // 设备重启 + 重新广播大约 0.5–3 s；这里每次多等一点。
+                tokio::time::sleep(std::time::Duration::from_millis(1_200)).await;
+            }
+            match self.connect_inner(device_id.to_string(), false).await {
+                Ok(()) => return Ok(()),
+                Err(err) => last = Some(err),
+            }
+        }
+
+        let err = last.unwrap_or_else(|| AppError::internal("重连失败：没有产生具体原因"));
+        self.record(
+            LogLevel::Warn,
+            "ble",
+            format!("设备复位后自动重连失败：{}", err.detail),
+        );
+        self.fail(err.clone());
+        Err(err)
+    }
+
+    /// `report_failure=false` 时不置 `Error` 状态（见 `reconnect_after_reset`）。
+    async fn connect_inner(
+        self: &Arc<Self>,
+        device_id: String,
+        report_failure: bool,
+    ) -> Result<(), AppError> {
         {
             let inner = self.lock_inner();
             if inner.state.is_busy() {
@@ -415,6 +466,8 @@ impl AppCore {
         self.set_state(AppState::Connecting {
             device_id: device_id.clone(),
         });
+        // 新链路：上一台设备的电量结论立刻作废，别把旧数字留给新设备。
+        self.lock_inner().battery = None;
         self.record(LogLevel::Info, "ble", format!("连接 {device_id}"));
 
         let connected = tokio::time::timeout(
@@ -431,7 +484,7 @@ impl AppCore {
                     "ble",
                     format!("连接失败（{:?}）：{}", err.code, err.detail),
                 );
-                self.fail(err.clone());
+                self.settle_failure(&err, report_failure);
                 return Err(err);
             }
             Err(_) => {
@@ -440,7 +493,7 @@ impl AppCore {
                     "连接超时：适配器未就绪（授权弹窗未点或蓝牙已关闭）",
                 );
                 self.record(LogLevel::Error, "ble", format!("连接超时：{}", err.detail));
-                self.fail(err.clone());
+                self.settle_failure(&err, report_failure);
                 return Err(err);
             }
         };
@@ -1108,6 +1161,18 @@ impl AppCore {
             code: err.code,
             detail: err.detail,
         });
+    }
+
+    /// 连接失败时决定"要不要让用户看见"。
+    ///
+    /// 静默失败必须把状态收回 `idle`——否则会卡在 `connecting`，界面一直转圈，
+    /// 后续的 `connect` 也会因为 `is_busy` 被拒。
+    fn settle_failure(&self, err: &AppError, report: bool) {
+        if report {
+            self.fail(err.clone());
+        } else {
+            self.set_state(AppState::Idle);
+        }
     }
 
     fn publish_devices(&self, found: &[apm_link::DeviceInfo]) {

@@ -9,7 +9,10 @@ import type {
   AppSnapshot,
   BindingInput,
   ErrorCode,
+  FirmwareStatus,
+  FlashReport,
   KeymapView,
+  ProbeResult,
   QualityReport,
   SessionSummary,
   SinkView,
@@ -46,6 +49,10 @@ export const api = {
   injectPermission: () => invoke<boolean>('inject_permission'),
   openAccessibilitySettings: () => invoke<void>('open_accessibility_settings'),
 
+  firmwareStatus: () => invoke<FirmwareStatus>('firmware_status'),
+  firmwareProbe: (port: string) => invoke<ProbeResult>('firmware_probe', { port }),
+  firmwareFlash: (port: string) => invoke<FlashReport>('firmware_flash', { port }),
+
   diagnosticsText: () => invoke<string>('diagnostics_text'),
   logPath: () => invoke<string>('log_path'),
   revealLog: () => invoke<void>('reveal_log'),
@@ -53,6 +60,11 @@ export const api = {
 
 export function onAppEvent(handler: (event: AppEvent) => void): Promise<UnlistenFn> {
   return listen<AppEvent>('app-event', (e) => handler(e.payload))
+}
+
+/** 烧写进度（0–100）。按字节数折算，三段不是各占 33%。 */
+export function onFirmwareProgress(handler: (percent: number) => void): Promise<UnlistenFn> {
+  return listen<number>('firmware-progress', (e) => handler(e.payload))
 }
 
 const KNOWN_CODES: ErrorCode[] = [
@@ -65,6 +77,10 @@ const KNOWN_CODES: ErrorCode[] = [
   'sink_rate_unsupported',
   'protocol_mismatch',
   'keymap_invalid',
+  'flash_no_device',
+  'firmware_image_invalid',
+  'flash_failed',
+  'flash_verify_failed',
   'busy',
   'internal',
 ]

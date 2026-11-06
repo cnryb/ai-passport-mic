@@ -23,6 +23,21 @@ echo "== 前端构建 =="
 ( cd "$front" && npm run build ) || { echo "前端构建失败"; exit 1; }
 
 echo
+# GUI 要能烧固件，安装包里就必须带一份镜像。缺了直接停，
+# 否则会打出一个"装得上、点烧写才报错"的包——那种包发给客户最伤。
+echo "== 随包固件 =="
+fw_src="$root/device/build/ai-passport-mic-merged.bin"
+fw_dst="$gui/resources/ai-passport-mic-merged.bin"
+if [[ ! -f "$fw_src" ]]; then
+  echo "FAIL 缺少 $fw_src"
+  echo "     先跑 ./scripts/build-firmware.sh（烧写功能依赖这份合并镜像）"
+  exit 1
+fi
+mkdir -p "$gui/resources"
+cp "$fw_src" "$fw_dst"
+echo "OK   $(basename "$fw_src") → crates/gui/resources（$(wc -c <"$fw_dst" | tr -d ' ') 字节）"
+
+echo
 # 变量后面紧跟中文全角括号时，某些 locale 下 bash 会把括号字节当成变量名的一部分，
 # 报 "profile: unbound variable"。一律用 ${} 包起来。
 echo "== Tauri 打包: ${profile} =="
@@ -69,6 +84,16 @@ if [[ -f "$plist" ]]; then
   fi
 else
   echo "MISS 没有 Info.plist"
+  failed=1
+fi
+
+# 随包固件：资源没进包，烧写页会显示"安装包里的固件缺失"。
+# 这是打包问题，不是运行时问题，必须在构建阶段就拦住。
+fw_in_app="$app/Contents/Resources/firmware/ai-passport-mic-merged.bin"
+if [[ -f "$fw_in_app" ]]; then
+  echo "OK   随包固件 $(wc -c <"$fw_in_app" | tr -d ' ') 字节"
+else
+  echo "FAIL .app 里没有 firmware/ai-passport-mic-merged.bin（检查 tauri.conf.json 的 bundle.resources）"
   failed=1
 fi
 

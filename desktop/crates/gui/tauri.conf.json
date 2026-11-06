@@ -32,6 +32,9 @@
     "category": "Utility",
     "shortDescription": "把 AI Passport 当成一台可靠的无线麦克风",
     "copyright": "MIT License",
+    "resources": {
+      "resources/ai-passport-mic-merged.bin": "firmware/ai-passport-mic-merged.bin"
+    },
     "macOS": {
       "minimumSystemVersion": "11.0",
       "infoPlist": "Info.plist",

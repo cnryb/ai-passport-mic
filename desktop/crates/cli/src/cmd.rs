@@ -208,6 +208,125 @@ pub fn selftest(explicit: Option<&Path>) -> Result<()> {
 }
 
 // ---------------------------------------------------------------------------
+// firmware：列串口 / 读版本 / 烧写
+//
+// 逻辑一条都不在这里——全在 `apm_app::firmware`。CLI 只负责选口、选镜像、打印。
+// 界面上点「检测」走的也是同一条路径，所以这里的报错就是用户看到的报错。
+// ---------------------------------------------------------------------------
+
+/// 默认随包镜像：仓库里的构建产物。安装包里的是 `Resources/firmware/`，那是 GUI 的事。
+fn default_image_path() -> Result<PathBuf> {
+    let p = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../../device/build/ai-passport-mic-merged.bin");
+    if p.is_file() {
+        return Ok(p);
+    }
+    Err(anyhow!(
+        "找不到合并镜像 {}，先跑 ./scripts/build-firmware.sh，或用 --image 指定",
+        p.display()
+    ))
+}
+
+/// 选串口：显式给了就用；没给就要求候选唯一，避免"猜一个口把别人的板子写了"。
+fn pick_port(explicit: Option<&str>) -> Result<String> {
+    let ports = apm_app::firmware::list_ports();
+    if let Some(p) = explicit {
+        return Ok(p.to_string());
+    }
+    match ports.len() {
+        0 => Err(anyhow!(
+            "没找到 VID:PID = {:04X}:{:04X} 的串口。用数据线直连电脑（不经无源 HUB），或先跑 `apmctl firmware ports` 看看",
+            apm_app::firmware::TARGET_VID,
+            apm_app::firmware::TARGET_PID
+        )),
+        1 => Ok(ports[0].path.clone()),
+        _ => {
+            let list: Vec<String> = ports.iter().map(|p| p.path.clone()).collect();
+            Err(anyhow!(
+                "有 {} 个候选串口 {}，用 --port 指定其中一个",
+                ports.len(),
+                list.join(", ")
+            ))
+        }
+    }
+}
+
+pub fn firmware_ports() -> Result<()> {
+    let ports = apm_app::firmware::list_ports();
+    if ports.is_empty() {
+        println!(
+            "没有 VID:PID = {:04X}:{:04X} 的串口。",
+            apm_app::firmware::TARGET_VID,
+            apm_app::firmware::TARGET_PID
+        );
+        println!("设备关机时插 USB 只会给充电 IC 上电，C3 不枚举——先按电源键 0.5 s 开机。");
+        return Ok(());
+    }
+    println!("{} 个候选串口（只读操作，没碰设备）：", ports.len());
+    for p in &ports {
+        println!(
+            "  {}\tserial={}",
+            p.path,
+            p.serial_number.as_deref().unwrap_or("—")
+        );
+    }
+    Ok(())
+}
+
+pub fn firmware_probe(port: Option<&str>, image: Option<&Path>) -> Result<()> {
+    let port = pick_port(port)?;
+    let image_path = match image {
+        Some(p) => p.to_path_buf(),
+        None => default_image_path()?,
+    };
+    let image = apm_app::firmware::load_image(&image_path)?;
+
+    println!("串口: {port}");
+    println!("镜像: {}（版本 {}，{} 字节）", image_path.display(), image.info.version, image.info.bytes);
+    println!("检测会让设备复位进下载模式，正在推流会断……");
+
+    let r = apm_app::firmware::probe(&port, &image)?;
+    println!("芯片: {}", r.chip);
+    println!("设备版本: {}", r.current_version.as_deref().unwrap_or("（读不到 / 空片）"));
+    println!("镜像版本: {}", r.image_version);
+    println!("状态: {:?}{}", r.state, if r.first_flash { "（首烧）" } else { "" });
+    Ok(())
+}
+
+pub fn firmware_flash(port: Option<&str>, image: Option<&Path>) -> Result<()> {
+    let port = pick_port(port)?;
+    let image_path = match image {
+        Some(p) => p.to_path_buf(),
+        None => default_image_path()?,
+    };
+    let image = apm_app::firmware::load_image(&image_path)?;
+
+    println!("串口: {port}");
+    println!("镜像: {}（版本 {}）", image_path.display(), image.info.version);
+    println!("烧写会让设备复位；只写 bootloader / 分区表 / app，不动 NVS。");
+
+    let mut last = 255u8;
+    let report = apm_app::firmware::flash(&port, &image, |pct| {
+        if pct != last {
+            last = pct;
+            print!("\r进度 {pct:3}%");
+            use std::io::Write;
+            std::io::stdout().flush().ok();
+        }
+    })?;
+    println!();
+    println!(
+        "完成：{} → {}，{} 字节，{:.1} s，校验 {}",
+        report.from_version.as_deref().unwrap_or("空片"),
+        report.to_version,
+        report.bytes_written,
+        report.elapsed_ms as f64 / 1000.0,
+        if report.verified { "通过" } else { "未通过" }
+    );
+    println!("app 分区 MD5 {}", report.md5);
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------
 // scan / status / record
 // ---------------------------------------------------------------------------
 pub async fn scan(timeout_s: u64) -> Result<()> {

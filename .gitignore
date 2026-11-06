@@ -39,6 +39,8 @@ desktop/crates/gui/frontend/dist/
 *.tsbuildinfo
 # Tauri 每次 build 都会重生成的 ACL schema（capabilities/*.json 的 $schema 指向这里）
 desktop/crates/gui/gen/
+# 随包固件由 scripts/build-gui.sh 从 device/build/ 复制进来，不入库
+desktop/crates/gui/resources/*.bin
 .pnpm-store/
 npm-debug.log*
 yarn-error.log*

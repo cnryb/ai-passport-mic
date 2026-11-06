@@ -11,12 +11,60 @@ export type ErrorCode =
   | 'sink_rate_unsupported'
   | 'protocol_mismatch'
   | 'keymap_invalid'
+  | 'flash_no_device'
+  | 'firmware_image_invalid'
+  | 'flash_failed'
+  | 'flash_verify_failed'
   | 'busy'
   | 'internal'
 
 export interface AppError {
   code: ErrorCode
   detail: string
+}
+
+// ---- M6：固件烧写（对应 `apm_app::firmware`） ----
+
+export interface ImageInfo {
+  path: string
+  version: string
+  bytes: number
+  md5: string
+}
+
+export interface PortView {
+  path: string
+  serial_number: string | null
+}
+
+/** 开箱页首屏：随包镜像 + 候选串口。不碰设备。 */
+export interface FirmwareStatus {
+  image: ImageInfo | null
+  /** 镜像缺失/损坏的原因。有值时不允许点"烧写"。 */
+  image_error: string | null
+  ports: PortView[]
+}
+
+export type DeviceFirmwareState = 'up_to_date' | 'blank' | 'mismatch' | 'unknown'
+
+export interface ProbeResult {
+  port: string
+  chip: string
+  current_version: string | null
+  image_version: string
+  state: DeviceFirmwareState
+  /** 空片/读不到 → 首次烧写，界面换文案。 */
+  first_flash: boolean
+}
+
+export interface FlashReport {
+  port: string
+  from_version: string | null
+  to_version: string
+  bytes_written: number
+  md5: string
+  verified: boolean
+  elapsed_ms: number
 }
 
 export interface DeviceView {
@@ -221,6 +269,11 @@ export const ERROR_HINTS: Record<ErrorCode, string> = {
   sink_rate_unsupported: '该声卡不支持 16 kHz，换一个原生支持 16 kHz 的输出',
   protocol_mismatch: '固件与桌面端版本不一致，重新烧录同一版本',
   keymap_invalid: '键名或修饰键不在支持列表内；PTT 的停止通道不能删',
+  flash_no_device:
+    '用数据线直连电脑（不要经无源 HUB），确认设备已上电，再换个 USB 口试一次',
+  firmware_image_invalid: '安装包里的固件损坏或缺失，重新安装本软件',
+  flash_failed: '重插设备后重试；反复失败可以按住 BOOT 键再插线（强制进下载模式）',
+  flash_verify_failed: '写入内容和镜像对不上，设备大概率还在下载模式，直接重试一次',
   busy: '当前状态下不能这么做，先停止正在进行的操作',
   internal: '查看诊断日志；这属于未预期错误',
 }

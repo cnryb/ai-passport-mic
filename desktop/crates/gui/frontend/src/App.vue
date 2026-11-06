@@ -2,6 +2,7 @@
 import { computed, onMounted, onUnmounted, ref } from 'vue'
 import DeviceList from './components/DeviceList.vue'
 import DiagnosticsView from './components/DiagnosticsView.vue'
+import FirmwareView from './components/FirmwareView.vue'
 import KeymapView from './components/KeymapView.vue'
 import LevelMeter from './components/LevelMeter.vue'
 import QualityView from './components/QualityView.vue'
@@ -25,7 +26,7 @@ import {
 const MAX_LOGS = 300
 const SCAN_WINDOW_MS = 6_000
 
-type Tab = 'live' | 'quality' | 'keymap' | 'diagnostics'
+type Tab = 'live' | 'setup' | 'quality' | 'keymap' | 'diagnostics'
 
 const state = ref<AppState>({ kind: 'idle' })
 const devices = ref<DeviceView[]>([])
@@ -383,6 +384,15 @@ onMounted(async () => {
     // 只等事件会一直空白（顶栏的 v-if 要求 batteryKnown）。
     battery.value = snap.battery_pct
     batteryKnown.value = snap.battery_known
+    // 没有上次连接记录 = 大概率是新装或新设备，直接落到烧写页，省掉"入口在哪"。
+    // 已经连过设备的人不该被拽走，所以只在既没历史也没连接时切。
+    if (
+      !snap.settings.last_device &&
+      snap.state.kind !== 'ready' &&
+      snap.state.kind !== 'streaming'
+    ) {
+      tab.value = 'setup'
+    }
     if (snap.state.kind === 'error') {
       error.value = { code: snap.state.code, detail: snap.state.detail }
     }
@@ -453,6 +463,7 @@ onUnmounted(() => {
 
     <nav class="tabs">
       <button :class="{ active: tab === 'live' }" @click="switchTab('live')">实时</button>
+      <button :class="{ active: tab === 'setup' }" @click="switchTab('setup')">设备烧写</button>
       <button :class="{ active: tab === 'quality' }" @click="switchTab('quality')">音质报告</button>
       <button :class="{ active: tab === 'keymap' }" @click="switchTab('keymap')">按键映射</button>
       <button :class="{ active: tab === 'diagnostics' }" @click="switchTab('diagnostics')">
@@ -562,6 +573,10 @@ onUnmounted(() => {
           开始后，在会议软件（腾讯会议 / Zoom / 飞书）里把麦克风选成「{{ sink }}」。
         </p>
       </section>
+    </main>
+
+    <main v-else-if="tab === 'setup'" class="wrap">
+      <FirmwareView />
     </main>
 
     <main v-else-if="tab === 'quality'" class="wrap">

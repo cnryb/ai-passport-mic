@@ -7,8 +7,14 @@
 
 use crate::GuiState;
 use apm_app::keymap_store::{self, BindingInput, KeymapView};
-use apm_app::{AppError, AppSnapshot, QualityReport, SessionSummary, SinkView};
-use tauri::State;
+use apm_app::{
+    firmware, AppError, AppSnapshot, FlashReport, ImageInfo, PortView, ProbeResult, QualityReport,
+    SessionSummary, SinkView,
+};
+use apm_app::state::ErrorCode;
+use serde::Serialize;
+use std::path::PathBuf;
+use tauri::{AppHandle, Emitter, Manager, State};
 
 #[tauri::command]
 pub fn snapshot(state: State<'_, GuiState>) -> AppSnapshot {
@@ -183,6 +189,124 @@ pub fn open_accessibility_settings() -> Result<(), AppError> {
     {
         Err(AppError::internal("首发只支持 macOS"))
     }
+}
+
+// ---- M6：固件烧写 ----
+//
+// 逻辑全在 `apm_app::firmware`（无 UI，CLI 也能用）。这里只做三件事：
+// 找镜像路径、把阻塞的串口操作塞进 `spawn_blocking`、把进度转成事件。
+//
+// **不提供后台轮询**：probe 会复位设备进下载模式，正推流时被偷偷复位比"没检测到"
+// 更难解释。只有用户明确点"检测"或"开始烧写"时才碰设备。
+
+/// 开箱页首屏数据：随包镜像 + 候选串口。不碰设备，可以随便调。
+#[derive(Debug, Serialize)]
+pub struct FirmwareStatus {
+    pub image: Option<ImageInfo>,
+    /// 镜像缺失/损坏的原因。有值时不显示"可烧写"——别拿坏包去写设备。
+    pub image_error: Option<String>,
+    pub ports: Vec<PortView>,
+}
+
+/// 随包镜像在哪。
+///
+/// 打包后读 `Resources/firmware/...`；开发态回退到仓库构建产物，
+/// 省掉"改一次固件就要重打包一次"的循环。两条路径都不存在才算错。
+fn firmware_path(app: &AppHandle) -> Result<PathBuf, AppError> {
+    let bundled = app
+        .path()
+        .resolve(
+            "firmware/ai-passport-mic-merged.bin",
+            tauri::path::BaseDirectory::Resource,
+        )
+        .ok()
+        .filter(|p| p.exists());
+    if let Some(p) = bundled {
+        return Ok(p);
+    }
+
+    let dev = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join("../../../device/build/ai-passport-mic-merged.bin");
+    if dev.exists() {
+        return Ok(dev);
+    }
+
+    Err(AppError::new(
+        ErrorCode::FirmwareImageInvalid,
+        "找不到随包固件镜像 firmware/ai-passport-mic-merged.bin。安装包不完整，或本地还没跑过 ./scripts/build-firmware.sh",
+    ))
+}
+
+#[tauri::command]
+pub fn firmware_status(app: AppHandle) -> FirmwareStatus {
+    let ports = firmware::list_ports();
+    match firmware_path(&app).and_then(|p| firmware::inspect_image(&p).map_err(AppError::from)) {
+        Ok(image) => FirmwareStatus {
+            image: Some(image),
+            image_error: None,
+            ports,
+        },
+        Err(e) => FirmwareStatus {
+            image: None,
+            image_error: Some(e.detail),
+            ports,
+        },
+    }
+}
+
+/// 读设备当前版本。**会让设备复位**，界面上要提前说清楚。
+#[tauri::command]
+pub async fn firmware_probe(
+    state: State<'_, GuiState>,
+    app: AppHandle,
+    port: String,
+) -> Result<ProbeResult, AppError> {
+    let was_connected = state.core.snapshot().state.device().map(|d| d.id.clone());
+    let path = firmware_path(&app)?;
+    let joined = tauri::async_runtime::spawn_blocking(move || -> Result<ProbeResult, AppError> {
+        let image = firmware::load_image(&path)?;
+        firmware::probe(&port, &image).map_err(AppError::from)
+    })
+    .await
+    .map_err(|e| AppError::internal(format!("检测任务异常退出：{e}")))?;
+    let result = joined?;
+
+    // 检测本身就把设备复位了，BLE 会断。用户不该为此手动重连一次。
+    // 重连失败不影响检测结果——检测结果已经拿到了。
+    if let Some(id) = was_connected {
+        let _ = state.core.reconnect_after_reset(&id).await;
+    }
+    Ok(result)
+}
+
+/// 烧写并校验。进度走 `firmware-progress`（0–100），返回值 `verified` 必为 true，
+/// 否则是 `Err`——不允许把"写失败"渲染成"完成，但有点小问题"。
+#[tauri::command]
+pub async fn firmware_flash(
+    state: State<'_, GuiState>,
+    app: AppHandle,
+    port: String,
+) -> Result<FlashReport, AppError> {
+    let was_connected = state.core.snapshot().state.device().map(|d| d.id.clone());
+    let path = firmware_path(&app)?;
+    let handle = app.clone();
+
+    let joined = tauri::async_runtime::spawn_blocking(move || -> Result<FlashReport, AppError> {
+        let image = firmware::load_image(&path)?;
+        firmware::flash(&port, &image, |percent| {
+            let _ = handle.emit("firmware-progress", percent);
+        })
+        .map_err(AppError::from)
+    })
+    .await
+    .map_err(|e| AppError::internal(format!("烧写任务异常退出：{e}")))?;
+    let report = joined?;
+
+    // 烧完设备已经在跑新固件，把它接回 BLE，省掉"再去实时页点一次连接"。
+    if let Some(id) = was_connected {
+        let _ = state.core.reconnect_after_reset(&id).await;
+    }
+    Ok(report)
 }
 
 // ---- 诊断 ----

@@ -16,6 +16,9 @@ anyhow = "1"
 serde = { workspace = true }
 serde_json = { workspace = true }
 tokio = { version = "1", features = ["rt-multi-thread", "time", "sync"] }
+espflash = { version = "4.7.0", default-features = false, features = ["serialport"] }
+md-5 = "0.11.0"
+serialport = "4"
 
 # 按键注入（M3）只在 macOS 上实现，其他平台由 inject.rs 里的空实现兜住。
 [target.'cfg(target_os = "macos")'.dependencies]
