@@ -219,8 +219,13 @@ static int gatt_access(uint16_t conn_handle, uint16_t attr_handle,
         }
         if (which == 6) {
             // Battery Level（0x2A19）：1 字节百分比，原始值，不带帧头。
-            // 0xFF 表示电量计不可用，回错误让对端区分"没电"和"读不到"。
-            if (s_battery_pct > 100) return BLE_ATT_ERR_UNLIKELY;
+            //
+            // 0xFF 表示"电量计还没给出有效值"。这里**必须原样返回 0xFF，绝不能回 ATT 错误**。
+            // 2026-11-06 现场：回 BLE_ATT_ERR_UNLIKELY 时，macOS 的 btleplug `read()`
+            // **挂住不返回**，PC 端 connect 卡在"读电量"这一步，界面永远停在"连接中"，
+            // 而设备侧日志显示连接与订阅都已成功 —— 排查时极易误判成广播/连接问题。
+            // 架构约定本来就是"0xFF / ATT 错误都算不可用"（docs/ARCHITECTURE.md），
+            // 返回 0xFF 对两端都安全：PC 端用 `pct <= 100` 把它降级成"不可用"。
             return os_mbuf_append(ctxt->om, &s_battery_pct, 1) == 0
                        ? 0 : BLE_ATT_ERR_INSUFFICIENT_RES;
         }

@@ -17,6 +17,14 @@ use uuid::Uuid;
 
 type NotificationStream = Pin<Box<dyn futures::Stream<Item = ValueNotification> + Send>>;
 
+/// 读一次电量特征值的超时。
+///
+/// **必须带超时**：设备回 ATT 错误时，macOS 的 btleplug `read()` 会挂住不返回。而这一步
+/// 排在 connect 成功之后、`Link` 交回调用方之前，一挂就让整个连接流程停在「连接中」——
+/// 设备侧日志显示已连接、已订阅，PC 侧一行不写，极难定位（2026-11-06 现场）。
+/// 电量不是关键路径，读不到就降级成"不可用"，不能拖住连接。
+const BATTERY_READ_TIMEOUT: Duration = Duration::from_secs(2);
+
 fn uuid(text: &str) -> Uuid {
     Uuid::parse_str(text).expect("常量 UUID 必須合法")
 }
@@ -342,16 +350,19 @@ impl Link {
     /// 读一次电量（标准 Battery Service 0x2A19）。
     ///
     /// 旧固件没有该服务时返回 `Ok(None)`；读到的值 > 100 也按"不可用"算——
-    /// 设备侧在电量计缺失时保持 0xFF 占位，不会误报 0%。
+    /// 设备侧在电量计缺失时保持 0xFF 占位，不会误报 0%。**读超时同样是 `Ok(None)`**，
+    /// 不能把"电量读不到"升级成"连接失败"（见 [`BATTERY_READ_TIMEOUT`]）。
     pub async fn read_battery(&self) -> Result<Option<u8>> {
         let Some(chr) = &self.battery else {
             return Ok(None);
         };
-        let value = self
-            .peripheral
-            .read(chr)
-            .await
-            .context("读 Battery Level 失败")?;
+        let read = tokio::time::timeout(BATTERY_READ_TIMEOUT, self.peripheral.read(chr)).await;
+        let value = match read {
+            Ok(Ok(v)) => v,
+            Ok(Err(err)) => return Err(anyhow::Error::from(err).context("读 Battery Level 失败")),
+            // 超时：设备没回或 ATT 错误把 read 挂住了。电量降级为"不可用"，连接继续。
+            Err(_) => return Ok(None),
+        };
         let Some(&pct) = value.first() else {
             return Ok(None);
         };
