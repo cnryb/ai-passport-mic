@@ -144,7 +144,12 @@ if [[ -f "$root/desktop/Cargo.toml" ]] && command -v cargo >/dev/null 2>&1; then
   test_log="${TMPDIR:-/tmp}/ai-passport-mic-verify-cargo.log"
   if ( cd "$root/desktop" && cargo test --quiet ) >"$test_log" 2>&1; then
     status_desktop=PASS
-    echo "OK   cargo test 通过（$(grep -c 'test result: ok' "$test_log" 2>/dev/null || echo 1) 个测试目标）"
+    # 只数"跑过测试"的目标：workspace 里有几个目标本身 0 测试（纯二进制入口），
+    # 把它们算进"测试目标"会让计数看起来比实际多，是文档数字反复过时的来源之一。
+    passed=$(awk '/^test result: ok\./ {s+=$4} END {print s+0}' "$test_log")
+    targets=$(awk '/^test result: ok\./ && $4+0 > 0 {n++} END {print n+0}' "$test_log")
+    ignored=$(awk '/^test result: ok\./ {s+=$8} END {print s+0}' "$test_log")
+    echo "OK   cargo test 通过（$targets 个有测试的目标，$passed passed / $ignored ignored）"
   else
     status_desktop=FAIL
     failed=1
@@ -182,7 +187,7 @@ printf 'Desktop   : %s\n' "$status_desktop"
 printf 'Env       : %s\n' "$status_env"
 printf 'Firmware  : SKIP（idf.py build 不在本脚本内，改固件后跑 ./scripts/build-firmware.sh）\n'
 printf 'GUI build : SKIP（tauri 依赖重，单独跑 ./scripts/build-gui.sh）\n'
-printf 'Unverified: 按键手势逐项核对、端到端声学延迟、G2 的"0 欠载"（10 min 实测 10 次欠载，KI-006）、GUI 真机验收（G1 断连、G3 对拍）；GUI 扫描的自动路径见 GUI.md §14.5\n'
+printf 'Unverified: 关麦兜底只验了 1 min 触发（机制正确），10 min 默认口径未跑、UI 上改时长未点过、KI-005 两条护栏只验了"不误伤正常会话"（"拦得住脏会话"仍只到单测，本机造不出慢档）、按键电压窗口未用万用表复核（分类结果已验）、端到端声学延迟、G2 的"0 欠载"（2026-11-07 长测 48 次欠载；根因已定位为链路到达抖动突破 80 ms 上限，修法待决策，KI-006；用 ./scripts/test-longrun.sh 复现）、GUI 真机验收（G4 场景矩阵）、M6 空片首烧与中断恢复；GUI 扫描的自动路径见 GUI.md §14.5\n'
 printf 'Known issues: docs/KNOWN_ISSUES.md（KI-001 毛刺根因未定位，不要写成已解决）\n'
 
 if (( failed )); then
@@ -195,5 +200,5 @@ if [[ "$status_env" == FAIL ]]; then
   echo "基线自检通过（结构/文档/脚本/协议/向量/桌面端）；环境未就绪，固件编译暂不可用。"
 else
   echo "基线自检通过（结构/文档/脚本/协议/向量/桌面端/环境）。"
-  echo "固件编译请跑 ./scripts/build-firmware.sh；GUI 构建请跑 ./scripts/build-gui.sh；虚拟声卡输出与链路 RTT 已真机验证，按键手势与端到端声学延迟未验证。"
+  echo "固件编译请跑 ./scripts/build-firmware.sh；GUI 构建请跑 ./scripts/build-gui.sh；虚拟声卡输出与链路 RTT 已真机验证；三键 PRESS、按键注入端到端、15 项手势码已于 2026-11-06 真机通过（GUI.md §14.16/§14.17），端到端声学延迟与按键电压窗口边界未验证。"
 fi
