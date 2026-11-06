@@ -1327,24 +1327,53 @@ impl AppCore {
                             ),
                         );
                         self.lock_inner().link_lost = true;
-                        return None;
+                        // 断链要区分"设备没了"和"蓝牙被关了"。
+                        //
+                        // 2026-11-06 G1 验收踩到：这里以前直接 `return None`（→ idle），
+                        // 只有下面 `Err(err)` 那条分支才探适配器。可现实里关蓝牙走的正是
+                        // **这一条**（链路只是"静默 + 报告未连接"，不抛错），于是关掉蓝牙后
+                        // 界面显示「待连接」，用户会以为设备没开机。
+                        return self.probe_after_link_loss().await;
                     }
                 }
                 Err(err) => {
                     self.record(LogLevel::Error, "ble", format!("链路中断：{err}"));
                     self.lock_inner().link_lost = true;
-                    // 链路断了要区分"设备没了"和"蓝牙被关了"：
-                    // 后者要落到 no_adapter，界面才会给"打开蓝牙"的指引。
-                    let probe = tokio::time::timeout(
-                        ADAPTER_PROBE_TIMEOUT,
-                        apm_link::probe_adapter(),
-                    )
-                    .await;
-                    return match probe {
-                        Ok(Ok(())) => None,
-                        _ => Some(AppState::NoAdapter),
-                    };
+                    return self.probe_after_link_loss().await;
                 }
+            }
+        }
+    }
+
+    /// 链路没了之后决定落到哪个状态：蓝牙还在 → `None`（`idle`），
+    /// 蓝牙被关了/不可用 → `Some(NoAdapter)`。
+    ///
+    /// **两条断链路径都要调它**：`Ok(None)` + 探活失败（关蓝牙走这条）、
+    /// 以及 `Err`（链路抛错）。2026-11-06 G1 验收前只有后者调了，所以关蓝牙
+    /// 之后界面停在「待连接」，用户会误以为设备没开机。
+    async fn probe_after_link_loss(self: &Arc<Self>) -> Option<AppState> {
+        let probe = tokio::time::timeout(ADAPTER_PROBE_TIMEOUT, apm_link::probe_adapter()).await;
+        match probe {
+            Ok(Ok(())) => None,
+            Ok(Err(err)) => {
+                // 把"为什么"写进日志：这是用户唯一能看到的诊断线索。
+                self.record(
+                    LogLevel::Warn,
+                    "ble",
+                    format!("断链后检查适配器：{err}（状态落到 no_adapter）"),
+                );
+                Some(AppState::NoAdapter)
+            }
+            Err(_) => {
+                self.record(
+                    LogLevel::Warn,
+                    "ble",
+                    format!(
+                        "断链后检查适配器超时（{} s）：按不可用处理，状态落到 no_adapter",
+                        ADAPTER_PROBE_TIMEOUT.as_secs()
+                    ),
+                );
+                Some(AppState::NoAdapter)
             }
         }
     }

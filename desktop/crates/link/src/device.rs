@@ -5,7 +5,8 @@ use anyhow::{anyhow, Context, Result};
 use apm_protocol::frame::{self, msg, Event, Status};
 use apm_protocol::{AUDIO_UUID, BATTERY_LEVEL_UUID, CTRL_UUID, EVENT_UUID, PROFILE_UUID, SERVICE_UUID, STATUS_UUID};
 use btleplug::api::{
-    Central, Characteristic, Manager as _, Peripheral as _, ScanFilter, ValueNotification, WriteType,
+    Central, CentralState, Characteristic, Manager as _, Peripheral as _, ScanFilter,
+    ValueNotification, WriteType,
 };
 use btleplug::platform::{Adapter, Manager, Peripheral};
 use futures::stream::StreamExt;
@@ -101,12 +102,40 @@ fn describe(peripheral: &Peripheral, props: Option<&btleplug::api::PeripheralPro
     }
 }
 
-/// 只检查有没有可用的蓝牙适配器，不做扫描。
+/// 只检查有没有**可用**的蓝牙适配器，不做扫描。
 ///
-/// GUI 启动时用它区分 `no_adapter` 与 `idle`：macOS 上蓝牙未授权时，
-/// 这里通常表现为枚举不到适配器（btleplug 拿不到 CBCentralManager 状态）。
+/// GUI 启动时用它区分 `no_adapter` 与 `idle`，断链后也用它区分
+/// "设备没了" 与 "蓝牙被关了"。
+///
+/// **必须查 `adapter_state()`，不能只看有没有 adapter 对象。**
+/// 2026-11-06 真机实测（G1 验收）：macOS 关掉蓝牙后 `manager.adapters()`
+/// **仍然返回一个 adapter**，只是扫不到设备。所以旧实现（只取第一个 adapter
+/// 就 `Ok`）永远判不出"蓝牙关了"，关蓝牙后状态落到 `idle` 而不是 `no_adapter`，
+/// 界面显示「待连接」——用户会以为设备没开机，而真正的原因是蓝牙关了。
+///
+/// 现在按 `CentralState` 判：`PoweredOn` 才算可用，`PoweredOff` 与 `Unknown`
+/// 都报错（`Unknown` 通常出现在刚启动、状态还没同步时，宁可让调用方重试一次）。
 pub async fn probe_adapter() -> Result<()> {
-    default_adapter().await.map(|_| ())
+    let manager = Manager::new().await.context("初始化蓝牙管理器失败")?;
+    let adapters = manager.adapters().await.context("枚举蓝牙适配器失败")?;
+    let adapter = adapters
+        .into_iter()
+        .next()
+        .ok_or_else(|| anyhow!("没有可用的蓝牙适配器（macOS 上检查系统设置里的蓝牙权限）"))?;
+
+    match adapter
+        .adapter_state()
+        .await
+        .context("读取蓝牙适配器状态失败")?
+    {
+        CentralState::PoweredOn => Ok(()),
+        CentralState::PoweredOff => {
+            Err(anyhow!("蓝牙已关闭：请在菜单栏或系统设置里打开蓝牙"))
+        }
+        CentralState::Unknown => Err(anyhow!(
+            "蓝牙状态未知（刚启动或尚未授权）：检查系统设置 → 隐私与安全性 → 蓝牙"
+        )),
+    }
 }
 
 /// 扫描 `timeout`，**边扫边回调**当前快照，`cancel` 置真时提前收尾。
