@@ -5,7 +5,7 @@
 //! `telemetry` 按 5 Hz 合批，前端只拿数字（`docs/GUI.md` §3 的 D2 / D3）。
 
 use crate::session::{SessionSummary, Telemetry};
-use crate::state::{AppState, DeviceView};
+use crate::state::{AppState, DeviceView, ErrorCode};
 use serde::Serialize;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
@@ -66,5 +66,18 @@ pub enum AppEvent {
     /// 静默隐藏会让人以为这个功能没做（见 docs/KNOWN_ISSUES.md KI-007）。
     Battery {
         pct: Option<u8>,
+    },
+    /// 推流被内核主动中止（不是用户点的停止）。
+    ///
+    /// 目前只有一种来源：开流后 `EARLY_STOP_WINDOW` 内收到的块数过少，判定
+    /// "设备没开始发送/链路异常"（KI-005 的 PC 侧护栏）。
+    ///
+    /// **为什么不走 `state-changed` 的 error 状态**：早停之后状态会回到 `ready`，
+    /// 用户应该能立刻重试；落到 `error` 会让「开始」按钮一直禁用，还得手动断开重连。
+    /// 但错误又不能吞掉——否则用户只会看到"点了开始又自己停了"。所以用独立边沿事件，
+    /// 前端弹一次横幅，状态机保持可用。
+    StreamAborted {
+        code: ErrorCode,
+        detail: String,
     },
 }

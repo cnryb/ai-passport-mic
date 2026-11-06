@@ -78,6 +78,12 @@ pub fn set_buffer_target(state: State<'_, GuiState>, ms: u32) -> Result<(), AppE
     state.core.set_buffer_target(ms)
 }
 
+/// 关麦兜底时长（分钟）。运行中改也生效（看门狗每轮现读配置）。
+#[tauri::command]
+pub fn set_auto_stop_min(state: State<'_, GuiState>, minutes: u32) -> Result<(), AppError> {
+    state.core.set_auto_stop_min(minutes)
+}
+
 #[tauri::command]
 pub async fn start_stream(state: State<'_, GuiState>, save_wav: bool) -> Result<String, AppError> {
     state.core.start_stream(save_wav).await

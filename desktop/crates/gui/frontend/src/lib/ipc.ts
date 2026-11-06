@@ -31,6 +31,7 @@ export const api = {
   listSinks: () => invoke<SinkView[]>('list_sinks'),
   setSink: (name: string) => invoke<void>('set_sink', { name }),
   setBufferTarget: (ms: number) => invoke<void>('set_buffer_target', { ms }),
+  setAutoStopMin: (minutes: number) => invoke<void>('set_auto_stop_min', { minutes }),
   setSaveWav: (save: boolean) => invoke<void>('set_save_wav', { save }),
   startStream: (saveWav: boolean) => invoke<string>('start_stream', { saveWav }),
   stopStream: () => invoke<SessionSummary>('stop_stream'),
@@ -81,6 +82,7 @@ const KNOWN_CODES: ErrorCode[] = [
   'firmware_image_invalid',
   'flash_failed',
   'flash_verify_failed',
+  'capture_not_starting',
   'busy',
   'internal',
 ]

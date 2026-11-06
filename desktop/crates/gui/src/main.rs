@@ -139,6 +139,7 @@ fn main() {
             commands::set_sink,
             commands::set_save_wav,
             commands::set_buffer_target,
+            commands::set_auto_stop_min,
             commands::start_stream,
             commands::stop_stream,
             commands::analyze_session,

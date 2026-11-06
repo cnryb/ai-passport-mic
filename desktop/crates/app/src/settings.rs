@@ -18,6 +18,23 @@ pub const DEFAULT_TARGET_MS: u32 = 80;
 pub const TARGET_MIN_MS: u32 = 40;
 pub const TARGET_MAX_MS: u32 = 80;
 
+/// 关麦兜底的默认时长：连续采集 10 分钟自动停。
+///
+/// 口径来自 [`docs/PRODUCT.md`](../../../../docs/PRODUCT.md) 与
+/// [`config/README.md`](../../../../config/README.md)：OK 是 toggle 式，"松开自动停"不存在，
+/// 忘了关麦是必然会发生的事，所以必须有兜底。
+pub const DEFAULT_AUTO_STOP_MIN: u32 = 10;
+/// 兜底时长上限（24 h）。设成 0 或超上限都夹到这个范围内。
+///
+/// 下限定在 1 min：比 1 分钟更短的"兜底"会把正常的一次发言也掐掉。
+pub const AUTO_STOP_MIN: u32 = 1;
+pub const AUTO_STOP_MAX_MIN: u32 = 24 * 60;
+
+/// 兜底时长的唯一夹紧点（界面输入、配置文件、命令行都走这里）。
+pub fn clamp_auto_stop_min(min: u32) -> u32 {
+    min.clamp(AUTO_STOP_MIN, AUTO_STOP_MAX_MIN)
+}
+
 /// 缓冲目标的唯一夹紧点。界面滑块、配置文件、命令行都走这里，
 /// 免得三处各夹一次、边界还不一样。
 pub fn clamp_target(ms: u32) -> u32 {
@@ -75,10 +92,20 @@ pub struct Settings {
     /// 启动后是否自动连接上次的设备。默认开——这是"打开就能用"的预期。
     #[serde(default = "default_true")]
     pub auto_connect: bool,
+    /// 连续采集多少分钟后自动停（关麦兜底）。
+    ///
+    /// OK 是 toggle 式，没有"松开自动停"，忘关麦是必然的（`docs/PRODUCT.md`）。
+    /// 对所有推流生效，**长测时把它调大**（G2 的 10 min 口径需要 ≥10，否则会被兜底切断）。
+    #[serde(default = "default_auto_stop_min")]
+    pub auto_stop_min: u32,
 }
 
 fn default_target_ms() -> u32 {
     DEFAULT_TARGET_MS
+}
+
+fn default_auto_stop_min() -> u32 {
+    DEFAULT_AUTO_STOP_MIN
 }
 
 fn default_true() -> bool {
@@ -94,6 +121,7 @@ impl Default for Settings {
             last_device_id: None,
             last_device_name: None,
             auto_connect: true,
+            auto_stop_min: DEFAULT_AUTO_STOP_MIN,
         }
     }
 }
@@ -132,6 +160,29 @@ mod tests {
         let s = Settings::default();
         assert!(!s.save_wav, "会话 WAV 默认必须不落盘");
         assert_eq!(s.target_ms, 80);
+        assert_eq!(
+            s.auto_stop_min, DEFAULT_AUTO_STOP_MIN,
+            "关麦兜底默认必须是 10 分钟（PRODUCT.md 的定稿口径）"
+        );
+    }
+
+    #[test]
+    fn auto_stop_min_is_clamped() {
+        // 0 分钟会把一次正常发言也掐掉，必须抬到下限。
+        assert_eq!(clamp_auto_stop_min(0), AUTO_STOP_MIN);
+        assert_eq!(clamp_auto_stop_min(1), 1);
+        assert_eq!(clamp_auto_stop_min(10), 10);
+        // 长测：G2 的 10 min 口径需要能调到 30 / 60，不能被默认值锁死。
+        assert_eq!(clamp_auto_stop_min(60), 60);
+        assert_eq!(clamp_auto_stop_min(u32::MAX), AUTO_STOP_MAX_MIN);
+    }
+
+    #[test]
+    fn old_settings_without_auto_stop_default_to_ten() {
+        // 旧版 settings.json 没有 auto_stop_min：必须回落到 10，而不是 0。
+        // 回落到 0 会让所有推流立刻被判超时。
+        let back: Settings = serde_json::from_str("{\"target_ms\":60}").unwrap();
+        assert_eq!(back.auto_stop_min, DEFAULT_AUTO_STOP_MIN);
     }
 
     #[test]
@@ -143,6 +194,7 @@ mod tests {
             last_device_id: Some("ABCD-1234".into()),
             last_device_name: Some("AI Passport".into()),
             auto_connect: false,
+            auto_stop_min: 30,
         };
         let text = serde_json::to_string(&s).unwrap();
         let back: Settings = serde_json::from_str(&text).unwrap();
@@ -152,6 +204,7 @@ mod tests {
         assert_eq!(back.last_device_id.as_deref(), Some("ABCD-1234"));
         assert_eq!(back.last_device_name.as_deref(), Some("AI Passport"));
         assert!(!back.auto_connect);
+        assert_eq!(back.auto_stop_min, 30, "兜底时长要能跨重启保留");
     }
 
     #[test]

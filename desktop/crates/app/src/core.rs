@@ -54,6 +54,21 @@ const CAPTURE_RESET_SETTLE: Duration = Duration::from_millis(120);
 /// 保留的会话数（仅用于"打开上次录音做分析"）。
 const SESSIONS_KEPT: usize = 20;
 
+/// 开流后的"有没有真的在发音频"观察窗口。
+///
+/// 设备停在 KI-005 的半死态时，链路通、STATUS 每秒来，但音频只有 1.5–2 块/秒。
+/// 正常链路 3 s 应该收到 ~150 块，10 块是个很宽松的下限——只拦"几乎没数据"，
+/// 不拦"稍慢一点"（那属于 KI-006 的欠载范畴，另行统计）。
+const EARLY_STOP_WINDOW: Duration = Duration::from_secs(3);
+/// 窗口内收到的块数低于这个值就判定"设备没在发/链路异常"。
+const EARLY_STOP_MIN_BLOCKS: u64 = 10;
+
+/// 关麦兜底看门狗的检查周期。
+///
+/// 秒级即可：兜底的粒度是"分钟"，检查得再勤也只是多几次加锁。
+/// 取整不取 1 s 是为了让日志里的触发时刻看起来不像是卡在整秒。
+const AUTO_STOP_TICK: Duration = Duration::from_secs(5);
+
 struct Inner {
     state: AppState,
     devices: Vec<DeviceView>,
@@ -116,6 +131,8 @@ pub struct SettingsView {
     pub auto_connect: bool,
     /// 上次连接的设备名（无记录为 `None`），只用于界面提示。
     pub last_device: Option<String>,
+    /// 连续采集多少分钟后自动停（关麦兜底）。
+    pub auto_stop_min: u32,
 }
 
 /// 前端的启动快照。之后一切变化走事件，不再轮询。
@@ -172,6 +189,15 @@ const ADAPTER_PROBE_TIMEOUT: Duration = Duration::from_secs(6);
 
 impl AppCore {
     pub fn new(log_dir: Option<PathBuf>) -> Arc<Self> {
+        Self::with_settings(log_dir, Settings::load())
+    }
+
+    /// 用**指定配置**构造，不读用户目录下的 `settings.json`。
+    ///
+    /// 测试必须走这个入口。2026-11-07 踩过：某测试断言"默认不录 WAV"，
+    /// 但它其实读的是**用户真实配置**——只要有人在界面上勾了「同时保存 WAV」，
+    /// `cargo test` 就会红。测试不该依赖机器的外部状态。
+    fn with_settings(log_dir: Option<PathBuf>, settings: Settings) -> Arc<Self> {
         let (events, _) = broadcast::channel(EVENT_CHANNEL);
         let core = Arc::new(Self {
             inner: StdMutex::new(Inner {
@@ -183,7 +209,7 @@ impl AppCore {
                 link_stop: None,
                 stream: None,
                 sessions: VecDeque::new(),
-                settings: Settings::load(),
+                settings,
                 exec: None,
                 link_lost: false,
                 battery: None,
@@ -240,6 +266,7 @@ impl AppCore {
             save_wav: s.save_wav,
             auto_connect: s.auto_connect,
             last_device: s.last_device_name.clone(),
+            auto_stop_min: s.auto_stop_min,
         }
     }
 
@@ -705,6 +732,25 @@ impl AppCore {
         Ok(())
     }
 
+    /// 关麦兜底的时长（分钟）。运行中改也生效：看门狗每轮都现读配置。
+    ///
+    /// 夹紧到 1 min – 24 h；界面、配置文件、命令行都走这同一个夹紧点，
+    /// 免得三处各夹一次、边界还不一样（与 `clamp_target` 同一套路）。
+    pub fn set_auto_stop_min(&self, minutes: u32) -> Result<(), AppError> {
+        let minutes = settings::clamp_auto_stop_min(minutes);
+        let mut inner = self.lock_inner();
+        inner.settings.auto_stop_min = minutes;
+        if let Err(err) = inner.settings.save() {
+            self.record(LogLevel::Warn, "app", format!("保存配置失败：{err}"));
+        }
+        self.record(
+            LogLevel::Info,
+            "app",
+            format!("关麦兜底改为：连续采集 {minutes} 分钟自动停"),
+        );
+        Ok(())
+    }
+
     /// 缓冲目标（40–80 ms）。运行中改了取下一批回调生效，不需要重启推流。
     pub fn set_buffer_target(&self, ms: u32) -> Result<(), AppError> {
         let ms = settings::clamp_target(ms);
@@ -854,7 +900,121 @@ impl AppCore {
         self.fire_hook("capture.start");
         self.remember_exec();
         self.spawn_telemetry();
+        self.spawn_early_stop();
+        self.spawn_auto_stop();
         Ok(session_id)
+    }
+
+    /// 关麦兜底看门狗：连续采集超过 `settings.auto_stop_min` 分钟就自动停。
+    ///
+    /// 为什么需要（`docs/PRODUCT.md` 的「按键」节）：OK 是 toggle 式，"松手自动停"
+    /// 不存在。开着麦去接杯水、开完会忘了按第二下，是这个设计必然会发生的事故——
+    /// 不只是浪费电，更是隐私问题。
+    ///
+    /// 三个设计点：
+    /// - **每轮现读配置**，不在开流时快照：用户在运行中把时长调大要立刻生效；
+    /// - **看的是会话自身的已运行时长**，不是本任务的存活时长，所以任务重新派生
+    ///   （理论上不会）也不会把计时清零；
+    /// - 走 `stop_stream()` 而不是只发 CTRL STOP：它负责触发 `capture.stop` 钩子、
+    ///   回填 WAV 头、把状态机放回 `ready`。只发 STOP 会留一条僵尸会话。
+    fn spawn_auto_stop(self: &Arc<Self>) {
+        let handle = self.lock_inner().exec.clone();
+        let Some(handle) = handle else { return };
+        let core = Arc::clone(self);
+        handle.spawn(async move {
+            loop {
+                tokio::time::sleep(AUTO_STOP_TICK).await;
+                // 一次加锁把"该不该停"判断完，避免两次读之间状态变了。
+                let decision = {
+                    let inner = core.lock_inner();
+                    match inner.stream.as_ref() {
+                        Some(p) => {
+                            let limit = Duration::from_secs(
+                                u64::from(inner.settings.auto_stop_min) * 60,
+                            );
+                            Some((p.should_auto_stop(limit), limit, p.blocks()))
+                        }
+                        // 会话结束了就退出，别留空转任务。
+                        None => None,
+                    }
+                };
+                let Some((due, limit, blocks)) = decision else {
+                    break;
+                };
+                if !due {
+                    continue;
+                }
+                core.record(
+                    LogLevel::Warn,
+                    "sink",
+                    format!(
+                        "连续采集已达 {} 分钟（{} 块）：触发关麦兜底，自动停止。\
+                         忘记关麦是 toggle 式的已知代价；要更长可在设置里调大",
+                        limit.as_secs() / 60,
+                        blocks
+                    ),
+                );
+                // 兜底触发的停止和用户手动停止走同一条收尾路径，钩子/WAV/状态都要对；
+                // 但日志里要写明是兜底停的，别让人误读成"用户自己停的"。
+                if let Err(err) = core
+                    .stop_stream_with_reason(&format!(
+                        "关麦兜底（连续采集 {} 分钟）",
+                        limit.as_secs() / 60
+                    ))
+                    .await
+                {
+                    // 走到这里通常意味着"刚好和用户的停止撞上了"，不是错误。
+                    core.record(
+                        LogLevel::Debug,
+                        "sink",
+                        format!("关麦兜底停止时会话已结束：{}", err.detail),
+                    );
+                }
+                break;
+            }
+        });
+    }
+
+    /// 开流后的"有没有真的在发音频"看门狗。
+    ///
+    /// 为什么要单独一个任务（KI-005）：设备停在半死态时链路是通的、STATUS 也在一秒
+    /// 一条地来，但音频只有 1.5–2 块/秒。这时**没有任何错误会抛出来**，会话会一路
+    /// 跑到用户手动停止，产出一份"欠载上千、漂移 −9000 ppm"的报告——看起来像声卡或
+    /// 漂移补偿坏了，实际是设备没在发。宁可 3 s 就停掉并明说，也别让人读假数据。
+    ///
+    /// 只跑一次判定，不循环：过了窗口就退出。正常会话在这里什么也不做。
+    fn spawn_early_stop(self: &Arc<Self>) {
+        let handle = self.lock_inner().exec.clone();
+        let Some(handle) = handle else { return };
+        let core = Arc::clone(self);
+        handle.spawn(async move {
+            tokio::time::sleep(EARLY_STOP_WINDOW).await;
+            let verdict = {
+                let inner = core.lock_inner();
+                inner.stream.as_ref().map(|p| (p.unstarted(EARLY_STOP_WINDOW, EARLY_STOP_MIN_BLOCKS), p.blocks()))
+            };
+            // 会话已经结束（用户手动停了 / 断链了）就不重复报错。
+            let Some((true, blocks)) = verdict else { return };
+            core.record(
+                LogLevel::Error,
+                "sink",
+                format!(
+                    "开流 {} s 只收到 {blocks} 块（正常应约 {} 块）：设备未开始发送或链路异常，已自动停止",
+                    EARLY_STOP_WINDOW.as_secs(),
+                    EARLY_STOP_WINDOW.as_secs() * 50
+                ),
+            );
+            // 走 stop_stream() 而不是只发 CTRL STOP：它会收尾 WAV、触发 capture.stop 钩子、
+            // 把状态机放回 ready。只发 STOP 会留一条"界面在推流、声卡在补静音"的僵尸会话。
+            let _ = core.stop_stream_with_reason("早停（开流后无音频）").await;
+            core.emit(AppEvent::StreamAborted {
+                code: ErrorCode::CaptureNotStarting,
+                detail: format!(
+                    "开流后 {} s 只收到 {blocks} 块音频，已自动停止（设备未开始发送或链路异常）",
+                    EARLY_STOP_WINDOW.as_secs()
+                ),
+            });
+        });
     }
 
     /// 触发采集状态钩子（`capture.start` / `capture.stop`）：点按注入一个快捷键。
@@ -979,13 +1139,25 @@ impl AppCore {
 
     /// 停止推流。收尾顺序：**先停写声卡 → 再 CTRL STOP**（断链由 disconnect 负责）。
     pub async fn stop_stream(self: &Arc<Self>) -> Result<SessionSummary, AppError> {
+        self.stop_stream_with_reason("手动停止").await
+    }
+
+    /// 与 [`Self::stop_stream`] 相同，但收尾日志写明**是谁**停的。
+    ///
+    /// 分出来的理由：兜底和早停也是"停"，但它们不是用户点的。如果日志一律写
+    /// 「手动停止」，事后排障时会把"忘记关麦被兜底了"误读成"用户自己停的"，
+    /// 正好把要查的那条线索抹掉。
+    async fn stop_stream_with_reason(
+        self: &Arc<Self>,
+        reason: &str,
+    ) -> Result<SessionSummary, AppError> {
         if self.lock_inner().stream.is_none() {
             return Err(AppError::busy("当前没有在推流"));
         }
         let device = self.state().device().cloned();
         self.set_state(AppState::Stopping);
 
-        let summary = match self.take_and_finish_stream("手动停止").await {
+        let summary = match self.take_and_finish_stream(reason).await {
             Some(summary) => summary,
             None => {
                 self.set_state(match device {
@@ -1555,7 +1727,12 @@ mod tests {
     }
 
     fn quiet_core(dir: &str) -> Arc<AppCore> {
-        AppCore::new(Some(std::env::temp_dir().join(dir)))
+        // 用 `Settings::default()` 而不是 `Settings::load()`：测试不能依赖
+        // 用户机器上真实 `settings.json` 的内容（否则勾一下「保存 WAV」就跑红）。
+        AppCore::with_settings(
+            Some(std::env::temp_dir().join(dir)),
+            crate::settings::Settings::default(),
+        )
     }
 
     /// 电量结论必须能从快照里读到。GUI 开了 `auto_connect` 时，后端会在前端注册
