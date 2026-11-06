@@ -73,6 +73,14 @@ export interface AppSnapshot {
   log_dir: string
   settings: SettingsView
   last_session: SessionRecord | null
+  /** 电量百分比（0..100）。`battery_known=false` 时无意义。 */
+  battery_pct: number | null
+  /**
+   * 是否已经拿到过电量结论（无论有没有数字）。
+   * 自动连接时 `Battery` 事件可能早于监听注册而丢失，靠这个字段补一次，
+   * 否则顶栏会一直空白——不是没做，是没收到。
+   */
+  battery_known: boolean
 }
 
 /** 5 Hz 遥测。字段口径见 docs/GUI.md §7，前端**不自己算**丢块率。 */
@@ -189,7 +197,7 @@ export type AppEvent =
   | { type: 'event-log'; entry: LogEntry }
   | { type: 'telemetry'; telemetry: Telemetry }
   | { type: 'session-done'; summary: SessionSummary }
-  | { type: 'battery'; pct: number }
+  | { type: 'battery'; pct: number | null }
 
 export const STATE_LABEL: Record<StateKind, string> = {
   no_adapter: '无蓝牙适配器',

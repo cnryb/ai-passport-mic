@@ -48,6 +48,12 @@ const summary = ref<SessionSummary | null>(null)
 const lastSession = ref<SessionRecord | null>(null)
 /** 设备电量百分比；null = 未连接或电量计不可用。设备只在变化时推送。 */
 const battery = ref<number | null>(null)
+/**
+ * 是否已经收到过电量结论（无论有没有数字）。
+ * 只靠 `battery === null` 分不清"还没读到"和"设备说不可用"：连上到读回结果之间有几十毫秒，
+ * 那段时间不该闪一下"电量不可用"。
+ */
+const batteryKnown = ref(false)
 
 const report = ref<QualityReport | null>(null)
 const reportLoading = ref(false)
@@ -82,7 +88,14 @@ const activeSessionId = computed(() => summary.value?.session_id ?? lastSession.
 /** 与固件 battery.c 的低电量阈值一致（APM_BATTERY_LOW_SOC_PCT = 20）。 */
 const BATTERY_LOW_PCT = 20
 const batteryLow = computed(() => battery.value !== null && battery.value <= BATTERY_LOW_PCT)
-const batteryText = computed(() => (battery.value === null ? null : `电量 ${battery.value}%`))
+/**
+ * 顶栏电量文案。`null` = 设备明确回报"电量不可用"（没有 Battery Service、读失败，
+ * 或设备侧 SOC 无效——见 docs/KNOWN_ISSUES.md KI-007）。
+ * 这时要**说出来**，不能藏起来：藏起来会让人以为功能没做。
+ */
+const batteryText = computed(() =>
+  battery.value === null ? '电量不可用' : `电量 ${battery.value}%`,
+)
 
 const elapsedText = computed(() => {
   const ms = streaming.value ? (telemetry.value?.elapsed_ms ?? 0) : 0
@@ -366,6 +379,10 @@ onMounted(async () => {
     autoConnect.value = snap.settings.auto_connect
     lastDevice.value = snap.settings.last_device
     sink.value = snap.settings.sink
+    // 电量先按快照回填：自动连接时后端可能在监听注册之前就读完了，
+    // 只等事件会一直空白（顶栏的 v-if 要求 batteryKnown）。
+    battery.value = snap.battery_pct
+    batteryKnown.value = snap.battery_known
     if (snap.state.kind === 'error') {
       error.value = { code: snap.state.code, detail: snap.state.detail }
     }
@@ -388,6 +405,7 @@ onMounted(async () => {
       const kind = event.state.kind
       if (kind !== 'ready' && kind !== 'streaming') {
         battery.value = null
+        batteryKnown.value = false
       }
     } else if (event.type === 'devices') {
       devices.value = event.devices
@@ -399,6 +417,7 @@ onMounted(async () => {
       summary.value = event.summary
     } else if (event.type === 'battery') {
       battery.value = event.pct
+      batteryKnown.value = true
     }
   })
 })
@@ -419,9 +438,9 @@ onUnmounted(() => {
       </div>
       <span class="spacer" />
       <span
-        v-if="batteryText && connectedDevice"
+        v-if="connectedDevice && batteryKnown"
         class="meta mono"
-        :class="{ 'batt-low': batteryLow }"
+        :class="{ 'batt-low': batteryLow, 'batt-na': battery === null }"
       >
         {{ batteryText }}{{ batteryLow ? '，请充电' : '' }}
       </span>
@@ -628,6 +647,11 @@ onUnmounted(() => {
 .meta.batt-low {
   color: var(--warn);
   font-weight: 600;
+}
+
+/* 电量不可用：低调但要说出来，不能用警告色制造"有故障"的错觉。 */
+.meta.batt-na {
+  color: var(--dim);
 }
 
 .spacer {

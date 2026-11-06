@@ -71,6 +71,14 @@ struct Inner {
     /// 监控循环判定"链路已经没了"。收尾时据此跳过 `disconnect()`——对一只已经消失的
     /// 外设调它只会白等一个超时，而且必然失败。
     link_lost: bool,
+    /// 最近一次电量结论，三层语义：
+    /// `None` = 还没读过 / 没有链路；`Some(None)` = 设备明确报"不可用"；
+    /// `Some(Some(pct))` = 有效百分比。
+    ///
+    /// 必须落在内核里而不是只走事件：GUI 启动时 `auto_connect` 会先连上并读一次电量，
+    /// 而前端要跑完 snapshot / 声卡枚举 / keymap 才注册监听，那时事件已经发完了
+    /// （Tauri 不重放）。快照带上它，界面才不会有"设备连着但电量永远空白"的死角。
+    battery: Option<Option<u8>>,
 }
 
 /// 一次会话的落盘记录。没有勾选保存 WAV 时 `wav_path` 为 `None`，
@@ -115,6 +123,12 @@ pub struct AppSnapshot {
     pub log_dir: String,
     pub settings: SettingsView,
     pub last_session: Option<SessionRecord>,
+    /// 电量百分比（0..100）。`battery_known=false` 时无意义。
+    pub battery_pct: Option<u8>,
+    /// 是否已经拿到过电量结论（无论有没有数字）。
+    /// 与 `battery_pct` 配合区分"还没读到"（known=false, pct=None）和
+    /// "设备说不可用"（known=true, pct=None）——前者不该闪「电量不可用」。
+    pub battery_known: bool,
 }
 
 pub struct AppCore {
@@ -166,6 +180,7 @@ impl AppCore {
                 settings: Settings::load(),
                 exec: None,
                 link_lost: false,
+                battery: None,
             }),
             link: AsyncMutex::new(None),
             events,
@@ -233,6 +248,7 @@ impl AppCore {
     }
 
     pub fn snapshot(&self) -> AppSnapshot {
+        let battery = self.lock_inner().battery;
         AppSnapshot {
             version: self.version.to_string(),
             state: self.state(),
@@ -242,6 +258,8 @@ impl AppCore {
             log_dir: self.log_dir(),
             settings: self.settings_view(),
             last_session: self.lock_inner().sessions.back().cloned(),
+            battery_pct: battery.flatten(),
+            battery_known: battery.is_some(),
         }
     }
 
@@ -459,19 +477,32 @@ impl AppCore {
         };
 
         // 电量只在变化时通知，连接后主动读一次，前端立刻有数。
-        // 读失败（旧固件没有 Battery Service）不算连接失败，电量就静默没有。
-        match link.read_battery().await {
+        // 三种结果都要落到内核并发出事件：`pct=None` 让界面显示「电量不可用」，
+        // 而不是静默不显示——静默不显示会让人以为功能没做，而事实是设备明确回了
+        // "电量未知"（KI-007）。
+        //
+        // 先写 `inner.battery` 再 emit：GUI 自动连接时前端常常还没注册监听，
+        // 事件会丢，但快照里必须有结论（否则界面永远空白，比事件丢更糟）。
+        let pct = match link.read_battery().await {
             Ok(Some(pct)) => {
-                self.emit(AppEvent::Battery { pct });
                 self.record(LogLevel::Info, "ble", format!("电量 {pct}%"));
+                Some(pct)
             }
             Ok(None) => {
-                self.record(LogLevel::Debug, "ble", "设备没有 Battery Service，电量不可用");
+                self.record(
+                    LogLevel::Info,
+                    "ble",
+                    "设备报电量不可用（无 Battery Service 或电量计未就绪）",
+                );
+                None
             }
             Err(err) => {
                 self.record(LogLevel::Warn, "ble", format!("读电量失败：{err:#}"));
+                None
             }
-        }
+        };
+        self.lock_inner().battery = Some(pct);
+        self.emit(AppEvent::Battery { pct });
 
         *self.link.lock().await = Some(link);
         // 新链路：把"已知丢失"的标记清掉，否则第一次收尾就会跳过一次正常的断开调用。
@@ -1308,7 +1339,9 @@ impl AppCore {
                 .record(LogLevel::Debug, "ping", format!("PONG seq={seq}")),
             Notification::Battery(pct) => {
                 // 设备只在数值变化时通知（1 s 采样），不需要去抖。
-                self.emit(AppEvent::Battery { pct });
+                // 同样先落内核再发事件：晚注册监听的前端靠快照补。
+                self.lock_inner().battery = Some(Some(pct));
+                self.emit(AppEvent::Battery { pct: Some(pct) });
                 self.record(
                     LogLevel::Debug,
                     "ble",
@@ -1359,6 +1392,8 @@ impl AppCore {
         }
         self.lock_inner().link_stop = None;
         self.lock_inner().link_lost = false;
+        // 链路没了，电量结论跟着作废：留着上一台的数字会被当成"这台还有电"。
+        self.lock_inner().battery = None;
         // 链路断了导致的收尾同样要触发 stop 钩子：否则前一个 capture.start 注入的
         // 那个快捷键对应的状态（例如会议软件里的"麦克风开"）就再也不会被复位。
         if was_streaming {
@@ -1388,6 +1423,30 @@ mod tests {
 
     fn quiet_core(dir: &str) -> Arc<AppCore> {
         AppCore::new(Some(std::env::temp_dir().join(dir)))
+    }
+
+    /// 电量结论必须能从快照里读到。GUI 开了 `auto_connect` 时，后端会在前端注册
+    /// 事件监听之前就完成连接并读完电量（Tauri 不重放事件），只靠 `Battery` 事件
+    /// 的话顶栏会永远空白——2026-11-06 现场就是这个现象。
+    #[test]
+    fn snapshot_carries_battery_verdict() {
+        let core = quiet_core("apm-battery-snapshot");
+
+        let snap = core.snapshot();
+        assert!(!snap.battery_known, "没读过电量时不该声称已知");
+        assert_eq!(snap.battery_pct, None);
+
+        core.lock_inner().battery = Some(Some(87));
+        let snap = core.snapshot();
+        assert!(snap.battery_known);
+        assert_eq!(snap.battery_pct, Some(87));
+
+        // `Some(None)` 是"设备明确说不可用"，与"还没读到"必须区分开：
+        // 前者界面要写「电量不可用」，后者什么都不该显示。
+        core.lock_inner().battery = Some(None);
+        let snap = core.snapshot();
+        assert!(snap.battery_known, "设备明确报不可用也算已知");
+        assert_eq!(snap.battery_pct, None);
     }
 
     fn rt() -> tokio::runtime::Runtime {
