@@ -14,7 +14,10 @@
 
 mod playout;
 
-pub use playout::{Playout, Stats, DRIFT_TAU_SEC, MAX_SLIP, TARGET_MAX_MS, TARGET_MIN_MS};
+pub use playout::{
+    UNDERRUN_LOG,
+    Playout, Stats, DRIFT_TAU_SEC, GAP_BUCKETS_MS, MAX_SLIP, TARGET_MAX_MS, TARGET_MIN_MS,
+};
 
 use anyhow::{anyhow, Context, Result};
 use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
@@ -35,13 +38,15 @@ pub struct Sink {
 pub fn output_devices() -> Result<Vec<String>> {
     let host = cpal::default_host();
     let devices = host.output_devices().context("枚举输出设备失败")?;
-    Ok(devices.filter_map(|d| d.name().ok()).collect())
+    Ok(devices
+        .filter_map(|d| d.description().ok().map(|desc| desc.name().to_string()))
+        .collect())
 }
 
 /// 一个输出设备的能力摘要，供 GUI 的声卡下拉框判断"这个能不能用"。
 ///
-/// `uid` 目前等于名字：cpal 0.15 没有 `Device::id()`，macOS 上设备名已经唯一。
-/// 留这个字段是为了以后换 cpal 0.16 或上 WASAPI 时不用改前端契约
+/// `uid` 用 cpal 0.18 的 `Device::id()`（macOS 上是 CoreAudio 的 UID 字符串），取不到时才
+/// 回退设备名。留这个字段是为了以后上 WASAPI 时不用改前端契约
 /// （`docs/GUI.md` §8 提到 Windows 要按 UID 匹配）。
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SinkInfo {
@@ -56,12 +61,16 @@ pub struct SinkInfo {
 }
 
 /// 枚举输出设备。读不到配置的设备（如被独占）跳过而不是让整次枚举失败。
+///
+/// `uid` 用 cpal 0.18 的 `Device::id()`（macOS 上是 CoreAudio 的 UID 字符串），
+/// 而不是设备名 —— 同名设备（两块同型号 USB 声卡）以前会被认成一个。
 pub fn list_sinks() -> Result<Vec<SinkInfo>> {
     let host = cpal::default_host();
     let devices = host.output_devices().context("枚举输出设备失败")?;
     let mut out = Vec::new();
     for device in devices {
-        let Ok(name) = device.name() else { continue };
+        let Ok(desc) = device.description() else { continue };
+        let name = desc.name().to_string();
         let mut channels = 0u16;
         let mut min_rate = u32::MAX;
         let mut max_rate = 0u32;
@@ -69,15 +78,20 @@ pub fn list_sinks() -> Result<Vec<SinkInfo>> {
         if let Ok(configs) = device.supported_output_configs() {
             for range in configs {
                 channels = channels.max(range.channels());
-                min_rate = min_rate.min(range.min_sample_rate().0);
-                max_rate = max_rate.max(range.max_sample_rate().0);
-                if (range.min_sample_rate().0..=range.max_sample_rate().0).contains(&16_000) {
+                min_rate = min_rate.min(range.min_sample_rate());
+                max_rate = max_rate.max(range.max_sample_rate());
+                if (range.min_sample_rate()..=range.max_sample_rate()).contains(&16_000) {
                     supports_16k = true;
                 }
             }
         }
+        // 拿不到 id 时退回设备名：宁可 UID 不唯一，也不能让这个设备从列表里消失。
+        let uid = device
+            .id()
+            .map(|id| id.to_string())
+            .unwrap_or_else(|_| name.clone());
         out.push(SinkInfo {
-            uid: name.clone(),
+            uid,
             name,
             channels,
             min_rate: if min_rate == u32::MAX { 0 } else { min_rate },
@@ -99,7 +113,10 @@ impl Sink {
 
         let mut matched: Option<(cpal::Device, String)> = None;
         for device in host.output_devices().context("枚举输出设备失败")? {
-            let name = device.name().unwrap_or_default();
+            let name = device
+                .description()
+                .map(|d| d.name().to_string())
+                .unwrap_or_default();
             if name.to_lowercase().contains(&name_substr.to_lowercase()) {
                 matched = Some((device, name));
                 break;
@@ -120,7 +137,7 @@ impl Sink {
         // 只接受原生支持目标采样率的配置；找不到就报错，不重采样。
         let mut chosen: Option<cpal::SupportedStreamConfigRange> = None;
         for range in device.supported_output_configs().context("读取声卡配置失败")? {
-            let (lo, hi) = (range.min_sample_rate().0, range.max_sample_rate().0);
+            let (lo, hi) = (range.min_sample_rate(), range.max_sample_rate());
             if rate >= lo && rate <= hi {
                 // 优先多声道（虚拟声卡常见 2ch），单声道也能用
                 let better = match &chosen {
@@ -138,7 +155,7 @@ impl Sink {
                  请在声卡设置里把采样率改成 {rate} Hz 后重试"
             )
         })?;
-        let supported = range.with_sample_rate(cpal::SampleRate(rate));
+        let supported = range.with_sample_rate(rate);
         let sample_format = supported.sample_format();
         let config = supported.config();
         let channels = config.channels;
@@ -266,6 +283,8 @@ where
     let channels = config.channels as usize;
     let mut scratch: Vec<i16> = Vec::new();
     let err_playout = playout.clone();
+    // cpal 0.18 起 `build_output_stream` 按值收 `StreamConfig`（它是 `Copy`）。
+    let config = *config;
     let stream = device
         .build_output_stream(
             config,
@@ -310,7 +329,6 @@ where
 // ---------------------------------------------------------------------------
 // 回环探针：验证音频真的进了虚拟声卡
 // ---------------------------------------------------------------------------
-
 /// 在同一个设备上开输入流，统计实际收到的电平。
 ///
 /// 存在的理由：程序自己报"我写了 N 帧"只是自说自话，虚拟声卡到底有没有把这些
@@ -334,7 +352,10 @@ impl Probe {
         let host = cpal::default_host();
         let mut matched: Option<(cpal::Device, String)> = None;
         for device in host.input_devices().context("枚举输入设备失败")? {
-            let name = device.name().unwrap_or_default();
+            let name = device
+                .description()
+                .map(|d| d.name().to_string())
+                .unwrap_or_default();
             if name.to_lowercase().contains(&name_substr.to_lowercase()) {
                 matched = Some((device, name));
                 break;
@@ -345,7 +366,7 @@ impl Probe {
 
         let mut chosen: Option<cpal::SupportedStreamConfigRange> = None;
         for range in device.supported_input_configs().context("读取输入配置失败")? {
-            let (lo, hi) = (range.min_sample_rate().0, range.max_sample_rate().0);
+            let (lo, hi) = (range.min_sample_rate(), range.max_sample_rate());
             if rate >= lo && rate <= hi {
                 let better = match &chosen {
                     None => true,
@@ -359,7 +380,7 @@ impl Probe {
         // 诊断用的探针允许回落到设备默认采样率：RMS 与采样率无关，
         // 硬要求 16 kHz 反而会让内置麦克风这类设备直接测不了。
         let supported = match chosen {
-            Some(range) => range.with_sample_rate(cpal::SampleRate(rate)),
+            Some(range) => range.with_sample_rate(rate),
             None => device
                 .default_input_config()
                 .with_context(|| format!("输入侧 \"{device_name}\" 既不支持 {rate} Hz，也读不到默认配置"))?,
@@ -367,7 +388,7 @@ impl Probe {
         let sample_format = supported.sample_format();
         let config = supported.config();
         let channels = config.channels;
-        let actual_rate = config.sample_rate.0;
+        let actual_rate = config.sample_rate;
 
         let shared = Arc::new(Mutex::new(ProbeShared { sum_sq: 0.0, frames: 0, peak: 0 }));
         let stream = match sample_format {
@@ -424,6 +445,7 @@ where
     T: cpal::Sample + cpal::SizedSample + 'static,
     f32: cpal::FromSample<T>,
 {
+    let config = *config;
     let stream = device
         .build_input_stream(
             config,
@@ -444,4 +466,19 @@ where
         )
         .context("创建输入流失败")?;
     Ok(stream)
+}
+
+#[cfg(test)]
+mod tests {
+    /// `cpal::Stream` 必须是 `Send` —— 这是 KI-004 能否关闭的判据。
+    ///
+    /// 0.15 里它是 `!Send`，所以声卡对象**只能**在创建它的线程里活一辈子，
+    /// `crates/app/src/session.rs` 的"声卡独占一条命名线程"是被迫的设计。
+    /// 0.17 起 macOS 的 `Stream` 拿了 `Send`，这里把它钉住：
+    /// 将来谁把 cpal 降回旧版本，这条会在编译期就炸，而不是等到有人想跨线程用才发现。
+    #[test]
+    fn cpal_stream_is_send() {
+        fn assert_send<T: Send>() {}
+        assert_send::<cpal::Stream>();
+    }
 }

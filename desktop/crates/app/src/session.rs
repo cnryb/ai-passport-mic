@@ -69,6 +69,9 @@ pub struct Telemetry {
     pub overflow_drops: u64,
     /// 长度不为 165 的块，通常意味着 MTU 不足被截断。
     pub bad_len_blocks: u32,
+    /// 设备报过 `LINK_SLOW`（连接间隔 > 40 ms）：这一场的欠载/漂移是链路假象，
+    /// 不能当音质结论。见 `docs/KNOWN_ISSUES.md` KI-005。
+    pub link_slow: bool,
 }
 
 #[derive(Debug)]
@@ -319,6 +322,8 @@ pub struct SessionSummary {
     pub underruns: u64,
     pub silent_frames: u64,
     pub frames_dropped: u64,
+    /// 延迟守卫一次性修剪掉的旧帧数（回调停摆造成的积压，不是链路问题）
+    pub frames_trimmed: u64,
     pub lock_misses: u64,
     pub ppm: f64,
     pub frames_inserted: u64,
@@ -332,6 +337,8 @@ pub struct SessionSummary {
     pub device_dropped: u16,
     pub bad_len_blocks: u32,
     pub overflow_drops: u64,
+    /// 设备报过 `LINK_SLOW`（连接间隔 > 40 ms）。这一场的数字不能进音质对比。
+    pub link_slow: bool,
 }
 
 enum Msg {
@@ -359,6 +366,7 @@ struct WorkerOutcome {
     underruns: u64,
     silent_frames: u64,
     frames_dropped: u64,
+    frames_trimmed: u64,
     lock_misses: u64,
     ppm: f64,
     frames_inserted: u64,
@@ -427,6 +435,7 @@ impl SessionHandle {
             underruns: o.underruns,
             silent_frames: o.silent_frames,
             frames_dropped: o.frames_dropped,
+            frames_trimmed: o.frames_trimmed,
             lock_misses: o.lock_misses,
             ppm: o.ppm,
             frames_inserted: o.frames_inserted,
@@ -598,7 +607,10 @@ fn worker(
         let st = s.stats();
         outcome.underruns = st.underruns;
         outcome.silent_frames = st.frames_silenced;
-        outcome.frames_dropped = st.frames_dropped;
+        // 报告里的"超容量丢弃"只算真·容量兜底；延迟守卫修剪的旧数据另记，
+        // 两者混在一起会让人以为链路出了问题。
+        outcome.frames_dropped = st.frames_overflow;
+        outcome.frames_trimmed = st.frames_trimmed;
         outcome.lock_misses = s.lock_misses();
         outcome.ppm = s.ppm();
         outcome.frames_inserted = st.frames_inserted;
