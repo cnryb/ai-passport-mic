@@ -139,12 +139,23 @@ export interface Telemetry {
   rms_dbfs: number | null
   peak_dbfs: number | null
   buffer_ms: number
+  /** 实测存量中位数（ms，整场累计）。延迟结论应当引它，而不是 target_ms。 */
+  fill_p50_ms: number | null
+  /** 实测存量 p95（ms）。延迟预算里"抖动缓冲"那一项用它。 */
+  fill_p95_ms: number | null
+  /** 当前实际生效的目标（基准 + 自适应余量）。 */
   target_ms: number
+  /** 用户选的基准目标；自适应不会改它。 */
+  base_target_ms: number
+  /** 自适应临时余量（ms）。非 0 说明最近发生过欠载。 */
+  boost_ms: number
   blocks: number
   lost_blocks: number
   seq_jumps: number
   device_dropped: number
   underruns: number
+  /** 其中上游断供造成的次数。与 underruns 分开：断供型调缓冲无效。 */
+  underruns_underfed: number
   silent_frames: number
   lock_misses: number
   bytes_written: number
@@ -166,6 +177,8 @@ export interface SessionSummary {
   wav_path: string | null
   bytes_written: number
   underruns: number
+  /** 其中上游断供（距上次推入 > 30 ms）造成的次数。 */
+  underruns_underfed: number
   silent_frames: number
   frames_dropped: number
   /** 延迟守卫丢弃的最旧帧数（回调停摆积压），与 frames_dropped 分开计。 */
@@ -174,8 +187,16 @@ export interface SessionSummary {
   ppm: number
   frames_inserted: number
   frames_skipped: number
+  /** 会话开始时用户选的缓冲基准（ms）。自适应不改它。 */
   target_start_ms: number
+  /** 会话结束时用户选的基准（运行中改过滑块就会变）。 */
   target_end_ms: number
+  /** 会话期间自适应最多临时加过多少余量（ms）。0 = 全程没被抬过。 */
+  target_boost_max_ms: number
+  /** 实测存量中位数（ms）。报告里的"抖动缓冲延迟"用它。 */
+  buffer_p50_ms: number | null
+  /** 实测存量 p95（ms）。 */
+  buffer_p95_ms: number | null
   glitch_events: number
   glitch_muted_ms: number
   lost_blocks: number
@@ -189,8 +210,7 @@ export interface SessionSummary {
 
 export interface SinkView {
   name: string
-  uid: string
-  channels: number
+  /** 支持范围只用于"不支持 16 kHz"的错误文案。 */
   min_rate: number
   max_rate: number
   supports_16k: boolean

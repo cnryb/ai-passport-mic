@@ -36,6 +36,93 @@ async fn run_smoke(core: Arc<AppCore>) {
     std::process::exit(code);
 }
 
+/// 无人值守**性能**基准：连上设备 → 开流 → 保持 N 秒 → 退出。
+///
+/// 为什么需要单独一个入口（2026-11-07）：G2 的 CPU/内存/帧率三项要在**推流稳态**
+/// 下测才有效，而 `scan` 入口扫完就退、界面又必须人点「开始」。
+/// 结果就是 §14.10 那种"人盯活动监视器抄数字"的测法——不可复现，也没法进 CI。
+///
+/// 这个入口让 `scripts/test-gui-perf.sh` 能确定性地把应用放进稳态：
+/// 电平表在画、音频在写声卡、5 Hz 遥测在跑，与用户实际使用时的负载一致。
+///
+/// 只读设备，不改任何状态；结束时不动设备（STOP 由会话收尾负责）。
+async fn run_perf(core: Arc<AppCore>, seconds: u64) {
+    let fail = |reason: &str| -> ! {
+        core.record(LogLevel::Error, "perf", format!("PERF_EXIT 1 reason={reason}"));
+        std::process::exit(1);
+    };
+
+    if core.detect_adapter().await.is_err() {
+        fail("adapter=unavailable");
+    }
+
+    // 自动连接优先；没记录就扫一遍再连。
+    let _ = core.auto_connect().await;
+    if core.snapshot().state.device().is_none() {
+        let _ = core.start_scan(6_000).await;
+        if let Some(id) = core
+            .devices()
+            .iter()
+            .find(|d| d.has_service)
+            .map(|d| d.id.clone())
+        {
+            let _ = core.connect(id).await;
+        }
+    }
+    if core.snapshot().state.device().is_none() {
+        fail("no_device");
+    }
+    core.record(LogLevel::Info, "perf", "PERF_READY connected");
+
+    // 声卡：用配置里的；没配就挑第一个原生支持 16 kHz 的（优先 BlackHole）。
+    if core.snapshot().settings.sink.is_none() {
+        let Ok(sinks) = core.list_sinks() else {
+            fail("sink_enum_failed");
+        };
+        let pick = sinks
+            .iter()
+            .find(|s| s.name.to_lowercase().contains("blackhole") && s.supports_16k)
+            .or_else(|| sinks.iter().find(|s| s.supports_16k));
+        match pick {
+            Some(s) => {
+                let _ = core.set_sink(s.name.clone());
+            }
+            None => fail("no_16k_sink"),
+        }
+    }
+
+    match core.start_stream(false).await {
+        Ok(id) => core.record(
+            LogLevel::Info,
+            "perf",
+            format!("PERF_STREAMING session={id} seconds={seconds}"),
+        ),
+        Err(e) => fail(&format!("start_stream={:?}", e.code)),
+    }
+
+    // 保持稳态。这段时间里外部脚本在采 CPU/内存。
+    tokio::time::sleep(std::time::Duration::from_secs(seconds)).await;
+
+    let summary = core.stop_stream().await;
+    match summary {
+        Ok(s) => core.record(
+            LogLevel::Info,
+            "perf",
+            format!(
+                "PERF_RESULT blocks={} underruns={} silent={} link_slow={}",
+                s.blocks, s.underruns, s.silent_frames, s.link_slow
+            ),
+        ),
+        Err(e) => core.record(
+            LogLevel::Warn,
+            "perf",
+            format!("PERF_STOP_ERR {:?}", e.code),
+        ),
+    }
+    core.record(LogLevel::Info, "perf", "PERF_EXIT 0");
+    std::process::exit(0);
+}
+
 /// 无人值守冒烟：连接 → USB 检测（必然复位设备）→ 自动重连。
 ///
 /// 验的是"点一次检测不会把 BLE 永久打断"这条回归：`firmware_probe` 命令里
@@ -98,22 +185,18 @@ async fn run_firmware_smoke(core: Arc<AppCore>) {
     std::process::exit(if reconnected { 0 } else { 1 });
 }
 
-/// 无人值守验收开关：`--smoke-scan` / `--smoke-firmware`，或
-/// `<数据目录>/smoke` 文件里写 `scan` / `firmware`。
+/// 无人值守验收入口：读 `<数据目录>/smoke`，内容为 `scan` / `firmware` / `perf:<秒>`。
 ///
-/// **为什么还要文件这一条**：`open ... --args --smoke-scan` 在本机试过三种写法，
-/// 进程 argv 里都没有参数（见 `docs/GUI.md` §14.5）；直接跑 `Contents/MacOS/apm-gui`
-/// 又会被 TCC 以"缺蓝牙用途声明"abort。哨兵文件是这台机器上唯一验证可行的入口。
+/// **只保留哨兵文件这一条路**，因为另外两条在本机都被实测证伪（`docs/GUI_IMPLEMENTATION_LOG.md` §14.5）：
+/// - 命令行 `--smoke-*`：经 LaunchServices（`open --args`）启动时 argv 里根本没有参数，
+///   三种写法都试过；双击启动同理；
+/// - 环境变量 `APM_GUI_SMOKE`：`open` 不继承 shell 环境，`launchctl setenv` 被系统拒绝；
+/// - 直接跑 `Contents/MacOS/apm-gui --smoke-scan`：被 TCC 以"缺蓝牙用途声明" abort。
+///
+/// 留着前两条只是把"试过不行"记在代码里，实际永远走不到。真要再加一条路，先有证据再说。
+///
 /// 读到就删：一次性，不会下次启动又跑一遍。
 fn smoke_mode() -> Option<String> {
-    if let Some(mode) = std::env::args().find_map(|a| a.strip_prefix("--smoke-").map(str::to_string))
-    {
-        return Some(mode);
-    }
-    if let Ok(mode) = std::env::var("APM_GUI_SMOKE") {
-        return Some(mode);
-    }
-
     let path = apm_app::settings::data_dir().join("smoke");
     let mode = std::fs::read_to_string(&path).ok()?.trim().to_string();
     let _ = std::fs::remove_file(&path);
@@ -156,6 +239,7 @@ fn main() {
             commands::firmware_probe,
             commands::firmware_flash,
             commands::diagnostics_text,
+            commands::report_fps,
             commands::log_path,
             commands::reveal_log,
         ])
@@ -186,17 +270,25 @@ fn main() {
 
             // 启动即检测适配器：失败会落到 no_adapter 并给出原因，不静默。
             //
-            // `APM_GUI_SMOKE=scan` 或 `--smoke-scan` 是无人值守验收开关：走**同一套**
-            // 检测 + 扫描代码路径，把结果写进诊断日志后退出。G0 的"扫到设备"就是靠它
-            // 拿到可复现的证据，而不是靠人眼看界面。
-            //
-            // 用命令行参数而不是只认环境变量，是因为 bundle 必须由 LaunchServices
-            // （`open -a ... --args`）启动才会以 App 自己的身份申请蓝牙权限；
-            // 而 `open` 不方便传环境变量。
+            // `<数据目录>/smoke` 里写 `scan` 是无人值守验收开关：走**同一套**检测 + 扫描
+            // 代码路径，把结果写进诊断日志后退出。G0 的"扫到设备"靠它拿到可复现的证据，
+            // 而不是靠人眼看界面。为什么用哨兵文件而不是命令行参数/环境变量：
+            // 见 `smoke_mode()` 的注释（三条路里另外两条都被实测证伪）。
             let boot_core = Arc::clone(&core);
             let smoke = smoke_mode();
             let smoke_scan = smoke.as_deref() == Some("scan");
             let smoke_firmware = smoke.as_deref() == Some("firmware");
+            // 写 `perf:<秒>`：连上设备、开流、保持 N 秒，供外部脚本采 CPU/内存。
+            // 见 `scripts/test-gui-perf.sh`。
+            let smoke_perf = smoke
+                .as_deref()
+                .and_then(|m| m.strip_prefix("perf"))
+                .map(|rest| {
+                    rest.trim_start_matches(':')
+                        .trim()
+                        .parse::<u64>()
+                        .unwrap_or(60)
+                });
             tauri::async_runtime::spawn(async move {
                 if smoke_scan {
                     run_smoke(boot_core).await;
@@ -204,6 +296,10 @@ fn main() {
                 }
                 if smoke_firmware {
                     run_firmware_smoke(boot_core).await;
+                    return;
+                }
+                if let Some(seconds) = smoke_perf {
+                    run_perf(boot_core, seconds).await;
                     return;
                 }
                 // 适配器就绪后自动连接上次的设备。失败（设备没上电、不在广播）

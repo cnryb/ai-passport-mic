@@ -55,7 +55,14 @@ export const api = {
   firmwareFlash: (port: string) => invoke<FlashReport>('firmware_flash', { port }),
 
   diagnosticsText: () => invoke<string>('diagnostics_text'),
-  logPath: () => invoke<string>('log_path'),
+  /**
+   * 上报一段实测帧率（5 s 窗口），写进诊断日志供 `test-gui-perf.sh` 汇总。
+   *
+   * 为什么走日志而不是返回值：帧率是**持续**指标，需要整场均值/最小值，
+   * 单次调用没有意义。日志是唯一天然的时序通道。
+   */
+  reportFps: (fps: number, windowMs: number) =>
+    invoke<void>('report_fps', { fps, windowMs }),  logPath: () => invoke<string>('log_path'),
   revealLog: () => invoke<void>('reveal_log'),
 }
 

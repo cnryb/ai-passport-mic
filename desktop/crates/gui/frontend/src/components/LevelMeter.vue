@@ -8,6 +8,7 @@
  * 只画，不算业务指标：rms/peak 都是后端给的，前端不做"我猜的丢块率"。
  */
 import { onMounted, onUnmounted, ref, watch } from 'vue'
+import { api } from '../lib/ipc'
 
 const props = defineProps<{
   rmsDbfs: number | null
@@ -170,6 +171,7 @@ function draw() {
 function loop(ts: number) {
   const dt = lastFrame ? (ts - lastFrame) / 1000 : 0.016
   lastFrame = ts
+  countFrame(ts)
 
   const target = props.rmsDbfs ?? FLOOR
   // 上升跟手，下降按 24 dB/s 释放，读数不会一跳一跳。
@@ -182,6 +184,48 @@ function loop(ts: number) {
 
   draw()
   raf = requestAnimationFrame(loop)
+}
+
+/**
+ * 帧率统计：每 `FPS_WINDOW_MS` 把这一段的实测帧率上报一次。
+ *
+ * 为什么挂在这里而不是另起一个 rAF 循环：**必须测真实渲染循环的帧率**。
+ * 另开一个循环会与渲染争同一个 vsync，测出的数没有验收意义。
+ *
+ * 上报路径：`reportFps` → `apm-app` 诊断日志（`source=fps`）→
+ * `scripts/test-gui-perf.sh` 从头到尾读出来算均值。
+ * G2 的"前端 ≥ 30 fps"此前一直是"未测（没有采集手段）"，这就是那个手段。
+ */
+const FPS_WINDOW_MS = 5_000
+let fpsWindowStart = 0
+let fpsFrames = 0
+
+function countFrame(ts: number) {
+  if (fpsWindowStart === 0) {
+    fpsWindowStart = ts
+    fpsFrames = 0
+    return
+  }
+  fpsFrames += 1
+  const elapsed = ts - fpsWindowStart
+  if (elapsed >= FPS_WINDOW_MS) {
+    const fps = (fpsFrames * 1000) / elapsed
+    // 只在**推流中**上报：待机时电平表基本不重绘，那个数字没有验收意义。
+    if (props.streaming) {
+      void reportFps(fps, elapsed)
+    }
+    fpsWindowStart = ts
+    fpsFrames = 0
+  }
+}
+
+/** 上报一次帧率。失败静默 —— 性能采样不该影响用户。 */
+async function reportFps(fps: number, windowMs: number) {
+  try {
+    await api.reportFps(fps, Math.round(windowMs))
+  } catch {
+    // 忽略：这是诊断通道，不影响功能
+  }
 }
 
 onMounted(() => {

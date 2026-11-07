@@ -12,6 +12,7 @@ use apm_app::{
     SessionSummary, SinkView,
 };
 use apm_app::state::ErrorCode;
+use apm_app::LogLevel;
 use serde::Serialize;
 use std::path::PathBuf;
 use tauri::{AppHandle, Emitter, Manager, State};
@@ -322,6 +323,31 @@ pub async fn firmware_flash(
 #[tauri::command]
 pub fn diagnostics_text(state: State<'_, GuiState>) -> String {
     state.core.diagnostics_text()
+}
+
+/// 前端上报一段实测帧率（5 s 窗口），写进诊断日志。
+///
+/// 存在的理由：G2 的"前端 ≥ 30 fps"此前一直是"未测（没有采集手段）"。
+/// WebView 内拿不到可无人值守读取的帧计数口，所以在真实渲染循环里数帧、
+/// 每 5 s 上报一次，由 `scripts/test-gui-perf.sh` 汇总。
+///
+/// 级别用 `Debug`：它在推流期间每 5 s 一条，不该污染界面的诊断页（那里显示
+/// warn/error 为主），但必须落盘可查。异常帧率（< 30）单独提成 `Warn` 留证据。
+#[tauri::command]
+pub fn report_fps(state: State<'_, GuiState>, fps: f64, window_ms: u32) {
+    if !fps.is_finite() || fps <= 0.0 {
+        return;
+    }
+    let level = if fps < 30.0 {
+        LogLevel::Warn
+    } else {
+        LogLevel::Debug
+    };
+    state.core.record(
+        level,
+        "fps",
+        format!("FPS {fps:.1} over {window_ms}ms"),
+    );
 }
 
 #[tauri::command]

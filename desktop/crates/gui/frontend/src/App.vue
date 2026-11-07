@@ -124,10 +124,20 @@ const metrics = computed(() => {
     { label: '跳变', value: String(t.seq_jumps) },
     { label: '设备丢弃', value: String(t.device_dropped) },
     { label: '欠载', value: String(t.underruns) },
+    { label: '其中断供', value: String(t.underruns_underfed) },
     { label: '静音帧', value: String(t.silent_frames) },
     { label: '锁定失败', value: String(t.lock_misses) },
     { label: '溢出', value: String(t.overflow_drops) },
     { label: '缓冲', value: `${t.buffer_ms.toFixed(0)} ms` },
+    // 延迟用**实测存量**，不用目标值：修剪守卫会把稳态存量留在目标之上，
+    // 拿目标当延迟会系统性低估（A4）。
+    {
+      label: '存量 p50/p95',
+      value:
+        t.fill_p50_ms == null || t.fill_p95_ms == null
+          ? '—'
+          : `${t.fill_p50_ms.toFixed(0)}/${t.fill_p95_ms.toFixed(0)} ms`,
+    },
     { label: '漂移', value: `${t.ppm >= 0 ? '+' : ''}${t.ppm.toFixed(0)} ppm` },
   ]
 })
@@ -479,7 +489,12 @@ onUnmounted(() => {
         {{ batteryText }}{{ batteryLow ? '，请充电' : '' }}
       </span>
       <span v-if="connectedDevice?.rssi != null" class="meta mono">{{ connectedDevice.rssi }} dBm</span>
-      <span v-if="streaming" class="meta mono">缓冲 {{ telemetry?.buffer_ms.toFixed(0) ?? '—' }} ms</span>
+      <span v-if="streaming" class="meta mono" title="实测存量中位数（不是滑块上的目标值）">
+        存量 {{ telemetry?.fill_p50_ms != null ? telemetry.fill_p50_ms.toFixed(0) : '—' }} ms
+      </span>
+      <span v-if="streaming && (telemetry?.boost_ms ?? 0) > 0" class="meta mono" title="欠载后自适应临时加上的余量">
+        +{{ telemetry?.boost_ms }} ms
+      </span>
       <span v-if="streaming" class="meta mono">{{ elapsedText }}</span>
       <span class="ver">v{{ version }}</span>
       <button :disabled="busy" @click="detect">重新检测</button>
