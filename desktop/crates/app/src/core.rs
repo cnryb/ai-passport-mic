@@ -1209,8 +1209,9 @@ impl AppCore {
     /// 设备按键 PRESS → 动作（M3 直连）。
     ///
     /// 动作按映射表走（每次现读，与 `fire_hook` 同一规则）：
-    /// - `ok`（保留动作 `ptt-toggle`）：没在推流就开麦，在推流就停麦——**开关语义**；
-    /// - `up` / `down`：配了普通键就点按注入，未绑定 = 不动作。
+    /// - 绑了 `ptt-toggle` 的那个键（**开麦键**，默认 `ok`，可换成 up/down）：
+    ///   没在推流就开麦，在推流就停麦——**开关语义**；
+    /// - 其余按键：配了普通键就点按注入，未绑定 = 不动作。
     ///
     /// 双击会连发两次 PRESS：切换窗口内的第二次会被 [`Self::toggle_ptt`]
     /// 的防抖吃掉（见该字段注释），窗口外的就是一次正常的开+关。
@@ -1229,7 +1230,7 @@ impl AppCore {
             self.record(LogLevel::Warn, "inject", err);
         }
         let Some(binding) = map.resolve(name).cloned() else {
-            return; // up / down 未绑定 = 不动作（ok 恒有默认 ptt-toggle）
+            return; // 未绑定 = 不动作（开麦键恒有一个，默认是 ok）
         };
         if binding.is_ptt() {
             match tokio::runtime::Handle::try_current() {
@@ -1248,8 +1249,8 @@ impl AppCore {
         }
     }
 
-    /// PTT 开关的唯一执行点：设备 OK 键走这里，语义与界面按钮完全一致
-    /// （同一条 `start_stream` / `stop_stream`，钩子照常触发）。
+    /// PTT 开关的唯一执行点：设备上的**开麦键**（默认 OK，可在映射里换成 up/down）走这里，
+    /// 语义与界面按钮完全一致（同一条 `start_stream` / `stop_stream`，钩子照常触发）。
     ///
     /// 防抖：**不再单独维护一个 `ptt_switching` 原子量。**
     /// 开麦的并发保护由 `Inner::stream_starting` 承担（它在锁内占位，覆盖

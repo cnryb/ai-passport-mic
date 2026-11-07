@@ -250,8 +250,8 @@ export interface BindingView {
   modifiers: string[]
   key: string
   repeat: number
+  /** 是开麦键（绑了 `ptt-toggle`）。整个映射里恰好一个。 */
   is_ptt: boolean
-  locked: boolean
 }
 
 export interface BindingInput {
@@ -265,6 +265,8 @@ export interface KeymapView {
   path: string
   schema: string
   bindings: BindingView[]
+  /** 当前的开麦键（绑 `ptt-toggle` 的事件名）。界面用它渲染下拉的当前值。 */
+  ptt_event: string | null
   error: string | null
 }
 
@@ -315,12 +317,13 @@ export const ERROR_HINTS: Record<ErrorCode, string> = {
  * 事件名 → 中文说明。只用于展示，键名/事件名本身以 config/README.md 为准。
  *
  * v3 起只有 3 个事件：一个键一个动作。按下触发，抬起/短按/双击/长按都不参与映射。
- * OK 是开关式（按一下开、再按一下关），所以不再像 v2 那样分"开/关"两行。
+ * 开麦键不固定在 OK 上：哪个键绑了 `ptt-toggle` 它就是开麦键，所以这里只写物理键名，
+ * 不写"某某是 PTT"——那由 `KeymapView.ptt_event` 决定。
  */
 export const EVENT_LABEL: Record<string, string> = {
   up: '上键',
   down: '下键',
-  ok: 'OK（PTT 开关）',
+  ok: 'OK 键',
   // 下面两行不是按键，是"采集状态钩子"：开麦/关麦的那一刻注入的快捷键（点按）。
   'capture.start': '开麦时 · 注入',
   'capture.stop': '关麦时 · 注入',
@@ -387,6 +390,4 @@ export const KEY_CHOICES = [
   'x',
   'y',
   'z',
-  'ptt-start',
-  'ptt-stop',
 ]

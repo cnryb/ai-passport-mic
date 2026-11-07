@@ -4,6 +4,10 @@
 //! schema 版本 → 事件名合法 → 键名/修饰键在支持列表内 → PTT 约束。
 //! 任一步失败整份拒绝，不做"部分生效"。
 //!
+//! **PTT 约束是一个计数，不是一个固定键**：整个映射里必须**恰好有一个**事件绑
+//! `ptt-toggle`（开麦键）。默认是 `ok`，但用户可以把它换成 `up` / `down`——
+//! 换走之后 `ok` 变回"未绑定 = 不动作"，不继承原来的注入键。
+//!
 //! **版本演进（每一步都往"更少更好记"走）：**
 //!
 //! | 版本 | 事件 | 说明 |
@@ -16,6 +20,10 @@
 //! v3 的语义变化：按键不再是"按下做什么、抬起做什么"，而是**一次按下 = 一次动作**。
 //! OK 键因此从"按住说话、松手停"变成"按一下开、再按一下关"（`ptt-toggle`）。
 //! 三个键、三个动作，用户不用记任何手势。
+//!
+//! v4 **没有**改事件表，只是加了可选的 `hooks` 表（采集状态钩子）。schema 版本号**不因
+//! "PTT 键可移位"而升**：那是把校验从"`ok` 必须是"**放宽**成"恰好一个事件是"，
+//! 所有既有 v4 文件在新规则下依然合法，升版本只会多出一张兼容表。
 //!
 //! **只向下兼容 v3**。v1 / v2 直接拒绝（理由见 [`Legacy`]）。
 //!
@@ -118,8 +126,10 @@ pub enum KeyMapError {
     UnknownModifier { event: String, modifier: String },
     UnknownKey { event: String, key: String },
     RepeatOutOfRange { event: String, value: i64 },
-    /// `ok` 被改成了非 `ptt-toggle`：麦克风就没有开关了。
+    /// 没有任何一个键绑 `ptt-toggle`：麦克风就没有开关了。
     PttToggleMissing,
+    /// 多个键同时绑了 `ptt-toggle`：开麦键只能有一个，否则同一按键会切换两遍。
+    PttToggleDuplicated { events: Vec<String> },
     /// 钩子里写了 `ptt-toggle`：开麦瞬间又 toggle，会自己关掉自己。
     HookCannotToggle { event: String },
 }
@@ -151,7 +161,12 @@ impl fmt::Display for KeyMapError {
             ),
             KeyMapError::PttToggleMissing => write!(
                 f,
-                "ok 必须是 {PTT_TOGGLE}：它是麦克风唯一的开关，改掉就没法停采集"
+                "没有任何键绑 {PTT_TOGGLE}：开麦键是麦克风唯一的开关，缺了就没法开始采集"
+            ),
+            KeyMapError::PttToggleDuplicated { events } => write!(
+                f,
+                "{} 同时绑了 {PTT_TOGGLE}：开麦键只能有一个，否则按一次会切换两遍",
+                events.join(" / ")
             ),
             KeyMapError::HookCannotToggle { event } => write!(
                 f,
@@ -203,7 +218,10 @@ pub struct KeyMap {
     hooks: BTreeMap<String, Binding>,
 }
 
-/// 默认只锁 OK 键的 PTT 开关；UP/DOWN 未绑定 = 不动作。
+/// 默认值：**只在没有任何键绑 `ptt-toggle` 时**补一个 `ok`（见 [`KeyMap::parse`]）。
+///
+/// 不能无条件补：`{"up":{"key":"ptt-toggle"}}` 这种"开麦键换成上键"的文件
+/// 会因此多出一个 PTT 键，按一次切换两遍。
 fn default_bindings() -> BTreeMap<String, Binding> {
     let mut map = BTreeMap::new();
     map.insert("ok".to_string(), Binding::new(vec![], PTT_TOGGLE, 1));
@@ -304,15 +322,27 @@ impl KeyMap {
             parsed.insert(event.clone(), parse_action(event, value, true)?);
         }
 
-        // 未出现的事件用默认值。
-        for (event, binding) in default_bindings() {
-            parsed.entry(event).or_insert(binding);
+        // 3. 未出现的事件用默认值——**但只在没有任何键绑 ptt-toggle 时才补默认的 ok**。
+        //    否则 `{"up":{"key":"ptt-toggle"}}`（开麦键换成上键）会被补出一个 ok，
+        //    变成两个 PTT 键，一次按键切换两遍。
+        let has_ptt = parsed.values().any(Binding::is_ptt);
+        if !has_ptt {
+            for (event, binding) in default_bindings() {
+                parsed.entry(event).or_insert(binding);
+            }
         }
 
-        // 4. PTT 约束：停止通道必须在。
-        match parsed.get("ok") {
-            Some(b) if b.key == PTT_TOGGLE => {}
-            _ => return Err(KeyMapError::PttToggleMissing),
+        // 4. PTT 约束：整个映射里**恰好一个**键是 ptt-toggle。
+        //    0 个 = 麦克风没有开关；多个 = 同一动作被触发两遍。
+        let ptt_events: Vec<String> = parsed
+            .iter()
+            .filter(|(_, b)| b.is_ptt())
+            .map(|(event, _)| event.clone())
+            .collect();
+        match ptt_events.len() {
+            1 => {}
+            0 => return Err(KeyMapError::PttToggleMissing),
+            _ => return Err(KeyMapError::PttToggleDuplicated { events: ptt_events }),
         }
 
         // 5. 采集状态钩子（可选）。键名必须落在 HOOK_EVENTS 里，动作不允许是 ptt-toggle。
@@ -335,6 +365,11 @@ impl KeyMap {
     /// 查动作。按键事件与采集钩子统一在这里查，调用方不用关心存在哪张表。
     pub fn resolve(&self, event: &str) -> Option<&Binding> {
         self.bindings.get(event).or_else(|| self.hooks.get(event))
+    }
+
+    /// 当前绑了 `ptt-toggle` 的那个键（开麦键）。解析成功时必然恰好一个。
+    pub fn ptt_event(&self) -> Option<&str> {
+        self.bindings.iter().find(|(_, b)| b.is_ptt()).map(|(event, _)| event.as_str())
     }
 
     /// 只看采集钩子（`capture.start` / `capture.stop`），按固定顺序。
@@ -419,6 +454,30 @@ mod tests {
         assert_eq!(map.resolve("ok").unwrap().key, PTT_TOGGLE);
         assert!(map.resolve("up").is_none(), "UP 默认不动作");
         assert!(map.resolve("down").is_none());
+        assert_eq!(map.ptt_event(), Some("ok"), "没指定开麦键时默认还是 OK");
+    }
+
+    /// 开麦键可以换成任意一个键，换过去之后不再给 `ok` 补默认（否则就有两个 PTT 键）。
+    #[test]
+    fn ptt_can_move_to_another_key() {
+        let text = r#"{"schema":"ai-passport-mic-keymap-4","bindings":{"up":{"key":"ptt-toggle"}}}"#;
+        let map = KeyMap::parse(text).expect("开麦键换成上键必须被接受");
+        assert_eq!(map.ptt_event(), Some("up"));
+        assert!(map.resolve("ok").is_none(), "OK 不该被补成第二个 PTT 键");
+    }
+
+    /// 多个键同时绑 `ptt-toggle` 必须拒绝：按一次会切换两遍。
+    #[test]
+    fn rejects_two_ptt_keys() {
+        let bad = r#"{"schema":"ai-passport-mic-keymap-4","bindings":{
+            "up":{"key":"ptt-toggle"},"ok":{"key":"ptt-toggle"}
+        }}"#;
+        match KeyMap::parse(bad) {
+            Err(KeyMapError::PttToggleDuplicated { events }) => {
+                assert_eq!(events, vec!["ok".to_string(), "up".to_string()]);
+            }
+            other => panic!("应当报 PttToggleDuplicated，实际 {other:?}"),
+        }
     }
 
     #[test]

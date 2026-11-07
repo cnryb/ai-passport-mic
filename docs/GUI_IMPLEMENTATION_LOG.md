@@ -912,6 +912,71 @@ thread 'core::tests::starts_idle_and_logs_boot' panicked:
 **教训**：测试读到用户机器的外部状态，是"昨天绿今天红"的常见来源。
 凡是 `load()` 磁盘/环境变量的构造函数，都该留一个可注入的入口。
 
+### 14.22 按键映射页重构：按角色分三块，开麦键可移位（2026-11-07）
+
+原来是一张 5 行平铺表（`up` / `down` / `ok` / `capture.start` / `capture.stop`），
+每行都是"修饰键 + 键名 + 连发次数"。问题在于**它按事件名平铺，而三行的性质完全不同**：
+
+| 行 | 触发源 | 实际做的事 |
+| --- | --- | --- |
+| `ok` | 设备按键 | 开关采集（`ptt-toggle`，被写死，整行只读） |
+| `up` / `down` | 设备按键 | 往前台应用注入一个快捷键 |
+| `capture.start` / `capture.stop` | **采集状态变化** | 开麦/关麦那一刻自动注入 |
+
+后两者被塞进同一个表格，但钩子**没有「按哪个键」这个输入**——它们不是按键，
+是时刻。混排的直接后果：`ok` 那行的连发次数下拉永远是禁用的噪音，
+而钩子行却长着和按键行一样的"修饰键 + 键名 + 连发"控件。
+
+#### 改了什么
+
+1. **界面按角色分三块**：麦克风 / 快捷键映射 / 采集时注入。
+   这是**纯展示分区**，落盘结构不变（还是同一个 `keymap-4` 文件，
+   `bindings` + `hooks`），所以导出、导入、round-trip 全都不受影响。
+2. **开麦键变成可选**：`up`/`down`/`ok` 三选一，被选中的那个绑 `ptt-toggle`。
+3. **协议约束从"固定键"改成"计数"**：`parsed.get("ok")` 必须是 `ptt-toggle`
+   → 统计全部事件里 `ptt-toggle` 的个数，**必须恰好 1**。
+   0 个报 `PttToggleMissing`，多个报新加的 `PttToggleDuplicated { events }`
+   （把冲突的事件名都列出来）。
+4. **`default_bindings()` 从无条件补 `ok` 改成有条件**：只在"没有任何键是 ptt-toggle"
+   时才补。否则 `{"up":{"key":"ptt-toggle"}}` 会解析出两个 PTT 键。
+5. **`save_bindings_at` 的兜底同样改成计数**：界面传 0 个 → 兜底回 `ok`；
+   传 2 个 → 交给 `KeyMap::parse` 整份拒绝（那是界面 bug，不该悄悄吞掉一个）。
+6. **`BindingView.locked` 删掉**，只留 `is_ptt`。`locked` 原本表达"这行不许改"，
+   而新界面用的是下拉框——"哪个是开麦键"本身就是下拉的当前值，不需要额外标记。
+   `KeymapView` 加了 `ptt_event: Option<String>` 供前端渲染下拉当前值。
+7. 清掉 `types.ts` 的 `KEY_CHOICES` 里两个死候选 `ptt-start` / `ptt-stop`：
+   v3 起已改名 `ptt-toggle`，`is_supported_key` 必然拒。
+
+#### 一个必须定死的语义：换键不迁移
+
+**两个方向都不搬迁**：
+- 开麦键从 OK 挪走后，OK 变回「未绑定 = 不动作」，不继承 up/down 原来的注入键；
+- 被选为开麦键的那个键，它原有的快捷键也被清掉——同一个键不能既开关采集又注入按键。
+
+让它继承会变成"习惯性按 OK 的人突然开始往前台应用敲键"，比什么都不做危险。
+`changePtt()` 里显式清空两边，并把被清掉的内容拼进一条即时提示（`pttNotice`）；
+测试 `ptt_can_move_to_up` 断言落盘结果。
+
+#### 为什么不升 schema
+
+这是**放宽**校验，不是改语义：所有既有 v4 文件（`ok = ptt-toggle`）在新规则下依然合法，
+`config/button-map.example.json` 一字未改。唯一代价是"PTT 挪到 up/down 的文件拿到旧版本上
+会被拒"——项目从未发布过，没有降级场景。升 v5 要付一张兼容表 + 三段版本分支，买不到东西。
+
+#### 给 hold 留的位置
+
+「开麦方式」下拉已在「麦克风」区占位，当前只有一个真实选项（toggle），
+hold 项置灰标"未实现"。hold 落地时要动的是：PC 端消费 RELEASE + 映射项加一个模式字段，
+那时才会真正碰到 schema 版本问题；这次先把概念位置占住，避免二次返工布局。
+
+#### 门禁
+
+`cargo test -p apm-protocol -p apm-app` 全绿（新增 5 个用例：
+`ptt_can_move_to_another_key`、`rejects_two_ptt_keys`、`ptt_can_move_to_up`、
+`rejects_two_ptt_keys_on_save`、`rejects_ptt_toggle_in_hook_on_save`）。
+`clippy --all-targets` 0 警告，`vue-tsc` 与 `npm run build` 通过。
+**真机未验**：开麦键换成 up 之后按 up 是否真的开关采集，需要接设备复测。
+
 ### 14.23 版面重构：把「固定带 + 唯一滚动区」立起来（2026-11-07）
 
 由头是"界面看着有点乱"。先渲染再判断，不做凭感觉的重排——做法是拿 release 构建产物

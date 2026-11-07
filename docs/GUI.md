@@ -118,7 +118,7 @@ btleplug 通知线程 ──decode──▶ 有界 mpsc(32 块) ──▶ sink w
 | `sink_missing` | 选定设备消失 | 重新枚举 + BlackHole 安装指引（**不静默安装**） |
 | `sink_rate_unsupported` | 声卡不支持 16 kHz | 显示声卡支持的采样率，给"不做重采样"的说明链接 |
 | `protocol_mismatch` | 块长 ≠ 165 / magic 不符；或 CTRL START 写入失败 | 提示固件与桌面端版本不一致 |
-| `keymap_invalid` | 映射校验失败：未知事件名/键名/修饰键，或 PTT 通道被删 | 指出具体哪一条不合法；`ok` 必须是 `ptt-toggle` |
+| `keymap_invalid` | 映射校验失败：未知事件名/键名/修饰键，或开麦键（绑 `ptt-toggle` 的键）不是恰好一个 | 指出具体哪一条不合法；开麦键缺失或重复都报错，重复时列出冲突的事件名 |
 | `flash_no_device` | 没有可烧写的串口：VID/PID 不符或不是 ESP32-C3 | 直连电脑、换 USB 口、确认已上电 |
 | `firmware_image_invalid` | 随包镜像缺失或解析失败 | 安装包不完整，重装 |
 | `flash_failed` | 烧写过程失败 | 重插重试；反复失败按住 BOOT 再插线 |
@@ -261,8 +261,8 @@ Tab（右上角切换，不引 vue-router，条件渲染即可）。顺序按使
 | `analyze_session` | `session_id` | `QualityReport` | 未测字段写 null，不猜 |
 | `analyze_session_json` | `session_id` | `String` | 与 `apmctl analyze --json` 同一份报告函数生成，前端只贴不拼 |
 | `reveal_path` | `path` | `()` | 在访达里选中该文件 |
-| `keymap_view` | — | `KeymapView`（裸值） | 3 按键 + 2 钩子，`ok` 标 `locked` |
-| `keymap_save` | `bindings` | `KeymapView` | 落盘前校验；`ok` 强制回填 `ptt-toggle` |
+| `keymap_view` | — | `KeymapView`（裸值） | 3 按键 + 2 钩子 + `ptt_event`（当前开麦键） |
+| `keymap_save` | `bindings` | `KeymapView` | 落盘前校验；开麦键恰好一个，缺了兜底回 `ok`，重复整份拒绝 |
 | `keymap_import` | `text` | `KeymapView` | 校验失败整份拒绝，不做部分生效 |
 | `keymap_reset` | — | `KeymapView` | 恢复默认 |
 | `keymap_text` | — | `String`（裸值） | 导出当前映射原文 |
@@ -430,7 +430,7 @@ GUI 必须放在同一个 workspace 里，否则 `link` / `sink` 的依赖会走
 > 改后的口径仍能发现"两个客户端统计口径不一致"这类真问题，只是不再验并发。
 | **G3b 回环自动验收** | 用 GUI 自身身份申请麦克风，恢复 `probe` / `--verify` | 推 440 Hz 正弦 → 回读 RMS > -30 dBFS；给出稳态延迟数值（这是延迟预算第一次可自动测） | **未实现**：`apmctl sink --verify` 仍在 CLI，GUI 侧没有回环入口 |
 | **G4 音质报告** | analyze 视图 + JSON 导出 | 报告字段与 `apmctl analyze --json` 逐字段一致；未测字段为 null | 代码完成：报告构造只有一份（`apm_app::report`），GUI 的 JSON 由后端同一函数生成；采样率提醒（`rate_note`）与下混标记已与 `apmctl` 对齐（2026-11-05） |
-| **G5 按键映射** | **3 个事件**（一个键一个动作）+ 2 个采集钩子（`keymap-4`）的编辑、导入导出、恢复默认 | 改成非默认键位 → 设备按键触发正确；OK 的 PTT 开关路径在任何配置下都可用 | 编辑/校验/落盘完成，`ok` 强制回填 `ptt-toggle`。**注入层（M3）已实现并在真机验过**（§14.13 钩子 + §14.14 设备按键直连 + §14.16 端到端注入 `a`/`b` PASS），"按键触发正确"这条已闭环。**唯一缺口是「按住不放 (hold)」**（固件侧 PRESS/RELEASE 齐，缺 PC 端消费）。事件表已于 2026-11-05 两次归并：15 → 6（§14.11）→ 3（§14.12），随后加钩子升到 v4 |
+| **G5 按键映射** | **按角色分三块**的编辑器（麦克风 / 快捷键映射 / 采集时注入），`keymap-4` 的导入导出与恢复默认 | 改成非默认键位 → 设备按键触发正确；开麦键换到任意键后 PTT 开关路径仍可用 | 编辑/校验/落盘完成；开麦键是**恰好一个**绑 `ptt-toggle` 的键（默认 `ok`，可换 `up`/`down`），缺了兜底回 `ok`、重复整份拒绝。**注入层（M3）已实现并在真机验过**（§14.13 钩子 + §14.14 设备按键直连 + §14.16 端到端注入 `a`/`b` PASS），"按键触发正确"这条已闭环。**唯一缺口是「按住不放 (hold)」**（固件侧 PRESS/RELEASE 齐，缺 PC 端消费；界面上已置灰占位）。事件表已于 2026-11-05 两次归并：15 → 6（§14.11）→ 3（§14.12），随后加钩子升到 v4 |
 | **G6 打包** | 签名、公证、版本号、崩溃日志脱敏 | 干净机器上从 dmg 装 → 首次启动授权 → 完成 G1~G3 验收 | **未做**：需要 Apple 开发者证书；当前只有 ad-hoc 签名 |
 | **M6 设备烧写页**（不在 G 系列，归 ROADMAP 的 M6） | 随包镜像信息、USB 设备枚举、读版本、分段写入、进度与结果 | 空片插上 → 一键写完 → 校验通过 → 能连上 BLE；重新烧写后配对与映射保留 | **真机已通（2026-11-06，`apmctl firmware probe/flash` 同一条内核路径）**：设备 `7552506-dirty` → `0.1.0`，三段写入 4.9 s、`FlashMd5` 一致、烧完自行复位回应用模式并恢复广播；烧写后配对仍在（NVS 未动）。**空片首烧未验**。约束见 §5 的「设备烧写」三条 |
 

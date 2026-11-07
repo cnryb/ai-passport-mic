@@ -4,6 +4,10 @@
 //! 3 个事件（一个键一个动作）、键名白名单、PTT 开关约束都在那里。
 //! 本模块只负责"文件在哪、坏文件怎么办、界面上怎么摆"。
 //!
+//! 界面按三种角色分区（`docs/GUI.md` G5）：**开麦键**（恰好一个，可在三键间移动）、
+//! **快捷键**（其余按键注入目标）、**采集时注入**（开麦/关麦那一刻的钩子）。
+//! 分区只是展示，落盘仍然是同一个 `keymap-4` 文件。
+//!
 //! 一条硬规则：解析失败就整份拒绝，不写盘、不做部分生效。
 //! 用户改坏一个键名时，宁可弹错误，也不能让 PTT 停下来不响应。
 
@@ -25,6 +29,9 @@ pub const EVENTS: [&str; 3] = keymap::EVENTS;
 pub const HOOKS: [&str; 2] = keymap::HOOK_EVENTS;
 
 /// 界面上出现的全部行（按键 + 钩子），顺序即展示顺序。
+///
+/// 这是**存盘与校验用的全集**，不是界面的分区顺序——界面按角色分成三块
+/// （开麦键 / 快捷键 / 采集时注入），分区在 `KeymapView::ptt_event` 与前端一起决定。
 pub fn all_events() -> [&'static str; 5] {
     [
         EVENTS[0], EVENTS[1], EVENTS[2], HOOKS[0], HOOKS[1],
@@ -41,10 +48,8 @@ pub struct BindingView {
     /// 目标键；空字符串表示"未绑定 = 不动作"。
     pub key: String,
     pub repeat: u8,
-    /// 是 PTT 的开关动作（`ptt-toggle`）。
+    /// 是开麦键（绑了 `ptt-toggle`）。整个映射里恰好一个。
     pub is_ptt: bool,
-    /// 不允许在界面上改（`ok` 必须是 `ptt-toggle`）。
-    pub locked: bool,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -52,6 +57,10 @@ pub struct KeymapView {
     pub path: String,
     pub schema: String,
     pub bindings: Vec<BindingView>,
+    /// 当前的开麦键（绑 `ptt-toggle` 的那个事件名）。界面用它渲染"开麦键"下拉的当前值。
+    ///
+    /// `None` 只可能出现在映射文件坏掉并回退默认的瞬间之外——解析成功时必然有值。
+    pub ptt_event: Option<String>,
     /// 读文件失败的原因（文件坏了要看得见），正常时为 null。
     pub error: Option<String>,
 }
@@ -85,7 +94,6 @@ fn view_of(map: &KeyMap, path: PathBuf, error: Option<String>) -> KeymapView {
                 key: binding.map(|b| b.key.clone()).unwrap_or_default(),
                 repeat: binding.map(|b| b.repeat).unwrap_or(1),
                 is_ptt: binding.map(|b| b.is_ptt()).unwrap_or(false),
-                locked: *event == "ok",
             }
         })
         .collect();
@@ -93,11 +101,12 @@ fn view_of(map: &KeyMap, path: PathBuf, error: Option<String>) -> KeymapView {
         path: path.display().to_string(),
         schema: SCHEMA.to_string(),
         bindings,
+        ptt_event: map.ptt_event().map(str::to_string),
         error,
     }
 }
 
-/// 只锁 OK 键 PTT 开关的默认映射（与 `keymap::default_bindings` 一致）。
+/// 开麦键在 `ok` 的默认映射（与 `keymap::default_bindings` 一致）。
 pub fn default_map() -> KeyMap {
     let minimal = format!("{{\"schema\":\"{SCHEMA}\",\"bindings\":{{}}}}");
     KeyMap::parse(&minimal).expect("默认映射必然合法")
@@ -135,14 +144,16 @@ fn write_map(dir: &std::path::Path, map: &KeyMap) -> Result<KeymapView, String> 
 /// 从界面提交的一组绑定生成完整映射。
 ///
 /// - 空 `key` 的事件不写进 JSON（schema 里"不出现"才表示不动作）；
-/// - `ok` 被清空或改成别的键时，强制填回 `ptt-toggle`，
-///   否则麦克风没有开关（`config/README.md` 的 PTT 约束）。
+/// - **开麦键恰好一个**：界面传了几个绑 `ptt-toggle` 的事件，就落几个；
+///   一个都没传时兜底回 `ok`（宁可复位成默认，也不能让麦克风失去开关）。
+///   传了两个由 `KeyMap::parse` 整份拒绝——那是界面 bug，不该悄悄吞掉一个。
 pub fn save_bindings_at(
     dir: &std::path::Path,
     bindings: &[BindingInput],
 ) -> Result<KeymapView, String> {
     let mut root_bindings = serde_json::Map::new();
     let mut root_hooks = serde_json::Map::new();
+    let mut ptt_count = 0usize;
     for input in bindings {
         // 钩子与按键是两类：按键进 `bindings`，采集钩子进 `hooks`。
         let is_hook = keymap::is_hook_event(&input.event);
@@ -152,6 +163,17 @@ pub fn save_bindings_at(
         if input.key.trim().is_empty() {
             continue;
         }
+        let key = input.key.trim().to_string();
+        if key == keymap::PTT_TOGGLE {
+            if is_hook {
+                return Err(format!(
+                    "{} 不能绑 {}：采集钩子在开麦/关麦时触发，再切换一次会自己把采集关掉",
+                    input.event,
+                    keymap::PTT_TOGGLE
+                ));
+            }
+            ptt_count += 1;
+        }
         let mut action = serde_json::Map::new();
         let mods: Vec<serde_json::Value> = input
             .modifiers
@@ -159,7 +181,7 @@ pub fn save_bindings_at(
             .map(|m| serde_json::Value::String(m.clone()))
             .collect();
         action.insert("modifiers".into(), serde_json::Value::Array(mods));
-        action.insert("key".into(), serde_json::Value::String(input.key.trim().to_string()));
+        action.insert("key".into(), serde_json::Value::String(key));
         if input.repeat != 1 {
             action.insert("repeat".into(), serde_json::Value::from(input.repeat));
         }
@@ -170,11 +192,14 @@ pub fn save_bindings_at(
         }
     }
 
-    // PTT 开关兜底：无论界面怎么传，都保证它在。
-    root_bindings.insert(
-        "ok".into(),
-        serde_json::json!({ "modifiers": [], "key": keymap::PTT_TOGGLE }),
-    );
+    // 开麦键兜底：一个都没有时回到默认的 OK，否则麦克风没有开关。
+    // 多于一个是界面 bug，交给下面的 `KeyMap::parse` 整份拒绝（它会报 PttToggleDuplicated）。
+    if ptt_count == 0 {
+        root_bindings.insert(
+            "ok".into(),
+            serde_json::json!({ "modifiers": [], "key": keymap::PTT_TOGGLE }),
+        );
+    }
 
     let mut root = serde_json::Map::new();
     root.insert("schema".into(), serde_json::json!(SCHEMA));
@@ -207,7 +232,7 @@ pub fn save_text(text: &str) -> Result<KeymapView, String> {
     save_text_at(&data_dir(), text)
 }
 
-/// 恢复默认：写回只含 PTT 两端的映射。
+/// 恢复默认：写回只含开麦键（OK）的映射。
 pub fn reset_at(dir: &std::path::Path) -> Result<KeymapView, String> {
     write_map(dir, &default_map())
 }
@@ -229,9 +254,40 @@ mod tests {
         let up = v.bindings.iter().find(|b| b.event == "up").unwrap();
         assert!(up.key.is_empty(), "未绑定要显示为空，不能显示成 esc");
         let ok = v.bindings.iter().find(|b| b.event == "ok").unwrap();
-        assert!(ok.locked);
         assert!(ok.is_ptt);
         assert_eq!(ok.key, keymap::PTT_TOGGLE);
+        assert_eq!(v.ptt_event.as_deref(), Some("ok"));
+    }
+
+    /// 开麦键换成上键后：视图正确指向 up，ok 变回"未绑定"，落盘里没有第二个 PTT 键。
+    #[test]
+    fn ptt_can_move_to_up() {
+        let dir = temp_dir("move-ptt");
+        let view = save_bindings_at(
+            &dir,
+            &[
+                BindingInput {
+                    event: "up".into(),
+                    modifiers: vec![],
+                    key: keymap::PTT_TOGGLE.into(),
+                    repeat: 1,
+                },
+                BindingInput {
+                    event: "ok".into(),
+                    modifiers: vec![],
+                    key: String::new(),
+                    repeat: 1,
+                },
+            ],
+        )
+        .expect("开麦键换成上键必须能存");
+        assert_eq!(view.ptt_event.as_deref(), Some("up"));
+        let ok = view.bindings.iter().find(|b| b.event == "ok").unwrap();
+        assert!(!ok.is_ptt);
+        assert!(ok.key.is_empty(), "换走之后 OK 必须变回不动作，不能继承原注入键");
+        let text = std::fs::read_to_string(dir.join("keymap.json")).unwrap();
+        assert_eq!(text.matches(keymap::PTT_TOGGLE).count(), 1, "{text}");
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     fn temp_dir(tag: &str) -> PathBuf {
@@ -291,8 +347,10 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    /// 界面一个 PTT 键都没传（例如把开麦键那栏留空、或全部解绑）时兜底回 OK，
+    /// 不能让麦克风失去开关。
     #[test]
-    fn ok_is_forced_back_to_ptt_toggle() {
+    fn missing_ptt_falls_back_to_ok() {
         let dir = temp_dir("ptt");
         let view = save_bindings_at(
             &dir,
@@ -305,8 +363,50 @@ mod tests {
         )
         .unwrap();
         let ok = view.bindings.iter().find(|b| b.event == "ok").unwrap();
-        assert_eq!(ok.key, keymap::PTT_TOGGLE, "PTT 开关被改掉了");
+        assert_eq!(ok.key, keymap::PTT_TOGGLE, "没有开麦键时必须兜底回 OK");
+        assert_eq!(view.ptt_event.as_deref(), Some("ok"));
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// 两个键同时绑 ptt-toggle 是界面 bug：整份拒绝，不悄悄吞掉一个。
+    #[test]
+    fn rejects_two_ptt_keys_on_save() {
+        let err = save_bindings_at(
+            &temp_dir("ptt-dup"),
+            &[
+                BindingInput {
+                    event: "up".into(),
+                    modifiers: vec![],
+                    key: keymap::PTT_TOGGLE.into(),
+                    repeat: 1,
+                },
+                BindingInput {
+                    event: "ok".into(),
+                    modifiers: vec![],
+                    key: keymap::PTT_TOGGLE.into(),
+                    repeat: 1,
+                },
+            ],
+        )
+        .unwrap_err();
+        assert!(err.contains("ok"), "{err}");
+        assert!(err.contains("up"), "{err}");
+    }
+
+    /// 钩子里绑 ptt-toggle 在保存入口就挡住，不指望用户看到协议层的错误码。
+    #[test]
+    fn rejects_ptt_toggle_in_hook_on_save() {
+        let err = save_bindings_at(
+            &temp_dir("hook-ptt"),
+            &[BindingInput {
+                event: "capture.start".into(),
+                modifiers: vec![],
+                key: keymap::PTT_TOGGLE.into(),
+                repeat: 1,
+            }],
+        )
+        .unwrap_err();
+        assert!(err.contains("capture.start"), "{err}");
     }
 
     #[test]

@@ -48,8 +48,6 @@
   --r-sm: 6px;
   --r-md: 10px;
   --r-pill: 999px;
-  /* 过渡别名：按键映射页还引用旧名 `--radius`，它迁到 `--r-md` 后即删。 */
-  --radius: var(--r-md);
 
   --mono: ui-monospace, SFMono-Regular, "SF Mono", Menlo, monospace;
 

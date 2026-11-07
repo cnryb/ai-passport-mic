@@ -185,8 +185,11 @@ STATUS 载荷：`state u8, flags u8, dropped u16-LE, sent u32-LE`。
 这是跨端协议，改它要动帧格式、UUID 与共享向量，收益只是省几帧通知——但 PC 端不再为它们
 提供映射项。
 
-副作用要知道：**双击 = 两次 `PRESS`**，在 OK 的 toggle 语义下等于"开了又关"。
-PC 端有切换窗口防抖（`apm_app::core` 的 `ptt_switching`）：开/关麦进行中（约几百毫秒）
+**开麦键不是固定键**：`up` / `down` / `ok` 里恰好一个绑保留动作 `ptt-toggle`，那个键
+就是开麦键（默认 `ok`）。这是 PC 端的映射约束，固件不感知——固件只上报"哪个键被按了"。
+
+副作用要知道：**双击 = 两次 `PRESS`**，在 toggle 语义下等于"开了又关"。
+PC 端有切换窗口防抖（`apm_app::core` 的 `stream_starting` 占位）：开/关麦进行中（约几百毫秒）
 再来的 PRESS 会被忽略，所以落在切换窗口内的双击只算一次动作；窗口外的双击仍是
 一次正常的开+关。三键方案的语义代价还在，真要双击语义得单独加事件。
 见 [`config/README.md`](../config/README.md)。
