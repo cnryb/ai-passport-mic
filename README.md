@@ -19,7 +19,7 @@
 > 以及**会议软件里当麦克风用**（虚拟声卡输出已实现并实测）。
 > 仍未验证：三键判定逐项核对（UP/DOWN/OK 各按一次看事件）、端到端声学延迟、
 > 长时间（>10 分钟）稳定性、
-> GUI 首次蓝牙授权、**GUI G1–G5 的每一条实测验收**（拔电源回 idle、10 min 0 欠载、
+> GUI 首次蓝牙授权、**GUI G1–G5 的每一条实测验收**（拔电源回 idle、10 min 欠载阈值、
 > GUI 与 CLI 同时录对拍），以及 **M6 的空片首烧与烧写中断后重插恢复**。
 > 电量计曾读到 `SOC=0 / VCELL=0`（KI-007），**根因已定位并解决**（CW2017 BATINFO 全 0，
 > 补写官方电池 profile 后 SOC 实测 77–79%）；界面上的百分比是设备真实读数。
@@ -52,7 +52,7 @@
 | [`device/`](device/) | 固件工作区（ESP-IDF 5.5.3 / ESP32-C3 / 8 MB Flash / 无 PSRAM） | M1 已实现并真机跑通（三键判定未逐项核对）；见 `device/README.md` |
 | [`desktop/`](desktop/) | PC 软件工作区（Rust workspace：protocol / link / sink / app / cli / gui） | 协议 + 链路 + 声卡输出 + CLI + GUI（G1–G5 + M6 设备烧写页）已实现；G3b/G6 未做，见 `desktop/README.md` |
 | [`config/`](config/) | 按键映射样例、字段说明、跨端协议向量 | 样例 + 说明 + `protocol-vectors.json`（由 C 实现导出） |
-| [`docs/`](docs/) | [产品](docs/PRODUCT.md)、[架构](docs/ARCHITECTURE.md)、[环境](docs/ENVIRONMENT.md)、[音质](docs/SOUND_QUALITY.md)、[路线图](docs/ROADMAP.md)、[参考实现](docs/REFERENCES.md)、[GUI 方案](docs/GUI.md)、[已知问题](docs/KNOWN_ISSUES.md)、[待办清单](docs/TODO.md)、[待决策事项](docs/DECISIONS_NEEDED.md) | 已就绪；未解决项看 `TODO.md`，证据链看 `KNOWN_ISSUES.md`，需要人拍板的看 `DECISIONS_NEEDED.md` |
+| [`docs/`](docs/) | [产品](docs/PRODUCT.md)、[架构](docs/ARCHITECTURE.md)、[环境](docs/ENVIRONMENT.md)、[音质](docs/SOUND_QUALITY.md)、[路线图](docs/ROADMAP.md)、[参考实现](docs/REFERENCES.md)、[GUI 方案](docs/GUI.md)、[GUI 实施记录](docs/GUI_IMPLEMENTATION_LOG.md)、[已知问题](docs/KNOWN_ISSUES.md)、[待办清单](docs/TODO.md) | 已就绪；未解决项看 `TODO.md`，证据链看 `KNOWN_ISSUES.md` |
 | [`scripts/`](scripts/) | 环境体检、IDF 激活、基线自检、协议单测与向量导出、固件构建、GUI 打包、macOS app-bundle 运行器 | 可用 |
 
 ## 环境

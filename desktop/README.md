@@ -206,7 +206,7 @@ min / 中位 / p95 / max 与抖动（`--json` 出 `ai-passport-mic-ping-report-1
 
 | 项 | 状态 |
 | --- | --- |
-| `cargo test`（workspace，`default-members` 不含 gui） | **通过（2026-11-07 复核）**：**130 passed / 0 failed / 2 ignored**，7 个有测试的目标——`apm-app` 69（+2 ignored）、`apm-protocol` 37、`c-vectors` 5、`glitch_repro` 3、`apm-link` 5、`apm-sink` 7、`apmctl` 4；无 warning |
+| `cargo test`（workspace，`default-members` 不含 gui） | **通过（2026-11-07 复核）**：**143 passed / 0 failed / 2 ignored**，7 个有测试的目标——`apm-app` 82（+2 ignored）、`apm-protocol` 37、`c-vectors` 5、`glitch_repro` 3、`apm-link` 5、`apm-sink` 7、`apmctl` 4；无 warning。**已知债**：`cargo fmt --all --check` 尚未通过（2026-11-07 实测 105 处 diff / 10 个文件），因此**没有**进 `verify.sh` |
 | `cargo build`（workspace） | 通过 |
 | `apmctl selftest` | 通过（同一份向量，**17 项**）。注意：它**不需要蓝牙**，直接跑 `./desktop/target/release/apmctl selftest` 即可；走 `apmctl-macos.sh` 反而会因为 cwd 变成 `/` 而找不到向量文件 |
 | `apmctl analyze` | 用合成 WAV 与真机 WAV 都跑过 |
@@ -225,7 +225,7 @@ min / 中位 / p95 / max 与抖动（`--json` 出 `ai-passport-mic-ping-report-1
 | GUI 构建（`scripts/build-gui.sh`） | **通过**：ad-hoc 签名有效，Info.plist 内含 `NSBluetooth*` / `NSMicrophone*`，bundle id `com.cnryb.ai-passport-mic`。体积要按 profile 看：**debug 37.81 MiB**（2026-11-06 接入 espflash/serialport 后的数字），**release 12.2 MiB**（`strip = true` + `lto = "thin"`）。别把 debug 的体积当发布体积 |
 | GUI 启动（`open` 启动、无 TCC abort） | **通过**：进程存活、webview 已加载、诊断日志有启动记录 |
 | GUI 适配器探测超时保护 | **通过**：授权未点/蓝牙关闭时 6 s 落到 `no_adapter` 并给出可执行提示，不再无限挂起 |
-| GUI 首次蓝牙授权 + 扫描到设备 | **通过（2026-11-05 真机，人在场那一轮）**：授权弹窗出现并手动点「允许」，6 s 扫到 7 个设备、目标在列、RSSI 与 `apmctl scan` 都是 −50 dBm。明细见 `../docs/GUI.md` §14.7。**无人值守那一轮**（§14.2 启动冒烟）停在等授权（屏幕锁屏），那是环境限制，不是功能缺陷 |
+| GUI 首次蓝牙授权 + 扫描到设备 | **通过（2026-11-05 真机，人在场那一轮）**：授权弹窗出现并手动点「允许」，6 s 扫到 7 个设备、目标在列、RSSI 与 `apmctl scan` 都是 −50 dBm。明细见 `../docs/GUI_IMPLEMENTATION_LOG.md` §14.7。**无人值守那一轮**（§14.2 启动冒烟）停在等授权（屏幕锁屏），那是环境限制，不是功能缺陷 |
 | 固件镜像解析（`cargo test -p apm-app firmware`） | **通过**：8 项——版本解析、短镜像/错 magic 拒绝、分区表守卫（含 nvs 被挪位必须拒绝）、MD5 向量、**用真实 `merged.bin` 验偏移常量** |
 | 随包固件进 `.app` | **通过**：`Contents/Resources/firmware/ai-passport-mic-merged.bin` 存在且 `build-gui.sh` 校验字节数（当前产物 720448 字节；数字随固件改动而变，脚本只断言存在且非空） |
 | 串口枚举去重 | **通过（2026-11-06 真机）**：macOS 上同一台设备原本被列成 `/dev/cu.usbmodem11301` 与 `/dev/tty.usbmodem11301` 两条，修完只剩一条 |

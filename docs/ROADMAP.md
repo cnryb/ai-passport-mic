@@ -23,7 +23,7 @@
 - [x] PTT 启停：`apmctl record` 走 CTRL START/STOP 强制采集，不依赖 OK 键。
 - [ ] **三键判定核对**：UP / DOWN / OK 各按一次，`apmctl status` 能打出对应的
       `按键: <键>.press`；换板要改 `main/board.h` 后重新标定 150 / 447 / 1900 mV 三个窗口。
-      现有旁证只有 OK（`GUI.md` §14.14），UP / DOWN 没有任何真机证据。
+      现有旁证只有 OK（`GUI_IMPLEMENTATION_LOG.md` §14.14），UP / DOWN 没有任何真机证据。
 - [ ] **15 个手势码对拍（低优先）**：3 键 × press / click / double / long / release。
       这是协议层证据，不是产品验收——PC 从 `keymap-3` 起只消费 `PRESS`，另外四码只记日志。
 - [x] **延迟测量手段（链路）**：控制帧 `0x04 PING` / `0x83 PONG` 两端落地，
@@ -84,7 +84,7 @@ Tauri 2 + Vue 3，分期 G0–G6，各期单独验收。完整方案见 [`GUI.md
 会话 WAV 默认不落盘、按键映射进首发但不卡前期、不做托盘常驻。
 
 本轮门禁（2026-11-05，历史记录）：`./scripts/verify.sh` 全绿、`cargo test` 93 passed / 1 ignored、
-`./scripts/build-gui.sh` 通过（`.app` 30.29 MiB）。明细见 `GUI.md` §14.2；
+`./scripts/build-gui.sh` 通过（`.app` 30.29 MiB）。明细见 `GUI_IMPLEMENTATION_LOG.md` §14.2；
 它证明的是"能编译、单测过、打得出来"，**不等于** G1–G5 已验收。
 
 **2026-11-07 复核**：`./scripts/verify.sh` 七项全 PASS（协议 C 44 passed）；
@@ -103,7 +103,7 @@ Tauri 2 + Vue 3，分期 G0–G6，各期单独验收。完整方案见 [`GUI.md
 - [x] G0 骨架 + macOS 蓝牙/麦克风权限（后续所有阶段的前置门槛）。
       `.app` 构建、ad-hoc 签名、Info.plist 用途声明、无 TCC abort 启动均已验证；
       **2026-11-05 真机 PASS**：授权弹窗正常、6 s 扫到 7 个设备（目标在列）、
-      RSSI 与 `apmctl scan` 都是 −50 dBm。明细见 [`GUI.md`](GUI.md) §14.7。
+      RSSI 与 `apmctl scan` 都是 −50 dBm。明细见 [`GUI_IMPLEMENTATION_LOG.md`](GUI_IMPLEMENTATION_LOG.md) §14.7。
 - [x] G1 连接 + 状态机 + 结构化事件日志（代码）。加了 5 s 静默 + `is_connected` 判活，
       断链后探一次适配器决定回 `idle` 还是 `no_adapter`。
       **2026-11-05 真机部分 PASS**：`ready` 与 `ready → stopping → idle` 已验；
@@ -117,8 +117,12 @@ Tauri 2 + Vue 3，分期 G0–G6，各期单独验收。完整方案见 [`GUI.md
       + canvas 电平表 + 缓冲滑块（运行中改目标，取下一批回调生效）。
       **2026-11-05 真机 15.6 min**：46949 块 / 939 s = 50.00 块/秒、丢块 0、设备侧丢弃 0、
       缓冲 77–90 ms、漂移 +94 ppm；**欠载 13 次（≈84 ms）**，与 CLI 同量级（KI-006），
-      "0 欠载"不通过。CPU 20.7% / 内存 166.9 MB（按 App 全家桶算）也超 G2 口径，
-      明细见 [`GUI.md`](GUI.md) §14.10。
+      CPU 20.7% / 内存 166.9 MB（按 App 全家桶算）也超 G2 口径，明细见
+      [`GUI_IMPLEMENTATION_LOG.md`](GUI_IMPLEMENTATION_LOG.md) §14.10。
+      **2026-11-07 更新**：KI-006 根因查明为 macOS CoreBluetooth 攒批交付，
+      欠载判据改为阈值型（≤5 次/分、单次 ≤50 ms、占比 ≤1%）。按新口径，
+      CLI 侧 600 s 真机已 PASS（1.0 次/分）；**GUI 侧未按新口径重跑**，
+      CPU/内存/前端 fps 三项仍超。
 - [x] G3 声卡选择 + 会话 WAV（代码）：枚举带采样率范围，不支持 16 kHz 的设备提前拒绝；
       WAV 增量写、收尾回填头；GUI 与 CLI 共用同一份会话统计。
       **GUI 与 `apmctl record` 的同时录对拍没做**。
@@ -150,7 +154,7 @@ Tauri 2 + Vue 3，分期 G0–G6，各期单独验收。完整方案见 [`GUI.md
       不存在"按下去没松开"的状态（单测覆盖 `ptt-toggle` 不可注入）。
 - [x] **权限引导**：映射页内置辅助功能权限横幅（`inject_permission` 轮询 +
       `open_accessibility_settings` 一键跳系统设置），授权后横幅自动消失。
-- [x] **按键事件直连（2026-11-05，`GUI.md` §14.14）**：设备 PRESS → 动作。
+- [x] **按键事件直连（2026-11-05，`GUI_IMPLEMENTATION_LOG.md` §14.14）**：设备 PRESS → 动作。
       `ok` 走 `toggle_ptt`（开关采集，与界面按钮同一条 `start_stream` / `stop_stream`）；
       `up` / `down` 走 `inject_in_background` 点按注入。切换窗口内防抖（`ptt_switching`）。
 - [ ] **真机端到端验收**：辅助功能授权后，设备 UP / DOWN 真的落到前台应用、OK 真的开关采集。
