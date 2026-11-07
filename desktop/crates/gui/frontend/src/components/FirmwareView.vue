@@ -6,6 +6,11 @@
  * - 烧写会让设备**复位**进下载模式，正在推流时别点；
  * - 不擦 NVS：配对与按键映射保留，重新烧写不等于恢复出厂；
  * - 校验不通过就不显示"完成"——这里不会把失败包装成"完成，但有警告"。
+ *
+ * ## 版面（2026-11-07 重做）
+ * 版本号原先出现三遍（顶栏 / 卡头 / 卡内格），现在只在卡头出现一次：它是这张卡的主语。
+ * 长路径改成「按钮 + 省略号 + tooltip」，行为说明折叠进 details——这页是低频操作，
+ * 不该用四段说明占满整屏。
  */
 import { computed, onMounted, onUnmounted, ref } from 'vue'
 import { api, asAppError, onFirmwareProgress } from '../lib/ipc'
@@ -104,6 +109,16 @@ async function flash(port: string) {
   }
 }
 
+async function revealImage() {
+  const path = status.value?.image?.path
+  if (!path) return
+  try {
+    await api.revealPath(path)
+  } catch (e) {
+    error.value = asAppError(e)
+  }
+}
+
 onMounted(async () => {
   await refresh()
   unlisten = await onFirmwareProgress((percent) => {
@@ -120,23 +135,26 @@ onUnmounted(() => unlisten?.())
       <div class="card-head">
         <h2>随包固件</h2>
         <span class="spacer" />
-        <span v-if="status?.image" class="meta mono">{{ status.image.version }}</span>
+        <span v-if="status?.image" class="tag">{{ status.image.version }}</span>
       </div>
 
       <template v-if="status?.image">
         <div class="grid">
           <div class="cell">
-            <span>版本</span><b>{{ status.image.version }}</b>
-          </div>
-          <div class="cell">
             <span>大小</span><b>{{ Math.round(status.image.bytes / 1024) }} KB</b>
           </div>
           <div class="cell">
             <span>app 分区 MD5</span>
-            <b class="mono">{{ status.image.md5.slice(0, 16) }}…</b>
+            <b class="mono" :title="status.image.md5">{{ status.image.md5.slice(0, 16) }}…</b>
+          </div>
+          <div class="cell">
+            <span>写入范围</span><b>3 段 · 保留 NVS</b>
           </div>
         </div>
-        <p class="path mono">{{ status.image.path }}</p>
+        <div class="path-row">
+          <button class="sm ghost" @click="revealImage">在访达中显示</button>
+          <span class="path mono" :title="status.image.path">{{ status.image.path }}</span>
+        </div>
       </template>
       <p v-else-if="status?.image_error" class="err">{{ status.image_error }}</p>
       <p v-else class="dim">正在读取安装包内的固件…</p>
@@ -144,9 +162,9 @@ onUnmounted(() => unlisten?.())
 
     <section class="card">
       <div class="card-head">
-        <h2>设备</h2>
+        <h2>USB 设备</h2>
         <span class="spacer" />
-        <button :disabled="busy !== null" @click="refresh">重新扫描</button>
+        <button class="sm" :disabled="busy !== null" @click="refresh">重新扫描</button>
       </div>
 
       <p v-if="!status?.ports.length" class="dim">
@@ -154,37 +172,35 @@ onUnmounted(() => unlisten?.())
         设备是空片也能识别——靠的是芯片内置的 USB，不是固件。
       </p>
 
-      <ul v-else class="ports">
-        <li v-for="p in status?.ports" :key="p.path">
+      <div v-else class="ports">
+        <div v-for="p in status?.ports" :key="p.path" class="port">
           <div class="port-main">
-            <span class="mono">{{ p.path }}</span>
+            <b class="mono">{{ p.path }}</b>
             <span class="tag" :data-tone="stateTone(p.path)">{{ stateLabel(p.path) }}</span>
           </div>
 
-          <div class="actions">
-            <template v-if="busy?.port === p.path && busy.kind === 'flash'">
-              <div class="bar"><i :style="{ width: `${progress}%` }" /></div>
-              <span class="meta mono">{{ progress }}%</span>
-            </template>
-            <template v-else>
-              <button :disabled="busy !== null" @click="probe(p.path)">
-                {{ busy?.port === p.path ? '检测中…' : '检测' }}
-              </button>
-              <button
-                class="primary"
-                :disabled="!canFlash || probes[p.path]?.state === 'up_to_date'"
-                @click="flash(p.path)"
-              >
-                {{ probes[p.path]?.first_flash ? '写入固件' : '重写固件' }}
-              </button>
-            </template>
+          <div v-if="busy?.port === p.path && busy.kind === 'flash'" class="progress">
+            <div class="bar"><i :style="{ width: `${progress}%` }" /></div>
+            <span class="mono">{{ progress }}%</span>
           </div>
-        </li>
-      </ul>
+          <div v-else class="actions">
+            <button class="sm" :disabled="busy !== null" @click="probe(p.path)">
+              {{ busy?.port === p.path ? '检测中…' : '检测版本' }}
+            </button>
+            <button
+              class="sm primary"
+              :disabled="!canFlash || probes[p.path]?.state === 'up_to_date'"
+              @click="flash(p.path)"
+            >
+              {{ probes[p.path]?.first_flash ? '写入固件' : '重写固件' }}
+            </button>
+          </div>
+        </div>
+      </div>
     </section>
 
     <div v-if="error" class="result err-box">
-      <strong>{{ error.code }}</strong>
+      <strong class="mono">{{ error.code }}</strong>
       <span>{{ error.detail }}</span>
       <p class="dim">{{ errorHint }}</p>
     </div>
@@ -200,10 +216,13 @@ onUnmounted(() => unlisten?.())
       <p class="dim">设备已复位，接下来去「实时」页扫描并连接。</p>
     </div>
 
-    <p class="foot dim">
-      烧写会复位设备，正在推流时不要点。只写 bootloader / 分区表 / app 三段，
-      <b>不碰 NVS</b>——配对信息和按键映射会保留。中途拔线不会刷坏设备：重新插上再点一次即可。
-    </p>
+    <details class="fold">
+      <summary>烧写行为说明</summary>
+      <p class="dim">
+        烧写会复位设备，正在推流时不要点。只写 bootloader / 分区表 / app 三段，
+        <b>不碰 NVS</b>——配对信息和按键映射会保留。中途拔线不会刷坏设备：重新插上再点一次即可。
+      </p>
+    </details>
   </div>
 </template>
 
@@ -211,67 +230,48 @@ onUnmounted(() => unlisten?.())
 .fw {
   display: flex;
   flex-direction: column;
-  gap: 10px;
-  padding: 12px 16px 16px;
-  overflow-y: auto;
+  gap: var(--gap-card);
   min-height: 0;
+  flex: 1 1 auto;
 }
 
 .card {
-  background: var(--panel);
-  border: 1px solid var(--line);
-  border-radius: var(--radius);
-  padding: 10px 12px;
   display: flex;
   flex-direction: column;
-  gap: 8px;
+  gap: var(--s2);
+  flex: 0 0 auto;
 }
 
 .card-head {
   display: flex;
   align-items: center;
-  gap: 8px;
-}
-
-.card-head h2 {
-  font-size: 12.5px;
-  font-weight: 600;
-  margin: 0;
-}
-
-.spacer {
-  flex: 1;
-}
-
-.meta {
-  font-size: 11px;
-  color: var(--muted);
+  gap: var(--s2);
 }
 
 .grid {
   display: grid;
   grid-template-columns: repeat(3, minmax(0, 1fr));
-  gap: 6px;
+  gap: var(--s2);
 }
 
 .cell {
   background: var(--panel-2);
   border: 1px solid var(--line-soft);
-  border-radius: 8px;
+  border-radius: var(--r-sm);
   padding: 7px 9px;
   display: flex;
   flex-direction: column;
-  gap: 2px;
+  gap: 1px;
   min-width: 0;
 }
 
 .cell span {
-  font-size: 10.5px;
+  font-size: var(--fs-10);
   color: var(--dim);
 }
 
 .cell b {
-  font-size: 12.5px;
+  font-size: var(--fs-12);
   font-weight: 600;
   font-variant-numeric: tabular-nums;
   white-space: nowrap;
@@ -279,29 +279,36 @@ onUnmounted(() => unlisten?.())
   text-overflow: ellipsis;
 }
 
+.path-row {
+  display: flex;
+  align-items: center;
+  gap: var(--s2);
+  min-width: 0;
+}
+
 .path {
-  font-size: 10.5px;
+  font-size: var(--fs-10);
   color: var(--dim);
-  margin: 0;
-  word-break: break-all;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  min-width: 0;
+  user-select: text;
 }
 
 .ports {
-  list-style: none;
-  margin: 0;
-  padding: 0;
   display: flex;
   flex-direction: column;
   gap: 6px;
 }
 
-.ports li {
+.port {
   display: flex;
   align-items: center;
   gap: 10px;
   background: var(--panel-2);
   border: 1px solid var(--line-soft);
-  border-radius: 8px;
+  border-radius: var(--r-sm);
   padding: 8px 10px;
 }
 
@@ -310,43 +317,53 @@ onUnmounted(() => unlisten?.())
   flex-direction: column;
   gap: 2px;
   min-width: 0;
-  flex: 1;
+  flex: 1 1 auto;
 }
 
-.port-main .mono {
-  font-size: 11.5px;
+.port-main b {
+  font-size: var(--fs-11);
+  font-weight: 500;
   white-space: nowrap;
   overflow: hidden;
   text-overflow: ellipsis;
 }
 
 .tag {
-  font-size: 11px;
+  align-self: flex-start;
 }
 
 .tag[data-tone='ok'] {
   color: var(--ok);
+  border-color: #3ddc9740;
+  background: #3ddc9710;
 }
 
 .tag[data-tone='warn'] {
   color: var(--warn);
-}
-
-.tag[data-tone='dim'] {
-  color: var(--dim);
+  border-color: #ffb02040;
+  background: #ffb02010;
 }
 
 .actions {
   display: flex;
   align-items: center;
-  gap: 8px;
+  gap: 6px;
   flex-shrink: 0;
 }
 
+.progress {
+  display: flex;
+  align-items: center;
+  gap: var(--s2);
+  flex-shrink: 0;
+  font-size: var(--fs-11);
+  color: var(--muted);
+}
+
 .bar {
-  width: 120px;
-  height: 6px;
-  background: var(--panel);
+  width: 110px;
+  height: 5px;
+  background: var(--bg);
   border: 1px solid var(--line);
   border-radius: 3px;
   overflow: hidden;
@@ -360,23 +377,22 @@ onUnmounted(() => unlisten?.())
 }
 
 .result {
-  border-radius: 8px;
+  border-radius: var(--r-sm);
   border: 1px solid var(--line);
   border-left-width: 3px;
   padding: 8px 10px;
   display: flex;
   flex-direction: column;
   gap: 3px;
-  font-size: 12px;
+  font-size: var(--fs-11);
 }
 
 .result strong {
-  font-size: 12.5px;
+  font-size: var(--fs-12);
 }
 
 .result p {
   margin: 0;
-  font-size: 11px;
   line-height: 1.6;
 }
 
@@ -392,40 +408,54 @@ onUnmounted(() => unlisten?.())
 
 .err {
   color: var(--err);
-  font-size: 11.5px;
+  font-size: var(--fs-11);
   margin: 0;
 }
 
 .dim {
   color: var(--muted);
-  font-size: 11.5px;
+  font-size: var(--fs-11);
   line-height: 1.65;
   margin: 0;
 }
 
-.foot {
-  font-size: 11px;
-  line-height: 1.7;
-  margin: 2px 0 0;
-}
-
-.foot b {
+.dim b {
   color: var(--text);
   font-weight: 600;
 }
 
-.mono {
-  font-family: var(--mono);
+.fold > summary {
+  cursor: pointer;
+  font-size: var(--fs-10);
+  letter-spacing: 0.05em;
+  text-transform: uppercase;
+  color: var(--dim);
+  list-style: none;
+  display: flex;
+  align-items: center;
+  gap: 6px;
 }
 
-button.primary {
-  background: var(--accent);
-  border-color: var(--accent);
-  color: #fff;
+.fold > summary::-webkit-details-marker {
+  display: none;
 }
 
-button.primary:hover:not(:disabled) {
-  background: #5c98ff;
-  border-color: #5c98ff;
+.fold > summary::before {
+  content: '';
+  width: 6px;
+  height: 6px;
+  border-right: 1.4px solid var(--dim);
+  border-bottom: 1.4px solid var(--dim);
+  transform: rotate(-45deg);
+  transition: transform 0.15s;
+}
+
+.fold[open] > summary::before {
+  transform: rotate(45deg);
+}
+
+.fold[open] > p {
+  margin: 6px 0 0;
+  max-width: 760px;
 }
 </style>

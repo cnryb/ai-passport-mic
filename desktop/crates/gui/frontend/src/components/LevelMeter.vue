@@ -6,24 +6,26 @@
  * 每帧改 30 个 DOM 节点的宽高会明显掉帧（`docs/GUI.md` §5）。
  *
  * 只画，不算业务指标：rms/peak 都是后端给的，前端不做"我猜的丢块率"。
+ *
+ * **这里不画「缓冲」**：那是 sink 的 `buffer_ms`，在「延迟」指标组里已有同口径数字。
+ * 同一屏出现两次同一个数（且与 `fill_p50` 长得像、口径不同）会让人没法判断
+ * 哪个才是延迟——2026-11-07 版面重做时删掉了画布里的那一份。
  */
-import { onMounted, onUnmounted, ref, watch } from 'vue'
+import { onMounted, onUnmounted, watch, ref } from 'vue'
 import { api } from '../lib/ipc'
 
 const props = defineProps<{
   rmsDbfs: number | null
   peakDbfs: number | null
   streaming: boolean
-  bufferMs: number
 }>()
 
 const FLOOR = -60
 const CEIL = 0
 const HISTORY = 50 // 5 Hz × 10 s
-const BAR_W = 26
 
 const canvas = ref<HTMLCanvasElement | null>(null)
-const history = ref<number[]>([])
+const history: number[] = []
 let raf = 0
 let level = FLOOR // 当前显示值（带释放）
 let peakHold = FLOOR
@@ -34,15 +36,12 @@ function dbToRatio(db: number): number {
   return (clamped - FLOOR) / (CEIL - FLOOR)
 }
 
-function pushSample() {
-  const v = props.rmsDbfs ?? FLOOR
-  history.value.push(v)
-  if (history.value.length > HISTORY) history.value.shift()
-}
-
 watch(
   () => props.rmsDbfs,
-  () => pushSample(),
+  () => {
+    history.push(props.rmsDbfs ?? FLOOR)
+    if (history.length > HISTORY) history.shift()
+  },
 )
 
 function draw() {
@@ -61,111 +60,119 @@ function draw() {
   ctx.setTransform(dpr, 0, 0, dpr, 0, 0)
   ctx.clearRect(0, 0, w, h)
 
-  const histH = 42
-  const meterH = h - histH - 8
-  const meterX = 40
-  const top = 6
+  // 版面：竖条在左，读数在它右边，曲线横贯底部。
+  const padTop = 14
+  const histH = 48
+  const meterH = Math.max(40, h - histH - padTop - 16)
+  const meterX = 46
+  const barW = 30
+  // 曲线画到整宽，不跟读数区抢空间。
+  const gridRight = w - 14
 
-  // --- 刻度 ---
+  // --- 刻度与网格 ---
   ctx.font = '10px ui-monospace, SFMono-Regular, Menlo, monospace'
   ctx.textAlign = 'right'
   ctx.textBaseline = 'middle'
   for (const db of [-6, -12, -18, -24, -36, -48, -60]) {
-    const y = top + meterH * (1 - dbToRatio(db))
-    ctx.fillStyle = '#5c6678'
-    ctx.fillText(String(db), meterX - 6, y)
-    ctx.strokeStyle = '#1c232d'
+    const y = padTop + meterH * (1 - dbToRatio(db))
+    ctx.fillStyle = '#4e586a'
+    ctx.fillText(String(db), meterX - 8, y)
+    ctx.strokeStyle = '#1e2530'
     ctx.lineWidth = 1
     ctx.beginPath()
     ctx.moveTo(meterX, y + 0.5)
-    ctx.lineTo(w - 2, y + 0.5)
+    ctx.lineTo(gridRight, y + 0.5)
     ctx.stroke()
   }
 
-  // --- 竖向条形 ---
-  const r = dbToRatio(level)
-  const barTop = top + meterH * (1 - r)
-  const grad = ctx.createLinearGradient(0, top + meterH, 0, top)
-  grad.addColorStop(0, '#3ddc97')
-  grad.addColorStop(0.7, '#3ddc97')
-  grad.addColorStop(0.86, '#ffb020')
-  grad.addColorStop(1, '#ff5f5f')
+  // --- 竖条 ---
+  ctx.fillStyle = '#111721'
+  ctx.fillRect(meterX, padTop, barW, meterH)
 
-  ctx.fillStyle = '#10151c'
-  ctx.fillRect(meterX, top, BAR_W, meterH)
-  ctx.fillStyle = grad
-  ctx.fillRect(meterX, barTop, BAR_W, top + meterH - barTop)
+  if (props.streaming) {
+    const r = dbToRatio(level)
+    const barTop = padTop + meterH * (1 - r)
+    const grad = ctx.createLinearGradient(0, padTop + meterH, 0, padTop)
+    grad.addColorStop(0, '#2fbf85')
+    grad.addColorStop(0.62, '#3ddc97')
+    grad.addColorStop(0.84, '#ffb020')
+    grad.addColorStop(1, '#ff5f5f')
+    ctx.fillStyle = grad
+    ctx.fillRect(meterX, barTop, barW, padTop + meterH - barTop)
 
-  // 峰值保持线
-  if (peakHold > FLOOR + 0.5) {
-    const py = top + meterH * (1 - dbToRatio(peakHold))
-    ctx.fillStyle = peakHold > -1 ? '#ff5f5f' : '#e7ecf4'
-    ctx.fillRect(meterX - 3, Math.max(top, py - 1), BAR_W + 6, 2)
+    // 峰值保持线
+    if (peakHold > FLOOR + 0.5) {
+      const py = padTop + meterH * (1 - dbToRatio(peakHold))
+      ctx.fillStyle = peakHold > -1 ? '#ff7b7b' : '#e8edf5'
+      ctx.fillRect(meterX - 4, Math.max(padTop, py - 1), barW + 8, 2)
+    }
   }
 
-  // --- 参数区（右侧文字）---
-  const textX = meterX + BAR_W + 16
+  // --- 读数 ---
+  const tx = meterX + barW + 26
   ctx.textAlign = 'left'
   ctx.textBaseline = 'alphabetic'
-  ctx.fillStyle = '#e7ecf4'
-  ctx.font = '600 20px -apple-system, "SF Pro Text", sans-serif'
-  ctx.fillText(props.rmsDbfs === null ? '—' : props.rmsDbfs.toFixed(1), textX, top + 26)
-  ctx.font = '10px ui-monospace, Menlo, monospace'
-  ctx.fillStyle = '#8b95a7'
-  ctx.fillText('dBFS RMS', textX + 2, top + 42)
 
-  ctx.font = '600 13px -apple-system, "SF Pro Text", sans-serif'
-  ctx.fillStyle = '#e7ecf4'
+  ctx.fillStyle = props.streaming ? '#e8edf5' : '#37404f'
+  ctx.font = '600 26px -apple-system, "SF Pro Text", sans-serif'
+  ctx.fillText(
+    props.rmsDbfs === null ? '—' : props.rmsDbfs.toFixed(1),
+    tx,
+    padTop + 26,
+  )
+
+  ctx.font = '10px ui-monospace, Menlo, monospace'
+  ctx.fillStyle = '#5b6577'
+  ctx.fillText('dBFS · RMS', tx + 2, padTop + 42)
+
+  ctx.font = '600 13px -apple-system, "PingFang SC", sans-serif'
+  ctx.fillStyle = props.streaming ? '#c9d2e0' : '#37404f'
   ctx.fillText(
     props.peakDbfs === null ? '峰值 —' : `峰值 ${props.peakDbfs.toFixed(1)}`,
-    textX + 92,
-    top + 26,
+    tx,
+    padTop + 68,
   )
-  ctx.font = '10px ui-monospace, Menlo, monospace'
-  ctx.fillStyle = '#8b95a7'
-  ctx.fillText(`缓冲 ${props.bufferMs.toFixed(0)} ms`, textX + 94, top + 42)
 
   if (!props.streaming) {
-    ctx.fillStyle = '#5c6678'
+    ctx.fillStyle = '#4e586a'
     ctx.font = '12px -apple-system, "PingFang SC", sans-serif'
-    ctx.fillText('未推流：没有数据可画，也不编造读数', textX, top + 70)
+    ctx.fillText('未推流：没有数据可画，也不编造读数', tx, padTop + 96)
   }
 
   // --- 最近 10 秒曲线 ---
-  const histTop = top + meterH + 12
-  const histBottom = h - 2
-  const histLeft = meterX
-  ctx.strokeStyle = '#1c232d'
+  const histTop = padTop + meterH + 22
+  const histBottom = h - 6
+  ctx.strokeStyle = '#1e2530'
   ctx.beginPath()
-  ctx.moveTo(histLeft, histBottom + 0.5)
-  ctx.lineTo(w - 2, histBottom + 0.5)
+  ctx.moveTo(meterX, histBottom + 0.5)
+  ctx.lineTo(gridRight, histBottom + 0.5)
   ctx.stroke()
 
-  if (history.value.length > 1) {
-    const step = (w - histLeft - 2) / (HISTORY - 1)
+  if (history.length > 1) {
+    const step = (gridRight - meterX - 4) / (HISTORY - 1)
     ctx.beginPath()
-    history.value.forEach((v, i) => {
-      const x = histLeft + i * step
+    history.forEach((v, i) => {
+      const x = meterX + i * step
       const y = histBottom - (histBottom - histTop) * dbToRatio(v)
       if (i === 0) ctx.moveTo(x, y)
       else ctx.lineTo(x, y)
     })
     ctx.strokeStyle = '#4c8dff'
-    ctx.lineWidth = 1.5
+    ctx.lineWidth = 1.6
     ctx.stroke()
 
     // 面积填充：让"这一段有没有声"一眼可见
-    ctx.lineTo(histLeft + (history.value.length - 1) * step, histBottom)
-    ctx.lineTo(histLeft, histBottom)
+    ctx.lineTo(meterX + (history.length - 1) * step, histBottom)
+    ctx.lineTo(meterX, histBottom)
     ctx.closePath()
-    ctx.fillStyle = '#4c8dff1a'
+    ctx.fillStyle = '#4c8dff18'
     ctx.fill()
   }
 
-  ctx.fillStyle = '#5c6678'
+  ctx.fillStyle = '#4e586a'
   ctx.font = '10px -apple-system, "PingFang SC", sans-serif'
   ctx.textAlign = 'right'
-  ctx.fillText('最近 10 秒', w - 4, histTop + 8)
+  ctx.fillText('最近 10 秒', gridRight, histTop + 8)
 }
 
 function loop(ts: number) {
@@ -228,12 +235,18 @@ async function reportFps(fps: number, windowMs: number) {
   }
 }
 
+const ro = new ResizeObserver(draw)
+
 onMounted(() => {
   raf = requestAnimationFrame(loop)
+  // 容器尺寸变化（窗口缩放、设备卡展开把电平表压小）时立刻重绘一次，
+  // 而不是等下一帧 rAF。rAF 在窗口不可见时会被节流，那时尺寸可能已经变了。
+  ro.observe(canvas.value as HTMLCanvasElement)
 })
 
 onUnmounted(() => {
   cancelAnimationFrame(raf)
+  ro.disconnect()
 })
 </script>
 
@@ -242,12 +255,11 @@ onUnmounted(() => {
 </template>
 
 <style scoped>
+/* 尺寸与背景由父级的 .meter-wrap 决定（边框、圆角、底色都在那边），
+   这里只负责铺满，避免两层卡片套出双边框。 */
 .meter {
-  width: 100%;
-  height: 156px;
   display: block;
-  background: var(--panel-2);
-  border: 1px solid var(--line-soft);
-  border-radius: 8px;
+  width: 100%;
+  height: 100%;
 }
 </style>

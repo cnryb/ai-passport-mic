@@ -4,6 +4,12 @@
  * 这里只负责展示，不重新计算任何指标。
  *
  * 一句话口径必须一直在：软件分析通过 ≠ 真机链路/会议软件通过。
+ *
+ * ## 为什么只有一张表（2026-11-07 重做）
+ * 旧版把同一组数字讲了三遍：verdict 文本里一遍（`rms=-22.10 … clipping=0.000%`）、
+ * 8 格指标卡一遍、判定表一遍。三处口径相同但格式不同，读的人要自己判断"哪个算数"。
+ * 现在合成一张表：指标 / 实测 / 判定 / 阈值同列，verdict 只留结论句与两个概览事实。
+ * 表格本身就是 `report.checks` 的渲染，**没有新增计算**。
  */
 import type { QualityReport } from '../lib/types'
 
@@ -21,70 +27,78 @@ const emit = defineEmits<{
   (e: 'reveal'): void
 }>()
 
-function fmt(v: number | null, digits = 2, unit = ''): string {
-  return v === null ? '—' : `${v.toFixed(digits)}${unit}`
+function fmtDuration(s: number): string {
+  return `${s.toFixed(2)} s`
+}
+
+/** 判定表里没有、但概览行需要的事实（都在 report 里，不重算）。 */
+function formatFacts(report: QualityReport): string {
+  const ch = `${report.sample_rate} Hz · ${report.channels} ch${report.downmixed ? ' · 已下混' : ''}`
+  return ch
 }
 </script>
 
 <template>
   <div class="quality">
     <div class="toolbar">
-      <span v-if="sessionId" class="meta mono">会话 {{ sessionId }}</span>
-      <span v-else class="meta">还没有会话</span>
+      <div class="session">
+        <b>{{ sessionId ?? '还没有会话' }}</b>
+        <span v-if="wavPath" class="mono" :title="wavPath">{{ wavPath }}</span>
+        <span v-else class="dim">
+          {{ sessionId ? '这次会话没有录音（开始推流时未勾选「保存 WAV」），无法出报告' : '连上设备、开始一次推流后，这里会出现报告' }}
+        </span>
+      </div>
       <span class="spacer" />
-      <button :disabled="!wavPath || loading" @click="emit('analyze')">
+      <button class="sm" :disabled="!wavPath || loading" @click="emit('analyze')">
         {{ loading ? '分析中…' : '重新分析' }}
       </button>
-      <button :disabled="!report" @click="emit('copy-json')">复制 JSON</button>
-      <button :disabled="!wavPath" @click="emit('reveal')">在访达中显示</button>
+      <button class="sm" :disabled="!report" @click="emit('copy-json')">复制 JSON</button>
+      <button class="sm ghost" :disabled="!wavPath" @click="emit('reveal')">在访达中显示</button>
     </div>
-
-    <p v-if="wavPath" class="path mono">{{ wavPath }}</p>
-    <p v-else class="path dim">
-      {{ sessionId ? '这次会话没有录音（开始推流时未勾选「同时保存 WAV」），无法出报告。' : '连上设备、开始一次推流后，这里会出现报告。' }}
-    </p>
 
     <p v-if="error" class="err">{{ error }}</p>
 
     <template v-if="report">
       <div class="verdict" :data-pass="report.pass">
-        <strong>{{ report.pass ? '软件分析通过' : '软件分析不通过' }}</strong>
-        <span class="mono">{{ report.verdict }}</span>
-        <p class="dim">
-          这只说明文件本身没有明显削波 / 直流偏置 / 电平异常。真机链路、虚拟声卡与会议软件
-          端到端是否通过，必须另外测；听感也没有自动化结论。
-        </p>
+        <div class="v-main">
+          <b>{{ report.pass ? '软件分析通过' : '软件分析不通过' }}</b>
+          <span>文件本身{{ report.pass ? '无明显' : '存在' }}削波 / 直流偏置 / 电平异常</span>
+        </div>
+        <div class="v-facts mono">
+          <span>{{ fmtDuration(report.duration_s) }}</span>
+          <span>{{ formatFacts(report) }}</span>
+        </div>
       </div>
 
-      <div class="grid">
-        <div class="cell"><span class="dim">时长</span><b>{{ fmt(report.duration_s, 2, ' s') }}</b></div>
-        <div class="cell"><span class="dim">RMS</span><b>{{ fmt(report.rms_dbfs, 2, ' dBFS') }}</b></div>
-        <div class="cell"><span class="dim">峰值</span><b>{{ fmt(report.peak_dbfs, 2, ' dBFS') }}</b></div>
-        <div class="cell"><span class="dim">削波</span><b>{{ fmt(report.clipping_pct, 3, ' %') }}</b></div>
-        <div class="cell"><span class="dim">直流偏置</span><b>{{ fmt(report.dc_offset_pct, 3, ' %') }}</b></div>
-        <div class="cell"><span class="dim">过零率</span><b>{{ fmt(report.zero_crossing_pct, 2, ' %') }}</b></div>
-        <div class="cell"><span class="dim">毛刺</span><b>{{ report.glitch_events }} 段 / {{ fmt(report.glitch_ms, 0, ' ms') }}</b></div>
-        <div class="cell"><span class="dim">格式</span><b>{{ report.sample_rate }} Hz · {{ report.channels }} ch{{ report.downmixed ? ' · 已下混' : '' }}</b></div>
-      </div>
-
-      <p v-if="report.rate_note" class="note">{{ report.rate_note }}</p>
+      <p v-if="report.rate_note" class="warn-note">{{ report.rate_note }}</p>
 
       <table class="checks">
+        <colgroup>
+          <col style="width: 30%" />
+          <col style="width: 26%" />
+          <col style="width: 14%" />
+          <col style="width: 30%" />
+        </colgroup>
         <thead>
           <tr><th>指标</th><th>实测</th><th>判定</th><th>阈值</th></tr>
         </thead>
         <tbody>
           <tr v-for="c in report.checks" :key="c.name" :data-ok="c.ok">
             <td>{{ c.name }}</td>
-            <td class="mono">{{ c.actual }}</td>
+            <td class="num">{{ c.actual }}</td>
             <td class="mark">{{ c.ok ? 'OK' : 'FAIL' }}</td>
-            <td class="dim">{{ c.expected }}</td>
+            <td class="th">{{ c.expected }}</td>
           </tr>
         </tbody>
       </table>
 
-      <p class="dim foot">
-        链路丢块、启动延迟与稳态端到端延迟不在 WAV 里，报告里写 null 而不是 0 —— 未测就是未测。
+      <p class="note">
+        这只说明文件本身合格。<b>链路丢块、启动延迟与稳态端到端延迟不在 WAV 里</b>，
+        报告里写 null 而不是 0 —— 未测就是未测。真机链路、虚拟声卡与会议软件的端到端结论必须另外测；
+        听感也没有自动化结论。
+        <template v-if="report.verdict">
+          <br /><span class="dim mono">{{ report.verdict }}</span>
+        </template>
       </p>
     </template>
   </div>
@@ -94,144 +108,138 @@ function fmt(v: number | null, digits = 2, unit = ''): string {
 .quality {
   display: flex;
   flex-direction: column;
-  gap: 8px;
+  gap: var(--gap-card);
   min-height: 0;
-  height: 100%;
-  overflow: auto;
-  scrollbar-width: thin;
 }
 
 .toolbar {
   display: flex;
   align-items: center;
-  gap: 8px;
+  gap: var(--s2);
+  flex-wrap: wrap;
 }
 
-.spacer {
-  flex: 1;
+.session {
+  display: flex;
+  flex-direction: column;
+  gap: 1px;
+  min-width: 0;
+  flex: 1 1 auto;
 }
 
-.meta {
-  color: var(--muted);
-  font-size: 11.5px;
+.session b {
+  font-family: var(--mono);
+  font-size: var(--fs-12);
+  font-weight: 500;
 }
 
-.path {
-  margin: 0;
+.session span {
+  font-size: var(--fs-10);
   color: var(--dim);
-  font-size: 11.5px;
-  overflow-wrap: anywhere;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
   user-select: text;
 }
 
 .err {
   margin: 0;
   color: var(--err);
-  font-size: 12px;
+  font-size: var(--fs-12);
+  user-select: text;
 }
 
-.note {
+.warn-note {
   margin: 0;
   color: var(--warn);
-  font-size: 11.5px;
+  font-size: var(--fs-11);
   line-height: 1.6;
 }
 
 .verdict {
-  border: 1px solid var(--line);
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  border: 1px solid var(--line-soft);
   border-left: 3px solid var(--warn);
   background: var(--panel);
-  border-radius: 8px;
+  border-radius: var(--r-sm);
   padding: 9px 12px;
-  display: flex;
-  flex-direction: column;
-  gap: 3px;
 }
 
 .verdict[data-pass='true'] {
   border-left-color: var(--ok);
 }
 
-.verdict strong {
-  font-size: 12.5px;
-}
-
-.verdict .mono {
-  color: var(--dim);
-  font-size: 11px;
-}
-
-.verdict p {
-  margin: 2px 0 0;
-  font-size: 11.5px;
-  line-height: 1.65;
-}
-
-.grid {
-  display: grid;
-  grid-template-columns: repeat(4, minmax(0, 1fr));
-  gap: 6px;
-}
-
-.cell {
-  background: var(--panel);
-  border: 1px solid var(--line-soft);
-  border-radius: 8px;
-  padding: 7px 9px;
+.v-main {
   display: flex;
   flex-direction: column;
-  gap: 2px;
+  gap: 1px;
   min-width: 0;
 }
 
-.cell span {
-  font-size: 10.5px;
+.v-main b {
+  font-size: var(--fs-13);
+  font-weight: 600;
 }
 
-.cell b {
-  font-size: 12.5px;
-  font-weight: 600;
-  font-variant-numeric: tabular-nums;
+.v-main span {
+  font-size: var(--fs-11);
+  color: var(--dim);
+}
+
+.v-facts {
+  margin-left: auto;
+  display: flex;
+  gap: 14px;
+  font-size: var(--fs-11);
+  color: var(--muted);
   white-space: nowrap;
-  overflow: hidden;
-  text-overflow: ellipsis;
 }
 
 .checks {
   width: 100%;
   border-collapse: collapse;
-  font-size: 12px;
+  font-size: var(--fs-12);
 }
 
 .checks th {
   text-align: left;
   color: var(--dim);
   font-weight: 500;
-  font-size: 10.5px;
-  letter-spacing: 0.04em;
+  font-size: var(--fs-10);
+  letter-spacing: 0.05em;
   text-transform: uppercase;
-  padding: 4px 8px;
-  border-bottom: 1px solid var(--line-soft);
+  padding: 5px 8px;
+  border-bottom: 1px solid var(--line);
 }
 
 .checks td {
-  padding: 5px 8px;
-  border-bottom: 1px solid #1a212b;
+  padding: 6px 8px;
+  border-bottom: 1px solid var(--line-soft);
 }
 
-.checks .mark {
+.checks td.num {
   font-family: var(--mono);
-  font-size: 11px;
+  font-variant-numeric: tabular-nums;
+}
+
+.checks td.mark {
+  font-family: var(--mono);
+  font-size: var(--fs-11);
+  font-weight: 600;
   color: var(--ok);
 }
 
-.checks tr[data-ok='false'] .mark {
+.checks tr[data-ok='false'] td.mark {
   color: var(--err);
 }
 
-.foot {
-  font-size: 11px;
-  line-height: 1.6;
-  margin: 0 0 4px;
+.checks td.th {
+  color: var(--dim);
+}
+
+.dim {
+  color: var(--dim);
 }
 </style>

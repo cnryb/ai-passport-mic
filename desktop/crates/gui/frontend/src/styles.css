@@ -1,22 +1,62 @@
-/* G0 的视觉基线：只定义"够用且不返工"的 token，不引 UI 库。
-   深色为主——麦克风类工具是常驻窗口，深色不刺眼，也与系统声音面板的观感一致。 */
+/* 视觉基线：只定义 token，不引 UI 库。
+   深色为主——麦克风类工具是常驻窗口，深色不刺眼，也与系统声音面板的观感一致。
+
+   ## 刻度（2026-11-07 收口，改之前是 10 / 10.5 / 11 / 11.5 / 12 / 12.5 / 13 / 13.5 八档混用）
+   字号只用四档，别再引入半档：
+     --fs-10  角标、单位、分组标题、卡内小说明
+     --fs-11  辅助说明、指标标签、次级按钮
+     --fs-12  正文、表格、下拉、主按钮
+     --fs-13  卡片主标题、大号读数、底部主按钮
+
+   电平表的读数（26px）是 canvas 里手绘的，不参与 CSS 字号体系。
+
+   间距只用四档：--s1 4 / --s2 8 / --s3 12 / --s4 16。
+     卡片内 padding 12，卡片之间 gap 10，控件之间 gap 8。
+
+   圆角只用三档：--r-sm 6（控件）/ --r-md 10（卡片）/ --r-pill 999。
+*/
 
 :root {
   color-scheme: dark;
   --bg: #0e1116;
-  --panel: #151a21;
-  --panel-2: #1b222c;
+  --panel: #141a21;
+  --panel-2: #1a212b;
+  --panel-3: #1f2733;
   --line: #232b37;
-  --line-soft: #1c232d;
-  --text: #e7ecf4;
-  --muted: #8b95a7;
-  --dim: #5c6678;
+  --line-soft: #1b222c;
+  --text: #e8edf5;
+  --muted: #8d97a9;
+  --dim: #5b6577;
   --accent: #4c8dff;
   --ok: #3ddc97;
   --warn: #ffb020;
   --err: #ff5f5f;
-  --radius: 10px;
+
+  --fs-10: 10px;
+  --fs-11: 11px;
+  --fs-12: 12px;
+  --fs-13: 13px;
+
+  --s1: 4px;
+  --s2: 8px;
+  --s3: 12px;
+  --s4: 16px;
+  /* 卡片之间比卡片内松一档：内 12、间 16。中间值会让"贴边"更明显，
+     而 10px 这种半档数值散落在各组件里最容易漂移。 */
+  --gap-card: var(--s4);
+
+  --r-sm: 6px;
+  --r-md: 10px;
+  --r-pill: 999px;
+  /* 过渡别名：按键映射页还引用旧名 `--radius`，它迁到 `--r-md` 后即删。 */
+  --radius: var(--r-md);
+
   --mono: ui-monospace, SFMono-Regular, "SF Mono", Menlo, monospace;
+
+  /* 三个固定带的高度：改这里就够，别在组件里散落写死 */
+  --h-topbar: 42px;
+  --h-tabs: 36px;
+  --h-dock: 56px;
 }
 
 * {
@@ -33,7 +73,7 @@ body,
 body {
   background: var(--bg);
   color: var(--text);
-  font: 13px/1.5 -apple-system, "SF Pro Text", "PingFang SC", "Helvetica Neue", sans-serif;
+  font: var(--fs-12)/1.5 -apple-system, "SF Pro Text", "PingFang SC", "Helvetica Neue", sans-serif;
   -webkit-font-smoothing: antialiased;
   user-select: none;
   overflow: hidden;
@@ -41,29 +81,37 @@ body {
 
 button {
   font: inherit;
-  color: inherit;
+  font-size: var(--fs-12);
+  color: var(--text);
   background: var(--panel-2);
   border: 1px solid var(--line);
-  border-radius: 7px;
+  border-radius: var(--r-sm);
   padding: 5px 12px;
   cursor: pointer;
-  transition: background 0.15s, border-color 0.15s;
+  white-space: nowrap;
+  transition: background 0.14s, border-color 0.14s, color 0.14s;
 }
 
 button:hover:not(:disabled) {
-  background: #212a36;
+  background: var(--panel-3);
   border-color: #33404f;
 }
 
 button:disabled {
-  opacity: 0.42;
+  opacity: 0.4;
   cursor: not-allowed;
+}
+
+/* 次级按钮：表格行内、工具栏里那些不该抢眼的操作 */
+button.sm {
+  padding: 3px 9px;
+  font-size: var(--fs-11);
 }
 
 button.primary {
   background: var(--accent);
   border-color: var(--accent);
-  color: #06101f;
+  color: #04101f;
   font-weight: 600;
 }
 
@@ -74,26 +122,68 @@ button.primary:hover:not(:disabled) {
 
 button.danger {
   color: var(--err);
-  border-color: #ff5f5f55;
+  border-color: #ff5f5f4d;
+  background: #ff5f5f0a;
+}
+
+button.danger:hover:not(:disabled) {
+  background: #ff5f5f16;
+  border-color: #ff5f5f77;
 }
 
 button.ghost {
   background: transparent;
+  color: var(--muted);
+}
+
+button.ghost:hover:not(:disabled) {
+  color: var(--text);
+  background: var(--panel-2);
 }
 
 h2 {
-  font-size: 12px;
+  font-size: var(--fs-11);
   font-weight: 600;
-  letter-spacing: 0.04em;
+  letter-spacing: 0.06em;
   color: var(--muted);
   margin: 0;
   text-transform: uppercase;
 }
 
+h3 {
+  font-size: var(--fs-12);
+  font-weight: 600;
+  margin: 0;
+}
+
 code,
 .mono {
   font-family: var(--mono);
-  font-size: 11.5px;
+  font-size: var(--fs-11);
+}
+
+input,
+select,
+textarea {
+  font: inherit;
+  font-size: var(--fs-12);
+  color: var(--text);
+  background: var(--panel-2);
+  border: 1px solid var(--line);
+  border-radius: var(--r-sm);
+  padding: 4px 8px;
+}
+
+input:focus,
+select:focus,
+textarea:focus {
+  outline: none;
+  border-color: #4c8dff88;
+}
+
+input[type='checkbox'] {
+  accent-color: var(--accent);
+  margin: 0;
 }
 
 .scroll {
@@ -107,6 +197,52 @@ code,
 
 .scroll::-webkit-scrollbar-thumb {
   background: #2a3341;
-  border-radius: 6px;
+  border-radius: var(--r-sm);
   border: 3px solid var(--bg);
+}
+
+/* 三处共用的版式小件 */
+.card {
+  background: var(--panel);
+  border: 1px solid var(--line-soft);
+  border-radius: var(--r-md);
+  padding: var(--s3);
+}
+
+.tag {
+  font-size: var(--fs-10);
+  letter-spacing: 0.05em;
+  color: var(--dim);
+  border: 1px solid var(--line);
+  border-radius: var(--r-pill);
+  padding: 1px 8px;
+  white-space: nowrap;
+}
+
+.tag.warn {
+  color: var(--warn);
+  border-color: #ffb02040;
+  background: #ffb02010;
+}
+
+.tag.live {
+  color: var(--ok);
+  border-color: #3ddc9740;
+  background: #3ddc9710;
+}
+
+.note {
+  margin: 0;
+  font-size: var(--fs-11);
+  line-height: 1.65;
+  color: var(--dim);
+}
+
+.note b {
+  color: var(--muted);
+  font-weight: 500;
+}
+
+.spacer {
+  flex: 1;
 }

@@ -34,19 +34,22 @@ const tone = computed(() => {
 .pill {
   display: inline-flex;
   align-items: center;
-  gap: 7px;
-  padding: 4px 11px 4px 9px;
-  border-radius: 999px;
-  font-size: 12px;
+  gap: 6px;
+  height: 22px;
+  padding: 0 10px 0 8px;
+  border-radius: var(--r-pill);
+  font-size: var(--fs-11);
   font-weight: 500;
   border: 1px solid var(--line);
   background: var(--panel-2);
+  color: var(--muted);
   white-space: nowrap;
+  flex: 0 0 auto;
 }
 
 .dot {
-  width: 7px;
-  height: 7px;
+  width: 6px;
+  height: 6px;
   border-radius: 50%;
   background: var(--dim);
 }
@@ -54,18 +57,18 @@ const tone = computed(() => {
 .pill[data-tone='ok'] {
   color: var(--ok);
   border-color: #3ddc9740;
-  background: #3ddc9714;
+  background: #3ddc9712;
 }
 
 .pill[data-tone='ok'] .dot {
   background: var(--ok);
-  box-shadow: 0 0 0 3px #3ddc9722;
+  box-shadow: 0 0 0 3px #3ddc9720;
 }
 
 .pill[data-tone='busy'] {
   color: #9ec3ff;
   border-color: #4c8dff40;
-  background: #4c8dff14;
+  background: #4c8dff12;
 }
 
 .pill[data-tone='busy'] .dot {
@@ -76,7 +79,7 @@ const tone = computed(() => {
 .pill[data-tone='warn'] {
   color: var(--warn);
   border-color: #ffb02040;
-  background: #ffb02014;
+  background: #ffb02012;
 }
 
 .pill[data-tone='warn'] .dot {
@@ -86,7 +89,7 @@ const tone = computed(() => {
 .pill[data-tone='err'] {
   color: var(--err);
   border-color: #ff5f5f40;
-  background: #ff5f5f14;
+  background: #ff5f5f12;
 }
 
 .pill[data-tone='err'] .dot {

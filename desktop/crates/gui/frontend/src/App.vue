@@ -1,5 +1,5 @@
 <script setup lang="ts">
-import { computed, onMounted, onUnmounted, ref } from 'vue'
+import { computed, nextTick, onMounted, onUnmounted, ref } from 'vue'
 import DeviceList from './components/DeviceList.vue'
 import DiagnosticsView from './components/DiagnosticsView.vue'
 import FirmwareView from './components/FirmwareView.vue'
@@ -26,7 +26,17 @@ import {
 const MAX_LOGS = 300
 const SCAN_WINDOW_MS = 6_000
 
-type Tab = 'live' | 'setup' | 'quality' | 'keymap' | 'diagnostics'
+/**
+ * 版面结构（改布局时先读这段）：
+ *
+ *   顶栏 42px  /  Tabs 36px  /  错误条 34px  /  内容区（唯一滚动）  /  底部操作条 56px
+ *
+ * 前四个区都是 `flex: 0 0 auto`，只有内容区 `flex: 1 1 auto; overflow-y: auto`。
+ * **「开始 / 停止」固定放在底部操作条右端**，不跟任何卡片走——它曾经在实时页最下方的
+ * 控制卡里，一出错误横幅就被挤出视口（900×620 溢出 22px、780×520 溢出 193px 且
+ * 三层父级都是 overflow:visible，滚不到），而那时候恰恰最需要点它。
+ */
+type Tab = 'live' | 'quality' | 'keymap' | 'diagnostics' | 'setup'
 
 const state = ref<AppState>({ kind: 'idle' })
 const devices = ref<DeviceView[]>([])
@@ -37,12 +47,27 @@ const tab = ref<Tab>('live')
 const error = ref<AppError | null>(null)
 const toast = ref('')
 
+/** 错误条默认折叠成一行，点开才显示处理指引（展开会占 60px，默认不该占）。 */
+const bannerOpen = ref(false)
+/** 本次运行累计的 error 条数。诊断 tab 显示角标，进页面即清零。 */
+const errorCount = ref(0)
+/** 设备卡默认折叠：已连接时它只需一行 42px，省下来的高度全给电平表。 */
+const deviceOpen = ref(false)
+/** 指标默认只显三组核心项，其余收在「显示全部指标」里。 */
+const moreMetrics = ref(false)
+
+/**
+ * 指标组是否收起。设备卡展开时自动置 true（见 toggleDevice），用户也可手动切。
+ * 收起时不是消失——`metricBrief` 那一行仍然给三个最关键的数。
+ */
+const groupsCollapsed = ref(false)
+
 const sinks = ref<SinkView[]>([])
 const sink = ref<string | null>(null)
 const targetMs = ref(80)
 const saveWav = ref(false)
 const autoConnect = ref(false)
-/** 关麦兜底时长（分钟）。默认 10，可在界面上改。 */
+/** 关麦兜底时长（分钟）。默认 10，可在设备展开区改。 */
 const autoStopMin = ref(10)
 const lastDevice = ref<string | null>(null)
 
@@ -86,7 +111,9 @@ const canStart = computed(() => stateKind.value === 'ready' && sink.value !== nu
 const errorHint = computed(() => (error.value ? ERROR_HINTS[error.value.code] : ''))
 
 const wavPath = computed(() => summary.value?.wav_path ?? lastSession.value?.wav_path ?? null)
-const activeSessionId = computed(() => summary.value?.session_id ?? lastSession.value?.session_id ?? null)
+const activeSessionId = computed(
+  () => summary.value?.session_id ?? lastSession.value?.session_id ?? null,
+)
 
 /** 与固件 battery.c 的低电量阈值一致（APM_BATTERY_LOW_SOC_PCT = 20）。 */
 const BATTERY_LOW_PCT = 20
@@ -106,39 +133,98 @@ const elapsedText = computed(() => {
   return `${String(Math.floor(total / 60)).padStart(2, '0')}:${String(total % 60).padStart(2, '0')}`
 })
 
-/** 指标条：口径写死在 docs/GUI.md §7，前端不自己算丢块率。 */
-const metrics = computed(() => {
+/**
+ * 指标分三组，一组回答一个问题：链路有没有丢东西 / 声卡有没有出问题 / 延迟是多少。
+ *
+ * 口径全部写死在 docs/GUI.md §7，前端不自己算。分成三组不是为了好看：
+ * 之前 12 项平铺在一行里，「缓冲」出现两次（buffer_ms 与 fill_p50）、
+ * 顶栏还有一次，四个数字长得像但口径不同，用户没法判断哪个是延迟。
+ */
+interface MetricItem {
+  label: string
+  value: string
+  tone?: 'ok' | 'warn'
+}
+
+const metricGroups = computed<{ title: string; items: MetricItem[] }[]>(() => {
   const t = telemetry.value
   if (!t) {
     return [
-      { label: '块', value: '—' },
-      { label: '丢块', value: '—' },
-      { label: '设备丢弃', value: '—' },
-      { label: '欠载', value: '—' },
-      { label: '缓冲', value: '—' },
+      { title: '链路', items: [{ label: '块', value: '—' }] },
+      { title: '声卡', items: [{ label: '欠载', value: '—' }] },
+      { title: '延迟', items: [{ label: '缓冲', value: '—' }, { label: '存量 p50/p95', value: '—' }] },
     ]
   }
   return [
-    { label: '块', value: String(t.blocks) },
-    { label: '丢块', value: String(t.lost_blocks) },
-    { label: '跳变', value: String(t.seq_jumps) },
-    { label: '设备丢弃', value: String(t.device_dropped) },
-    { label: '欠载', value: String(t.underruns) },
-    { label: '其中断供', value: String(t.underruns_underfed) },
-    { label: '静音帧', value: String(t.silent_frames) },
-    { label: '锁定失败', value: String(t.lock_misses) },
-    { label: '溢出', value: String(t.overflow_drops) },
-    { label: '缓冲', value: `${t.buffer_ms.toFixed(0)} ms` },
-    // 延迟用**实测存量**，不用目标值：修剪守卫会把稳态存量留在目标之上，
-    // 拿目标当延迟会系统性低估（A4）。
     {
-      label: '存量 p50/p95',
-      value:
-        t.fill_p50_ms == null || t.fill_p95_ms == null
-          ? '—'
-          : `${t.fill_p50_ms.toFixed(0)}/${t.fill_p95_ms.toFixed(0)} ms`,
+      title: '链路',
+      items: [
+        { label: '块', value: String(t.blocks) },
+        { label: '丢块', value: String(t.lost_blocks), tone: t.lost_blocks > 0 ? 'warn' : 'ok' },
+        { label: '跳变', value: String(t.seq_jumps), tone: t.seq_jumps > 0 ? 'warn' : 'ok' },
+        {
+          label: '设备丢弃',
+          value: String(t.device_dropped),
+          tone: t.device_dropped > 0 ? 'warn' : 'ok',
+        },
+      ],
     },
-    { label: '漂移', value: `${t.ppm >= 0 ? '+' : ''}${t.ppm.toFixed(0)} ppm` },
+    {
+      title: '声卡',
+      items: [
+        { label: '欠载', value: String(t.underruns) },
+        { label: '断供', value: String(t.underruns_underfed) },
+        { label: '静音', value: `${t.silent_frames} 帧` },
+        { label: '锁定失败', value: String(t.lock_misses) },
+        { label: '通道满', value: String(t.overflow_drops) },
+      ],
+    },
+    {
+      title: '延迟',
+      items: [
+        { label: '缓冲', value: `${t.buffer_ms.toFixed(0)} ms` },
+        // 延迟用**实测存量**，不用目标值：修剪守卫会把稳态存量留在目标之上，
+        // 拿目标当延迟会系统性低估（A4）。
+        {
+          label: '存量 p50/p95',
+          value:
+            t.fill_p50_ms == null || t.fill_p95_ms == null
+              ? '—'
+              : `${t.fill_p50_ms.toFixed(0)}/${t.fill_p95_ms.toFixed(0)}`,
+        },
+        { label: '漂移', value: `${t.ppm >= 0 ? '+' : ''}${t.ppm.toFixed(0)} ppm` },
+      ],
+    },
+  ]
+})
+
+/** 折叠起来的次要指标。不是"不重要"，是不该跟核心项抢同一行。 */
+const extraMetrics = computed<MetricItem[]>(() => {
+  const t = telemetry.value
+  if (!t) return []
+  return [
+    { label: '块长异常', value: String(t.bad_len_blocks) },
+    { label: '毛刺事件', value: String(t.glitch_events) },
+    { label: '用户基准', value: `${t.base_target_ms} ms` },
+    { label: '自适应余量', value: `+${t.boost_ms} ms` },
+    { label: '目标缓冲', value: `${t.target_ms} ms` },
+    { label: '已写字节', value: t.bytes_written.toLocaleString('en-US') },
+  ]
+})
+
+/**
+ * 指标组收起时留的一行摘要：只给三个"要不要现在处理"的判断依据。
+ *
+ * 为什么不是干脆全藏起来：收起只是**视图**取舍，不是认为这些数不重要。
+ * 推流中突然掉块或欠载暴涨，用户不展开也应该看得见。
+ */
+const metricBrief = computed<MetricItem[]>(() => {
+  const t = telemetry.value
+  if (!t) return []
+  return [
+    { label: '丢块', value: String(t.lost_blocks), tone: t.lost_blocks > 0 ? 'warn' : undefined },
+    { label: '欠载', value: String(t.underruns) },
+    { label: '缓冲', value: `${t.buffer_ms.toFixed(0)} ms` },
   ]
 })
 
@@ -161,6 +247,7 @@ async function handle(fn: () => Promise<unknown>) {
     await fn()
   } catch (err) {
     error.value = asAppError(err)
+    bannerOpen.value = false
   }
 }
 
@@ -238,6 +325,7 @@ async function onSinkChange() {
       code: 'sink_rate_unsupported',
       detail: `${picked.name} 不支持 16000 Hz 原生采样率；本项目不做隐式重采样`,
     }
+    bannerOpen.value = false
   }
   await handle(() => api.setSink(sink.value as string))
 }
@@ -370,9 +458,39 @@ async function copyKeymap() {
   })
 }
 
+/** 设备卡的 DOM，展开时用它滚到可见（见 toggleDevice）。 */
+const deviceCard = ref<HTMLElement | null>(null)
+
+/**
+ * 折叠 / 展开设备卡。
+ *
+ * 展开后卡片高约 281px，在默认窗口下内容区会开始滚动。这里做两件事：
+ *
+ * 1. **展开时自动收起指标组**，折叠时恢复用户原来的选择。
+ *    不这么做的话，flex 只好把电平表压到 `min-height`（168px，曲线区很扁），
+ *    而指标组仍然占着 100 多像素——用户点开设备是为了"换设备"，
+ *    那一刻不看他刚才一直看着的链路/声卡/延迟三组数字。
+ *    这是**视图状态**的自动调整，不改任何数据，退出展开即恢复。
+ * 2. 展开后把卡片滚进可见区，"点了有反应"要立刻看得见。
+ */
+async function toggleDevice() {
+  const next = !deviceOpen.value
+  deviceOpen.value = next
+  if (next) {
+    groupsCollapsed.value = true
+    await nextTick()
+    deviceCard.value?.scrollIntoView({ block: 'nearest' })
+  } else {
+    groupsCollapsed.value = false
+  }
+}
+
 function switchTab(next: Tab) {
   tab.value = next
   if (next === 'keymap') void loadKeymap()
+  // 进诊断页即视为"已读"：角标统计的是本次运行新增的 error，
+  // 原来的实现是扫 300 条滚动缓冲里的 error，一条就永久常亮，纯噪声。
+  if (next === 'diagnostics') errorCount.value = 0
 }
 
 // ---- 诊断 ----
@@ -390,6 +508,13 @@ function pushLog(entry: LogEntry) {
   const next = logs.value.length >= MAX_LOGS ? logs.value.slice(1) : logs.value.slice()
   next.push(entry)
   logs.value = next
+  // 不在诊断页时累加角标；在页面里就当作正在看，不累加。
+  if (entry.level === 'error' && tab.value !== 'diagnostics') errorCount.value += 1
+}
+
+function pushError(e: AppError) {
+  error.value = e
+  bannerOpen.value = false
 }
 
 onMounted(async () => {
@@ -421,10 +546,10 @@ onMounted(async () => {
       tab.value = 'setup'
     }
     if (snap.state.kind === 'error') {
-      error.value = { code: snap.state.code, detail: snap.state.detail }
+      pushError({ code: snap.state.code, detail: snap.state.detail })
     }
   } catch (err) {
-    error.value = asAppError(err)
+    pushError(asAppError(err))
   }
 
   await refreshSinks()
@@ -434,7 +559,7 @@ onMounted(async () => {
     if (event.type === 'state-changed') {
       state.value = event.state
       if (event.state.kind === 'error') {
-        error.value = { code: event.state.code, detail: event.state.detail }
+        pushError({ code: event.state.code, detail: event.state.detail })
       } else if (event.state.kind === 'ready') {
         error.value = null
       }
@@ -461,7 +586,7 @@ onMounted(async () => {
     } else if (event.type === 'stream-aborted') {
       // 内核主动中止了推流（开流后迟迟没音频）。状态已经回 ready，用户能直接重试，
       // 所以这里只弹横幅说明原因，不占用状态机的 error 分支。
-      error.value = { code: event.code, detail: event.detail }
+      pushError({ code: event.code, detail: event.detail })
     }
   })
 })
@@ -474,206 +599,290 @@ onUnmounted(() => {
 
 <template>
   <div class="app">
+    <!-- ============ 顶栏（固定 42px） ============
+         只放"现在是什么状态"：连接态、设备、电量、信号、推流时长。
+         版本号搬去诊断页底部、重新检测搬去设备展开区——低频操作不该占黄金位置。 -->
     <header class="topbar">
       <StatePill :state="state" />
       <div class="ident">
         <strong>{{ connectedDevice?.name ?? 'AI Passport Mic' }}</strong>
-        <span v-if="connectedDevice" class="mono sub">{{ connectedDevice.id.slice(0, 12) }}…</span>
+        <span v-if="connectedDevice" class="mono sub">{{ connectedDevice.id.slice(0, 8) }}…</span>
       </div>
       <span class="spacer" />
       <span
         v-if="connectedDevice && batteryKnown"
-        class="meta mono"
-        :class="{ 'batt-low': batteryLow, 'batt-na': battery === null }"
+        class="meta"
+        :class="{ low: batteryLow, na: battery === null }"
+        :title="batteryLow ? '电量低于 20%，请充电' : undefined"
       >
-        {{ batteryText }}{{ batteryLow ? '，请充电' : '' }}
+        {{ batteryText }}{{ batteryLow ? ' · 请充电' : '' }}
       </span>
       <span v-if="connectedDevice?.rssi != null" class="meta mono">{{ connectedDevice.rssi }} dBm</span>
-      <span v-if="streaming" class="meta mono" title="实测存量中位数（不是滑块上的目标值）">
-        存量 {{ telemetry?.fill_p50_ms != null ? telemetry.fill_p50_ms.toFixed(0) : '—' }} ms
-      </span>
-      <span v-if="streaming && (telemetry?.boost_ms ?? 0) > 0" class="meta mono" title="欠载后自适应临时加上的余量">
-        +{{ telemetry?.boost_ms }} ms
-      </span>
-      <span v-if="streaming" class="meta mono">{{ elapsedText }}</span>
-      <span class="ver">v{{ version }}</span>
-      <button :disabled="busy" @click="detect">重新检测</button>
+      <span v-if="streaming" class="meta mono" title="本场推流时长">{{ elapsedText }}</span>
     </header>
 
+    <!-- ============ Tabs（固定 36px） ============
+         顺序按使用频率：日常两个（实时/音质）在前，一次性操作（烧写）在最后。 -->
     <nav class="tabs">
       <button :class="{ active: tab === 'live' }" @click="switchTab('live')">实时</button>
-      <button :class="{ active: tab === 'setup' }" @click="switchTab('setup')">设备烧写</button>
       <button :class="{ active: tab === 'quality' }" @click="switchTab('quality')">音质报告</button>
       <button :class="{ active: tab === 'keymap' }" @click="switchTab('keymap')">按键映射</button>
       <button :class="{ active: tab === 'diagnostics' }" @click="switchTab('diagnostics')">
         诊断
-        <i v-if="logs.some((e) => e.level === 'error')" class="dot-err" />
+        <i v-if="errorCount > 0" class="count" :title="`本次运行新增 ${errorCount} 条 error`">
+          {{ errorCount > 9 ? '9+' : errorCount }}
+        </i>
       </button>
+      <button :class="{ active: tab === 'setup' }" @click="switchTab('setup')">设备烧写</button>
       <span class="spacer" />
       <span v-if="stateKind === 'no_adapter'" class="hint">没有可用蓝牙适配器</span>
     </nav>
 
-    <div v-if="error" class="banner">
-      <div class="banner-main">
-        <strong>{{ error.code }}</strong>
-        <span>{{ error.detail }}</span>
+    <!-- ============ 错误条（固定 34px / 展开再加） ============
+         单行摘要 + 点开展开处理指引。原来是一次性铺开 60px，
+         在默认窗口下会把底部操作条顶出屏幕。 -->
+    <template v-if="error">
+      <div class="banner" @click="bannerOpen = !bannerOpen">
+        <span class="code mono">{{ error.code }}</span>
+        <span class="msg">{{ error.detail }}</span>
+        <span class="spacer" />
+        <span class="act">点此<b>{{ bannerOpen ? '收起' : '展开详情' }}</b></span>
+        <button class="sm ghost" @click.stop="error = null">关闭</button>
       </div>
-      <div class="banner-hint">{{ errorHint }}</div>
-      <button class="ghost" @click="error = null">收起</button>
-    </div>
+      <div v-if="bannerOpen" class="banner-detail">
+        <strong>怎么处理：</strong>{{ errorHint }}
+        <span class="dim">（错误码与完整证据链见「诊断」页）</span>
+      </div>
+    </template>
 
-    <main v-if="tab === 'live'" class="live">
-      <section class="card devices">
-        <div class="card-head">
-          <h2>设备</h2>
-          <span class="spacer" />
-          <label class="inline" title="启动后自动连接上次的设备（设备需已上电并在广播）">
-            <input v-model="autoConnect" type="checkbox" @change="onAutoConnectChange" />
-            自动连接
-          </label>
-          <button v-if="scanning" @click="stopScan">停止扫描</button>
-          <button v-else class="primary" :disabled="!canScan" @click="scan">扫描</button>
-          <button v-if="connectedDevice" class="danger" :disabled="streaming" @click="disconnect">
-            断开
-          </button>
-        </div>
-        <DeviceList
-          :devices="devices"
-          :connected-id="connectedDevice?.id ?? null"
-          :busy="busy"
-          :scanning="scanning"
-          @connect="connect"
+    <!-- ============ 内容区（唯一滚动） ============ -->
+    <main class="content scroll">
+      <!-- ---------- 实时 ---------- -->
+      <div v-if="tab === 'live'" class="page live">
+        <section class="card meter grow-card">
+          <div class="card-head">
+            <h2>电平与指标</h2>
+            <span class="spacer" />
+            <span
+              v-if="linkSlow"
+              class="tag warn"
+              title="设备报 LINK_SLOW：连接间隔 > 40 ms，撑不住 50 块/秒"
+            >
+              链路慢档
+            </span>
+            <span class="tag" :class="{ live: streaming }">{{ streaming ? 'LIVE' : '待机' }}</span>
+          </div>
+
+          <p v-if="linkSlow" class="slow-note">
+            设备报 <code>LINK_SLOW</code>（连接间隔 &gt; 40 ms），撑不住 50 块/秒。
+            <strong>下面的欠载与漂移是链路假象</strong>，不能当音质结论；本场也不会出音质报告。
+            复位设备后重连再试。
+          </p>
+
+          <div class="meter-wrap">
+            <LevelMeter
+              :rms-dbfs="telemetry?.rms_dbfs ?? null"
+              :peak-dbfs="telemetry?.peak_dbfs ?? null"
+              :streaming="streaming"
+            />
+          </div>
+
+          <!-- 指标区：正常态是三组；设备卡展开时降级为一行摘要（见 groupsCollapsed）。
+               降级的理由不是"这些数不重要"，而是那一刻用户在换设备、不在这里读指标，
+               把高度让给电平表比把电平表压到 168px 更好。摘要仍给三个判断依据。 -->
+          <div v-if="!groupsCollapsed" class="groups">
+            <div v-for="g in metricGroups" :key="g.title" class="group">
+              <div class="group-head">{{ g.title }}</div>
+              <div class="kvs">
+                <span v-for="m in g.items" :key="m.label" class="kv">
+                  <i>{{ m.label }}</i>
+                  <b :class="m.tone">{{ m.value }}</b>
+                </span>
+              </div>
+            </div>
+          </div>
+          <div v-else class="kvs brief-row">
+            <span v-for="m in metricBrief" :key="m.label" class="kv">
+              <i>{{ m.label }}</i>
+              <b :class="m.tone">{{ m.value }}</b>
+            </span>
+            <button class="more-toggle inline-toggle" @click="groupsCollapsed = false">
+              展开指标
+            </button>
+          </div>
+
+          <template v-if="!groupsCollapsed">
+            <div v-if="moreMetrics && extraMetrics.length" class="kvs extra">
+              <span v-for="m in extraMetrics" :key="m.label" class="kv">
+                <i>{{ m.label }}</i>
+                <b>{{ m.value }}</b>
+              </span>
+            </div>
+            <button class="more-toggle" @click="moreMetrics = !moreMetrics">
+              {{ moreMetrics ? '收起多余指标' : '显示全部指标' }}
+            </button>
+          </template>
+        </section>
+
+        <!-- 设备卡默认折叠成一行；展开才占 280px -->
+        <section ref="deviceCard" class="card device">
+          <div
+            class="device-row"
+            :data-open="deviceOpen"
+            @click="toggleDevice"
+          >
+            <i class="chev" :data-open="deviceOpen" />
+            <span class="dlabel">设备</span>
+            <span class="dname">{{ connectedDevice?.name ?? lastDevice ?? '未连接' }}</span>
+            <span v-if="connectedDevice" class="dstate">已连接</span>
+            <span v-else-if="scanning" class="dstate busy">扫描中…</span>
+            <span v-if="connectedDevice?.rssi != null" class="dm mono">{{ connectedDevice.rssi }} dBm</span>
+            <span class="spacer" />
+            <button
+              v-if="connectedDevice"
+              class="sm danger"
+              :disabled="streaming"
+              @click.stop="disconnect"
+            >
+              断开
+            </button>
+            <button v-else class="sm primary" :disabled="!canScan" @click.stop="scan">扫描</button>
+          </div>
+
+          <div v-if="deviceOpen" class="device-body">
+            <div class="device-actions">
+              <button v-if="scanning" class="sm" @click="stopScan">停止扫描</button>
+              <button v-else class="sm" :disabled="!canScan" @click="scan">扫描附近设备</button>
+              <label class="check" title="启动后自动连接上次的设备（设备需已上电并在广播）">
+                <input v-model="autoConnect" type="checkbox" @change="onAutoConnectChange" />
+                启动时自动连接
+              </label>
+              <span class="spacer" />
+              <button class="sm ghost" :disabled="busy" @click="detect">重新检测适配器</button>
+            </div>
+
+            <DeviceList
+              :devices="devices"
+              :connected-id="connectedDevice?.id ?? null"
+              :busy="busy"
+              :scanning="scanning"
+              @connect="connect"
+            />
+            <p v-if="stateKind === 'idle' && lastDevice" class="note">
+              上次连接：{{ lastDevice }}{{ autoConnect ? '，启动时自动连接' : '' }}
+            </p>
+
+            <div class="hr" />
+            <div class="capture-row">
+              <span class="note">关麦兜底</span>
+              <input
+                v-model.number="autoStopMin"
+                type="number"
+                min="1"
+                max="1440"
+                step="1"
+                class="num mono"
+                title="连续采集这么久就自动关麦，防忘记。所有推流都生效"
+                @change="onAutoStopChange"
+              />
+              <span class="note">分钟</span>
+              <span class="note dim">连续采集这么久自动关麦（1–1440），改完立即生效</span>
+            </div>
+          </div>
+        </section>
+      </div>
+
+      <!-- ---------- 音质报告 ---------- -->
+      <div v-else-if="tab === 'quality'" class="page">
+        <QualityView
+          :report="report"
+          :session-id="activeSessionId"
+          :wav-path="wavPath"
+          :loading="reportLoading"
+          :error="reportError"
+          @analyze="analyze"
+          @copy-json="copyReportJson"
+          @reveal="revealWav"
         />
-        <p v-if="stateKind === 'idle' && lastDevice" class="tip">
-          上次连接：{{ lastDevice }}{{ autoConnect ? '，启动时自动连接' : '' }}
-        </p>
-      </section>
+      </div>
 
-      <section class="card meter">
-        <div class="card-head">
-          <h2>电平与指标</h2>
-          <span class="spacer" />
-          <span v-if="linkSlow" class="tag tag-warn" title="设备报 LINK_SLOW：连接间隔 > 40 ms">
-            链路慢档
-          </span>
-          <span class="tag" :data-live="streaming">{{ streaming ? 'LIVE' : '待机' }}</span>
-        </div>
-        <p v-if="linkSlow" class="tip warn-tip">
-          设备报 <code>LINK_SLOW</code>（连接间隔 &gt; 40 ms），撑不住 50 块/秒。
-          <strong>下面的欠载与漂移是链路假象</strong>，不能当音质结论；本场也不会出音质报告。
-          复位设备后重连再试。
-        </p>
-        <LevelMeter
-          :rms-dbfs="telemetry?.rms_dbfs ?? null"
-          :peak-dbfs="telemetry?.peak_dbfs ?? null"
-          :streaming="streaming"
-          :buffer-ms="telemetry?.buffer_ms ?? 0"
+      <!-- ---------- 按键映射 ---------- -->
+      <div v-else-if="tab === 'keymap'" class="page">
+        <KeymapView
+          :view="keymap"
+          :busy="keymapBusy"
+          :error="keymapError"
+          @save="saveKeymap"
+          @reset="resetKeymap"
+          @import="importKeymap"
+          @copy="copyKeymap"
         />
-        <div class="metrics">
-          <span v-for="m in metrics" :key="m.label">
-            <i>{{ m.label }}</i>
-            <b>{{ m.value }}</b>
-          </span>
-        </div>
-      </section>
+      </div>
 
-      <section class="card controls">
-        <div class="ctl-row">
-          <label for="sink">声卡</label>
-          <select id="sink" v-model="sink" :disabled="streaming" @change="onSinkChange">
-            <option :value="null" disabled>选择输出设备…</option>
-            <option v-for="s in sinks" :key="s.name" :value="s.name">
-              {{ s.name }}{{ s.supports_16k ? '' : '（不支持 16 kHz）' }}
-            </option>
-          </select>
-          <button class="ghost" :disabled="streaming" @click="refreshSinks">重新枚举</button>
-          <span class="spacer" />
-          <label class="inline">
-            <input v-model="saveWav" type="checkbox" :disabled="streaming" @change="onSaveWavChange" />
-            同时保存 WAV
-          </label>
-        </div>
+      <!-- ---------- 诊断 ---------- -->
+      <div v-else-if="tab === 'diagnostics'" class="page">
+        <DiagnosticsView
+          :entries="logs"
+          :log-path="logPath"
+          :version="version"
+          @copy="copyDiagnostics"
+          @reveal="revealLog"
+        />
+      </div>
 
-        <div class="ctl-row">
-          <label for="buf">缓冲</label>
-          <input
-            id="buf"
-            v-model.number="targetMs"
-            type="range"
-            min="40"
-            max="80"
-            step="5"
-            @change="onBufferChange"
-          />
-          <span class="mono val">{{ targetMs }} ms</span>
-          <span class="spacer" />
-          <label for="auto-stop" title="连续采集这么久就自动关麦，防忘记。所有推流都生效">
-            关麦兜底
-          </label>
-          <input
-            id="auto-stop"
-            v-model.number="autoStopMin"
-            type="number"
-            min="1"
-            max="1440"
-            step="1"
-            class="num"
-            @change="onAutoStopChange"
-          />
-          <span class="mono val">分钟</span>
-          <span class="spacer" />
-          <button v-if="!streaming" class="primary" :disabled="!canStart" @click="startStream">
-            开始
-          </button>
-          <button v-else class="danger" @click="stopStream">停止</button>
-        </div>
-
-        <p v-if="!streaming && stateKind === 'ready' && !sink" class="tip">
-          还没选输出声卡。macOS 上通常装 BlackHole 2ch，然后在会议软件里把麦克风选成它。
-        </p>
-        <p v-else-if="!streaming && stateKind === 'ready'" class="tip">
-          开始后，在会议软件（腾讯会议 / Zoom / 飞书）里把麦克风选成「{{ sink }}」。
-        </p>
-      </section>
+      <!-- ---------- 设备烧写 ---------- -->
+      <div v-else class="page">
+        <FirmwareView />
+      </div>
     </main>
 
-    <main v-else-if="tab === 'setup'" class="wrap">
-      <FirmwareView />
-    </main>
+    <!-- ============ 底部操作条（固定 56px） ============
+         声卡 / 缓冲 / 保存 WAV / 开始停止。这四个是"每次开流都要碰"的东西，
+         放这里的好处是位置永不变化：错误横幅、慢档提示、窗口缩小都挤不掉它。 -->
+    <footer class="dock">
+      <span class="fl">声卡</span>
+      <select
+        v-model="sink"
+        :disabled="streaming"
+        class="sink-select"
+        title="推流目标声卡（会议软件里要把麦克风选成它）"
+        @change="onSinkChange"
+      >
+        <option :value="null" disabled>选择输出设备…</option>
+        <option v-for="s in sinks" :key="s.name" :value="s.name">
+          {{ s.name }}{{ s.supports_16k ? '' : '（不支持 16 kHz）' }}
+        </option>
+      </select>
+      <button class="sm ghost" :disabled="streaming" title="装完虚拟声卡后点这里" @click="refreshSinks">
+        重新枚举
+      </button>
 
-    <main v-else-if="tab === 'quality'" class="wrap">
-      <QualityView
-        :report="report"
-        :session-id="activeSessionId"
-        :wav-path="wavPath"
-        :loading="reportLoading"
-        :error="reportError"
-        @analyze="analyze"
-        @copy-json="copyReportJson"
-        @reveal="revealWav"
+      <span class="divider" />
+
+      <span class="fl">缓冲</span>
+      <input
+        v-model.number="targetMs"
+        type="range"
+        min="40"
+        max="80"
+        step="5"
+        title="用户基准，自适应不会改它；40–80 ms 是延迟预算决定的"
+        @change="onBufferChange"
       />
-    </main>
+      <span class="val mono">{{ targetMs }} ms</span>
 
-    <main v-else-if="tab === 'keymap'" class="wrap">
-      <KeymapView
-        :view="keymap"
-        :busy="keymapBusy"
-        :error="keymapError"
-        @save="saveKeymap"
-        @reset="resetKeymap"
-        @import="importKeymap"
-        @copy="copyKeymap"
-      />
-    </main>
+      <label class="check" title="把这一场录成 WAV，停止时可出音质报告">
+        <input v-model="saveWav" type="checkbox" :disabled="streaming" @change="onSaveWavChange" />
+        保存 WAV
+      </label>
 
-    <main v-else class="wrap">
-      <DiagnosticsView
-        :entries="logs"
-        :log-path="logPath"
-        @copy="copyDiagnostics"
-        @reveal="revealLog"
-      />
-    </main>
+      <span class="spacer" />
+
+      <button v-if="!streaming" class="primary main" :disabled="!canStart" @click="startStream">
+        开始
+      </button>
+      <button v-else class="danger main" @click="stopStream">停止</button>
+    </footer>
 
     <transition name="fade">
       <div v-if="toast" class="toast">{{ toast }}</div>
@@ -686,82 +895,87 @@ onUnmounted(() => {
   display: flex;
   flex-direction: column;
   height: 100%;
-  padding: 0 16px 14px;
-  gap: 10px;
+  min-height: 0;
+  overflow: hidden;
 }
 
+/* ---------- 顶栏 ---------- */
 .topbar {
+  flex: 0 0 auto;
+  height: var(--h-topbar);
   display: flex;
   align-items: center;
-  gap: 10px;
-  padding: 12px 0 0;
+  gap: var(--s2);
+  padding: 0 var(--s4);
+  border-bottom: 1px solid var(--line-soft);
 }
 
 .ident {
   display: flex;
   align-items: baseline;
-  gap: 8px;
+  gap: 6px;
   min-width: 0;
 }
 
 .ident strong {
-  font-size: 13.5px;
+  font-size: var(--fs-13);
   font-weight: 600;
   white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
 }
 
 .sub {
   color: var(--dim);
+  font-size: var(--fs-11);
 }
 
 .meta {
+  font-size: var(--fs-11);
   color: var(--muted);
-  font-size: 11.5px;
-  font-variant-numeric: tabular-nums;
   white-space: nowrap;
+  font-variant-numeric: tabular-nums;
 }
 
-.meta.batt-low {
+.meta.low {
   color: var(--warn);
   font-weight: 600;
 }
 
 /* 电量不可用：低调但要说出来，不能用警告色制造"有故障"的错觉。 */
-.meta.batt-na {
+.meta.na {
   color: var(--dim);
 }
 
-.spacer {
-  flex: 1;
-}
-
-.ver {
-  color: var(--dim);
-  font-size: 11.5px;
-  font-variant-numeric: tabular-nums;
-}
-
+/* ---------- Tabs ---------- */
 .tabs {
+  flex: 0 0 auto;
   display: flex;
-  align-items: center;
-  gap: 4px;
+  align-items: stretch;
+  gap: 2px;
+  height: var(--h-tabs);
+  padding: 0 var(--s4);
   border-bottom: 1px solid var(--line-soft);
 }
 
 .tabs button {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
   border: none;
   background: transparent;
   border-radius: 0;
-  padding: 7px 10px;
+  padding: 0 10px;
   color: var(--muted);
-  font-size: 12.5px;
   border-bottom: 2px solid transparent;
   margin-bottom: -1px;
 }
 
-.tabs button:hover {
+.tabs button:hover:not(:disabled) {
   color: var(--text);
   background: transparent;
+  border-color: transparent;
+  border-bottom-color: #ffffff14;
 }
 
 .tabs button.active {
@@ -769,248 +983,470 @@ onUnmounted(() => {
   border-bottom-color: var(--accent);
 }
 
+.count {
+  min-width: 15px;
+  height: 15px;
+  padding: 0 4px;
+  border-radius: var(--r-pill);
+  background: #ff5f5f28;
+  color: var(--err);
+  font-size: var(--fs-10);
+  font-style: normal;
+  font-weight: 600;
+  font-variant-numeric: tabular-nums;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+}
+
 .hint {
-  font-size: 11.5px;
+  align-self: center;
+  font-size: var(--fs-11);
   color: var(--dim);
-  padding-right: 2px;
 }
 
-.dot-err {
-  display: inline-block;
-  width: 5px;
-  height: 5px;
-  border-radius: 50%;
-  background: var(--err);
-  margin-left: 5px;
-  vertical-align: middle;
-}
-
+/* ---------- 错误条 ---------- */
 .banner {
-  display: grid;
-  grid-template-columns: minmax(0, 1fr) auto;
-  gap: 4px 12px;
-  padding: 9px 12px;
-  border-radius: var(--radius);
-  border: 1px solid #ff5f5f3d;
-  background: #ff5f5f10;
-}
-
-.banner-main {
+  flex: 0 0 auto;
   display: flex;
-  gap: 10px;
-  align-items: baseline;
+  align-items: center;
+  gap: var(--s2);
+  height: 34px;
+  padding: 0 var(--s4);
+  background: #ff5f5f0d;
+  border-bottom: 1px solid #ff5f5f26;
+  cursor: pointer;
   min-width: 0;
 }
 
-.banner-main strong {
+.banner .code {
   color: var(--err);
-  font-size: 11.5px;
   font-weight: 600;
   white-space: nowrap;
 }
 
-.banner-main span {
-  font-size: 12px;
-  color: #f2d6d6;
-  overflow-wrap: anywhere;
+.banner .msg {
+  font-size: var(--fs-11);
+  color: #e6c9c9;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  min-width: 0;
 }
 
-.banner-hint {
-  grid-column: 1;
-  font-size: 11.5px;
+.banner .act {
+  font-size: var(--fs-11);
+  color: var(--muted);
+  white-space: nowrap;
+}
+
+.banner .act b {
+  color: var(--text);
+  font-weight: 500;
+}
+
+.banner-detail {
+  flex: 0 0 auto;
+  padding: var(--s2) var(--s4);
+  background: #ff5f5f08;
+  border-bottom: 1px solid #ff5f5f26;
+  font-size: var(--fs-11);
+  line-height: 1.65;
   color: var(--muted);
 }
 
-.banner button {
-  grid-row: 1 / span 2;
-  grid-column: 2;
-  align-self: center;
+.banner-detail strong {
+  color: var(--text);
+  font-weight: 500;
 }
 
-.live {
+.banner-detail .dim {
+  color: var(--dim);
+}
+
+/* ---------- 内容区（唯一滚动） ---------- */
+.content {
+  flex: 1 1 auto;
+  min-height: 0;
+  overflow-y: auto;
+  overflow-x: hidden;
+  padding: var(--s3) var(--s4);
   display: flex;
   flex-direction: column;
-  gap: 10px;
-  min-height: 0;
-  flex: 1;
+  gap: var(--gap-card);
 }
 
-.card {
-  background: var(--panel);
-  border: 1px solid var(--line-soft);
-  border-radius: var(--radius);
-  padding: 10px 12px;
+.page {
   display: flex;
   flex-direction: column;
+  gap: var(--gap-card);
+  /* `1 0 auto` 而不是 `1 1 auto`：页面可以**长高**，但不允许被**压缩**。
+     空间不够时（典型：设备卡展开、或出现错误条）应当由 .content 滚动，
+     而不是把里面 flex:1 的电平卡压到内容高度以下——那会让 .groups 与
+     「显示全部指标」溢出卡片、直接盖在设备卡上（2026-11-07 修）。
+     注意 `min-height: 0` 会抵消这个保护，所以这里不写它。 */
+  flex: 1 0 auto;
+}
+
+/* ---------- 实时页 ---------- */
+.card.meter {
+  display: flex;
+  flex-direction: column;
+  gap: var(--s3);
   min-height: 0;
 }
 
-.devices {
-  flex: 1;
-  min-height: 96px;
-  max-height: 190px;
-  overflow: hidden;
-}
-
-.meter {
-  flex: 0 0 auto;
-  gap: 8px;
-}
-
-.controls {
-  flex: 0 0 auto;
-  gap: 8px;
+.grow-card {
+  flex: 1 1 auto;
 }
 
 .card-head {
   display: flex;
   align-items: center;
-  gap: 8px;
-  margin-bottom: 6px;
+  gap: var(--s2);
+  min-height: 16px;
 }
 
-.tag {
-  font-size: 10px;
-  letter-spacing: 0.06em;
-  color: var(--dim);
-  border: 1px solid var(--line);
-  border-radius: 999px;
-  padding: 1px 8px;
+.slow-note {
+  margin: 0;
+  font-size: var(--fs-11);
+  line-height: 1.6;
+  color: var(--warn);
 }
 
-.tag[data-live='true'] {
-  color: var(--ok);
-  border-color: #3ddc9755;
-  background: #3ddc970f;
-}
-
-/* 链路慢档：用警告色，但不像 error banner 那样抢眼——它是"这份数据别信"，
-   不是"出故障了"。 */
-.tag-warn {
-  color: #f0b429;
-  border-color: #f0b42955;
-  background: #f0b4290f;
-}
-
-.warn-tip {
-  color: #f0b429;
-  padding: 0 2px 6px;
-}
-
-.warn-tip code {
-  background: #f0b42918;
+.slow-note code {
+  background: #ffb0201a;
   padding: 0 3px;
   border-radius: 3px;
 }
 
-.metrics {
-  display: flex;
-  flex-wrap: wrap;
-  gap: 4px 14px;
-  padding-top: 2px;
+/* 电平表的盒子。
+ *
+ * 两条约束都是必须的，不是风格选择：
+ *
+ * 1. `position: relative` + 子元素 absolute。canvas 的 `height: 100%` 在"高度未定"
+ *    的父级上会退化成 auto，于是采用自身 `height` 属性；而 LevelMeter 每帧又把属性
+ *    设成 `clientHeight`——两者互相喂养，卡片会自己长高（实测闭合态被撑到 591px，
+ *    比可视区还高）。absolute 之后 canvas 完全不参与父级尺寸计算。
+ * 2. 盒子自身不设 `height`，只设 `min-height` 兜底；可用高度由 flex 给。
+ *    这样"设备卡展开 → 可用高度变小 → 电平表变矮"是单向的，不会反向撑高页面。
+ */
+.meter-wrap {
+  position: relative;
+  flex: 1 1 auto;
+  min-height: 168px;
+  border-radius: var(--r-sm);
+  overflow: hidden;
+  background: var(--panel-2);
 }
 
-.metrics span {
+.meter-wrap > :deep(canvas) {
+  position: absolute;
+  inset: 0;
+  width: 100%;
+  height: 100%;
+}
+
+/* ---------- 指标三组 ---------- */
+.groups {
+  display: grid;
+  grid-template-columns: repeat(3, minmax(0, 1fr));
+  gap: var(--s3);
+  border-top: 1px solid var(--line-soft);
+  padding-top: var(--s3);
+}
+
+.group {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  min-width: 0;
+}
+
+.group-head {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  font-size: var(--fs-10);
+  letter-spacing: 0.06em;
+  color: var(--dim);
+  text-transform: uppercase;
+}
+
+.group-head::after {
+  content: '';
+  flex: 1;
+  height: 1px;
+  background: var(--line-soft);
+}
+
+.kvs {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 3px 14px;
+}
+
+.kv {
   display: inline-flex;
   align-items: baseline;
   gap: 5px;
-  font-size: 11px;
+  min-width: 0;
 }
 
-.metrics i {
-  color: var(--dim);
+.kv i {
+  font-size: var(--fs-11);
   font-style: normal;
+  color: var(--dim);
+  white-space: nowrap;
 }
 
-.metrics b {
+.kv b {
+  font-family: var(--mono);
+  font-size: var(--fs-12);
   font-weight: 600;
+  font-variant-numeric: tabular-nums;
+  white-space: nowrap;
+}
+
+.kv b.ok {
+  color: var(--ok);
+}
+
+.kv b.warn {
+  color: var(--warn);
+}
+
+.kvs.extra {
+  border-top: 1px solid var(--line-soft);
+  padding-top: var(--s2);
+}
+
+/* 设备卡展开时的降级指标行：一行三个数 + 一个展开入口，高度只有一组的三分之一。 */
+.kvs.brief-row {
+  align-items: center;
+  gap: 4px 14px;
+  border-top: 1px solid var(--line-soft);
+  padding-top: var(--s2);
+}
+
+.inline-toggle {
+  margin-left: auto;
+}
+
+/* 「显示全部指标」是个零 padding 的文本按钮，贴在卡片底边时视觉上像压着下一张卡。
+   给一点下留白，让卡片底边有自己的呼吸空间。 */
+.more-toggle {
+  align-self: flex-start;
+  border: none;
+  background: transparent;
+  padding: 0;
+  font-size: var(--fs-11);
+  color: var(--dim);
+  line-height: 1.5;
+}
+
+.more-toggle.inline-toggle {
+  align-self: center;
+  margin-left: auto;
+}
+
+.more-toggle:hover:not(:disabled) {
+  color: var(--muted);
+  background: transparent;
+  border-color: transparent;
+}
+
+/* ---------- 设备（默认折叠） ---------- */
+.card.device {
+  padding: 0;
+  overflow: hidden;
+  flex: 0 0 auto;
+}
+
+/* 标题行与展开区之间有一条分隔线，让"一行摘要"和"展开的详情"在视觉上分开。 */
+.device-row {
+  display: flex;
+  align-items: center;
+  gap: var(--s2);
+  height: 42px;
+  padding: 0 var(--s3);
+  cursor: pointer;
+  min-width: 0;
+}
+
+.device-row[data-open='true'] {
+  border-bottom: 1px solid var(--line-soft);
+}
+
+.device-row:hover {
+  background: #ffffff04;
+}
+
+.chev {
+  width: 8px;
+  height: 8px;
+  flex: 0 0 auto;
+  border-right: 1.5px solid var(--muted);
+  border-bottom: 1.5px solid var(--muted);
+  transform: rotate(-45deg);
+  transition: transform 0.16s;
+  margin-left: 2px;
+}
+
+.chev[data-open='true'] {
+  transform: rotate(45deg);
+}
+
+.dlabel {
+  font-size: var(--fs-10);
+  letter-spacing: 0.06em;
+  text-transform: uppercase;
+  color: var(--dim);
+  flex: 0 0 auto;
+}
+
+.dname {
+  font-size: var(--fs-12);
+  font-weight: 500;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.dstate {
+  font-size: var(--fs-11);
+  color: var(--ok);
+  white-space: nowrap;
+}
+
+.dstate.busy {
+  color: var(--accent);
+}
+
+.dm {
+  font-size: var(--fs-11);
+  color: var(--dim);
+  white-space: nowrap;
+}
+
+/* 展开区：与上方标题行之间要留白。`padding-top` 不能是 0，否则
+   「扫描附近设备」那一行会紧贴标题行的下边框（标题行自己有 42px 固定高度，
+   视觉上会把两行粘成一块）。 */
+.device-body {
+  padding: var(--s3) var(--s3) var(--s3);
+  display: flex;
+  flex-direction: column;
+  gap: var(--s2);
+}
+
+/* 设备列表是一个独立区块（可以滚动、有 hover 行），和上面的操作行不是一组。
+   这里给它一点上留白，否则「扫描附近设备」那一行的按钮会贴着第一行设备的边框。 */
+.device-body > :deep(.list) {
+  margin-top: var(--s1);
+}
+
+.device-actions {
+  display: flex;
+  align-items: center;
+  gap: var(--s2);
+  flex-wrap: wrap;
+}
+
+.check {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  font-size: var(--fs-11);
+  color: var(--muted);
+  white-space: nowrap;
+  cursor: pointer;
+}
+
+.hr {
+  height: 1px;
+  background: var(--line-soft);
+}
+
+.capture-row {
+  display: flex;
+  align-items: center;
+  gap: var(--s2);
+  flex-wrap: wrap;
+}
+
+.num {
+  width: 58px;
+  padding: 3px 6px;
+  text-align: right;
+}
+
+.dim {
+  color: var(--dim);
+}
+
+/* ---------- 底部操作条 ---------- */
+.dock {
+  flex: 0 0 auto;
+  display: flex;
+  align-items: center;
+  gap: var(--s2);
+  height: var(--h-dock);
+  padding: 0 var(--s4);
+  background: var(--panel);
+  border-top: 1px solid var(--line);
+}
+
+.dock .fl {
+  font-size: var(--fs-11);
+  color: var(--dim);
+  white-space: nowrap;
+}
+
+.sink-select {
+  min-width: 160px;
+  max-width: 210px;
+}
+
+.dock input[type='range'] {
+  width: 104px;
+  padding: 0;
+  border: none;
+  background: transparent;
+  accent-color: var(--accent);
+  cursor: pointer;
+}
+
+.dock .val {
+  color: var(--muted);
+  min-width: 46px;
   font-variant-numeric: tabular-nums;
 }
 
-.ctl-row {
-  display: flex;
-  align-items: center;
-  gap: 8px;
+.divider {
+  width: 1px;
+  height: 20px;
+  background: var(--line);
+  margin: 0 2px;
 }
 
-.ctl-row > label {
-  color: var(--muted);
-  font-size: 12px;
-  min-width: 30px;
+.dock .main {
+  min-width: 92px;
+  height: 32px;
+  font-size: var(--fs-13);
+  padding: 0 18px;
 }
 
-select {
-  font: inherit;
-  font-size: 12px;
-  color: var(--text);
-  background: var(--panel-2);
-  border: 1px solid var(--line);
-  border-radius: 7px;
-  padding: 4px 8px;
-  min-width: 210px;
-}
-
-select:focus {
-  outline: none;
-  border-color: #4c8dff88;
-}
-
-input[type='range'] {
-  width: 180px;
-  accent-color: var(--accent);
-}
-
-.inline {
-  display: inline-flex;
-  align-items: center;
-  gap: 5px;
-  font-size: 12px;
-  color: var(--muted);
-}
-
-.inline input {
-  accent-color: var(--accent);
-}
-
-.val {
-  color: var(--muted);
-  min-width: 48px;
-}
-
-/* 关麦兜底的数字输入：宽度够放 4 位数（1440 分钟 = 24 h）。 */
-.num {
-  width: 62px;
-  padding: 3px 6px;
-  border: 1px solid var(--line);
-  border-radius: 6px;
-  background: var(--bg);
-  color: var(--fg);
-  font-family: var(--mono, ui-monospace, monospace);
-  font-size: 12px;
-}
-
-.tip {
-  margin: 0;
-  font-size: 11px;
-  color: var(--dim);
-  line-height: 1.6;
-}
-
-.wrap {
-  flex: 1;
-  min-height: 0;
-}
-
+/* ---------- toast ---------- */
 .toast {
   position: fixed;
   right: 18px;
-  bottom: 16px;
-  background: #1e2733;
+  bottom: 68px;
+  background: var(--panel-3);
   border: 1px solid #2f3d4e;
   color: var(--text);
   padding: 7px 14px;
-  border-radius: 8px;
-  font-size: 12px;
+  border-radius: var(--r-sm);
+  font-size: var(--fs-12);
   box-shadow: 0 8px 24px #00000055;
 }
 

@@ -23,41 +23,29 @@ function shortId(id: string): string {
 </script>
 
 <template>
-  <div class="list scroll">
+  <div class="list">
     <p v-if="devices.length === 0" class="empty">
       <template v-if="scanning">正在扫描…设备会在发现后立刻出现</template>
       <template v-else>还没有设备。点「扫描」开始；设备需上电并且未被其他主机连接。</template>
     </p>
 
-    <div
-      v-for="d in devices"
-      :key="d.id"
-      class="row"
-      :data-connected="d.id === connectedId"
-    >
+    <div v-for="d in devices" :key="d.id" class="row" :data-connected="d.id === connectedId">
       <div class="id">
         <span class="name">{{ d.name || '（未命名设备）' }}</span>
         <span class="sub mono">{{ shortId(d.id) }}</span>
       </div>
 
-      <span v-if="d.has_service" class="badge">本项目</span>
-      <span v-else class="badge muted">其他</span>
+      <span class="badge" :class="{ muted: !d.has_service }">{{ d.has_service ? '本项目' : '其他' }}</span>
 
       <span class="rssi" :data-tone="rssiTone(d.rssi)">
         <i class="bars"><b /><b /><b /></i>
         {{ d.rssi === null ? '—' : `${d.rssi} dBm` }}
       </span>
 
-      <button
-        v-if="d.id === connectedId"
-        class="ghost"
-        disabled
-      >
-        已连接
-      </button>
+      <button v-if="d.id === connectedId" class="sm ghost" disabled>已连接</button>
       <button
         v-else
-        class="primary"
+        class="sm"
         :disabled="busy || connectedId !== null"
         @click="emit('connect', d.id)"
       >
@@ -72,13 +60,15 @@ function shortId(id: string): string {
   display: flex;
   flex-direction: column;
   gap: 2px;
-  min-height: 0;
+  max-height: 168px;
+  overflow-y: auto;
+  scrollbar-width: thin;
 }
 
 .empty {
   color: var(--dim);
-  font-size: 12px;
-  padding: 18px 4px;
+  font-size: var(--fs-11);
+  padding: 14px 4px;
   margin: 0;
   line-height: 1.7;
 }
@@ -88,8 +78,8 @@ function shortId(id: string): string {
   grid-template-columns: minmax(0, 1fr) auto auto auto;
   align-items: center;
   gap: 10px;
-  padding: 9px 10px;
-  border-radius: 8px;
+  padding: 7px 8px;
+  border-radius: var(--r-sm);
   border: 1px solid transparent;
 }
 
@@ -99,7 +89,7 @@ function shortId(id: string): string {
 }
 
 .row[data-connected='true'] {
-  background: #3ddc970f;
+  background: #3ddc970c;
   border-color: #3ddc9733;
 }
 
@@ -113,18 +103,20 @@ function shortId(id: string): string {
   overflow: hidden;
   text-overflow: ellipsis;
   white-space: nowrap;
+  font-size: var(--fs-12);
   font-weight: 500;
 }
 
 .sub {
   color: var(--dim);
+  font-size: var(--fs-10);
 }
 
 .badge {
-  font-size: 11px;
+  font-size: var(--fs-10);
   padding: 1px 7px;
-  border-radius: 999px;
-  background: #4c8dff1f;
+  border-radius: var(--r-pill);
+  background: #4c8dff1c;
   color: #9ec3ff;
   white-space: nowrap;
 }
@@ -138,10 +130,10 @@ function shortId(id: string): string {
   display: inline-flex;
   align-items: center;
   gap: 6px;
-  font-size: 11.5px;
+  font-size: var(--fs-11);
   color: var(--muted);
   font-variant-numeric: tabular-nums;
-  min-width: 74px;
+  min-width: 68px;
   justify-content: flex-end;
 }
 
@@ -188,6 +180,6 @@ function shortId(id: string): string {
 }
 
 button {
-  min-width: 62px;
+  min-width: 58px;
 }
 </style>
