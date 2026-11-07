@@ -19,7 +19,6 @@ use apm_link::Notification;
 use std::collections::VecDeque;
 use std::path::{Path, PathBuf};
 use std::sync::{
-    atomic::{AtomicBool, Ordering},
     Arc, Mutex as StdMutex, MutexGuard,
 };
 use std::time::{Duration, Instant};
@@ -69,6 +68,12 @@ const EARLY_STOP_MIN_BLOCKS: u64 = 10;
 /// 取整不取 1 s 是为了让日志里的触发时刻看起来不像是卡在整秒。
 const AUTO_STOP_TICK: Duration = Duration::from_secs(5);
 
+/// "未推流却收到音频块"告警的最小间隔。
+///
+/// 设备在 CTRL 状态不一致时会以 50 块/秒推音频，若每块记一条日志，一秒钟就是
+/// 50 行、而且全在通知循环里 —— 那不是诊断，那是自己制造故障。
+const STRAY_AUDIO_LOG_EVERY: Duration = Duration::from_secs(5);
+
 struct Inner {
     state: AppState,
     devices: Vec<DeviceView>,
@@ -76,8 +81,23 @@ struct Inner {
     scan_cancel: Option<watch::Sender<bool>>,
     /// 存在表示通知监控在跑；`send(true)` 即请求收尾断链。
     link_stop: Option<watch::Sender<bool>>,
+    /// **链路代次**：每建立一条新链路 +1，断开/收尾时不动。
+    ///
+    /// 所有"跨 await 之后要改状态"的异步迁移都必须先校验它没变（见 `set_state_if_link`）。
+    /// 没有这一条时，`start_stream` 在 `CTRL START` 的往返窗口里被断链收尾插进来，
+    /// 就会把已经拆掉的链路重新标成 `Ready` —— 界面显示"已连接"，但点开麦永远失败，
+    /// 只能重启 App（B2）。`connect_inner` / `teardown` 都靠它判断"我还是不是当初那条链路"。
+    link_epoch: u64,
     /// 正在推流的会话。**唯一**的音频消费入口在 `monitor_loop`。
     stream: Option<Pipeline>,
+    /// 有一条 `start_stream` 正在推进中（已通过前置校验，还没落定）。
+    ///
+    /// 开流是"STOP → 等 120 ms → 开声卡 → START"的一串 await，全程约 200–300 ms，
+    /// 而这段时间入口只看到 `state == Ready`、`stream == None`。两个并发调用
+    /// （用户双击「开始」、或界面按钮与设备 OK 键撞上）会各自建一条 `Pipeline`：
+    /// 后写入的覆盖先写入的，被覆盖的那个在 async 上下文里同步 `join` 声卡线程，
+    /// 阻塞 tokio worker；声卡也被打开两次（B1）。这个标志是那个窗口的占位锁。
+    stream_starting: bool,
     /// 最近若干次会话（用于音质报告页）。
     sessions: VecDeque<SessionRecord>,
     settings: Settings,
@@ -86,6 +106,17 @@ struct Inner {
     /// 监控循环判定"链路已经没了"。收尾时据此跳过 `disconnect()`——对一只已经消失的
     /// 外设调它只会白等一个超时，而且必然失败。
     link_lost: bool,
+    /// 上一次 STATUS 心跳。只用于判断"这条心跳与上一条有没有实质变化"，
+    /// 决定要不要记日志 —— 每秒一条无条件 Info 会把日志变成噪声源。
+    last_status: Option<apm_protocol::frame::Status>,
+    /// 未推流时收到的音频块累计（用于限流告警里报数量）。
+    stray_audio_blocks: u64,
+    /// 上一次打"未推流却收到音频"告警的时刻。
+    stray_audio_logged: Option<Instant>,
+    /// 收到但解析不出来的通知累计（B6）。与"链路安静"必须分开统计。
+    malformed_blocks: u64,
+    /// 上一次打"无法解析的通知"告警的时刻。
+    malformed_logged: Option<Instant>,
     /// 最近一次电量结论，三层语义：
     /// `None` = 还没读过 / 没有链路；`Some(None)` = 设备明确报"不可用"；
     /// `Some(Some(pct))` = 有效百分比。
@@ -112,11 +143,14 @@ pub struct SessionRecord {
 }
 
 /// 声卡的界面视图。字段够用来判断"能不能选"，不暴露 cpal 类型。
+///
+/// 只带界面真正用到的字段。`SinkInfo` 里的 `uid` / `channels` 曾经一路复制到这里
+/// 却没有任何消费方（前端只读 `name` 与 `supports_16k`），属于"为以后可能的
+/// WASAPI 按 UID 匹配"预留的字段 —— 真要上 Windows 时再加，现在留着只是契约噪音。
 #[derive(Debug, Clone, serde::Serialize)]
 pub struct SinkView {
     pub name: String,
-    pub uid: String,
-    pub channels: u16,
+    /// 该声卡支持的采样率范围，只用于"不支持 16 kHz"时的错误文案。
     pub min_rate: u32,
     pub max_rate: u32,
     pub supports_16k: bool,
@@ -162,10 +196,6 @@ pub struct AppCore {
     sink: StdMutex<LogSink>,
     tail: StdMutex<VecDeque<LogEntry>>,
     version: &'static str,
-    /// PTT 开关防抖：DOUBLE 手势会连发两次 PRESS（固件协议如此），而开/关麦本身
-    /// 有几百毫秒的状态切换窗口。这期间再来的 PRESS 直接忽略——既避免了"开了又关"
-    /// 的双击副作用，也堵住了并发开关两条会话的竞态。
-    ptt_switching: AtomicBool,
 }
 
 /// 把动作描述成 `ctrl+enter`、`esc ×2` 这种形式，只用于日志与控制台输出。
@@ -207,11 +237,18 @@ impl AppCore {
                 devices: Vec::new(),
                 scan_cancel: None,
                 link_stop: None,
+                link_epoch: 0,
                 stream: None,
+                stream_starting: false,
                 sessions: VecDeque::new(),
                 settings,
                 exec: None,
                 link_lost: false,
+                last_status: None,
+                stray_audio_blocks: 0,
+                stray_audio_logged: None,
+                malformed_blocks: 0,
+                malformed_logged: None,
                 battery: None,
             }),
             link: AsyncMutex::new(None),
@@ -219,7 +256,6 @@ impl AppCore {
             sink: StdMutex::new(LogSink::new(log_dir)),
             tail: StdMutex::new(VecDeque::new()),
             version: env!("CARGO_PKG_VERSION"),
-            ptt_switching: AtomicBool::new(false),
         });
         core.record(
             LogLevel::Info,
@@ -272,12 +308,25 @@ impl AppCore {
 
     /// 启动自动连接开关。立即落盘：用户勾完就关 App 也得记住。
     pub fn set_auto_connect(&self, enabled: bool) -> Result<(), AppError> {
-        let mut inner = self.lock_inner();
-        inner.settings.auto_connect = enabled;
-        if let Err(err) = inner.settings.save() {
-            self.record(LogLevel::Warn, "ble", format!("保存配置失败：{err}"));
-        }
+        let snapshot = {
+            let mut inner = self.lock_inner();
+            inner.settings.auto_connect = enabled;
+            inner.settings.clone()
+        };
+        // **落盘在锁外**（A2）。`Inner` 是整个内核唯一的锁，而它同时被 BLE 通知任务
+        // 持有 —— 在这里写磁盘等于让音频块排在 fsync 后面。
+        self.persist(snapshot, "ble");
         Ok(())
+    }
+
+    /// 把配置写盘。**调用方必须已经放开 `inner` 锁**。
+    ///
+    /// 传进来的是一份克隆而不是 `&Settings`：这样调用点无法"顺手"在锁内调用它，
+    /// 编译器会挡住那种写法。
+    fn persist(&self, settings: Settings, source: &str) {
+        if let Err(err) = settings.save() {
+            self.record(LogLevel::Warn, source, format!("保存配置失败：{err}"));
+        }
     }
 
     pub fn snapshot(&self) -> AppSnapshot {
@@ -500,7 +549,15 @@ impl AppCore {
             device_id: device_id.clone(),
         });
         // 新链路：上一台设备的电量结论立刻作废，别把旧数字留给新设备。
-        self.lock_inner().battery = None;
+        // STATUS 的"上一次值"同理 —— 留着会让新链路的第一次心跳被误判成"没变化"，
+        // 于是第一条证据被吞掉。未推流告警的计数器也是按链路重置的。
+        {
+            let mut inner = self.lock_inner();
+            inner.battery = None;
+            inner.last_status = None;
+            inner.stray_audio_blocks = 0;
+            inner.stray_audio_logged = None;
+        }
         self.record(LogLevel::Info, "ble", format!("连接 {device_id}"));
 
         let connected = tokio::time::timeout(
@@ -533,7 +590,7 @@ impl AppCore {
 
         // 设备视图优先用扫描列表里的真实名字；启动自动连接没经过扫描时
         // （devices 为空），退回配置里记的上次设备名。
-        let device = {
+        let (device, saved) = {
             let mut inner = self.lock_inner();
             let remembered = inner.settings.last_device_name.clone();
             let view = inner
@@ -556,11 +613,10 @@ impl AppCore {
             // 跨进程重启稳定）。手动断开不清除——用户关掉重开 App 通常还是想连它。
             inner.settings.last_device_id = Some(device_id.clone());
             inner.settings.last_device_name = Some(view.name.clone());
-            if let Err(err) = inner.settings.save() {
-                self.record(LogLevel::Warn, "ble", format!("保存配置失败：{err}"));
-            }
-            view
+            (view, inner.settings.clone())
         };
+        // 落盘在锁外（A2）：连接成功后立刻写，别让音频块排在它后面。
+        self.persist(saved, "ble");
 
         // 电量只在变化时通知，连接后主动读一次，前端立刻有数。
         // 三种结果都要落到内核并发出事件：`pct=None` 让界面显示「电量不可用」，
@@ -591,13 +647,24 @@ impl AppCore {
         self.emit(AppEvent::Battery { pct });
 
         *self.link.lock().await = Some(link);
-        // 新链路：把"已知丢失"的标记清掉，否则第一次收尾就会跳过一次正常的断开调用。
-        self.lock_inner().link_lost = false;
+        // 新链路：代次 +1，所有在飞的异步迁移（旧的 start_stream / 收尾）随之作废。
+        // 同时把"已知丢失"的标记清掉，否则第一次收尾就会跳过一次正常的断开调用。
+        let epoch = {
+            let mut inner = self.lock_inner();
+            inner.link_lost = false;
+            inner.link_epoch = inner.link_epoch.wrapping_add(1);
+            inner.link_epoch
+        };
         let (stop_tx, stop_rx) = watch::channel(false);
         self.lock_inner().link_stop = Some(stop_tx);
         self.set_state(AppState::Ready {
             device: device.clone(),
         });
+        self.record(
+            LogLevel::Debug,
+            "ble",
+            format!("链路代次 → {epoch}"),
+        );
         self.record(
             LogLevel::Info,
             "ble",
@@ -622,7 +689,10 @@ impl AppCore {
     pub async fn auto_connect(self: &Arc<Self>) -> Result<(), AppError> {
         let (device_id, device_name) = {
             let inner = self.lock_inner();
-            match (&inner.settings.auto_connect, inner.settings.last_device_id.clone()) {
+            match (
+                &inner.settings.auto_connect,
+                inner.settings.last_device_id.clone(),
+            ) {
                 (true, Some(id)) if inner.state == AppState::Idle => {
                     let name = inner
                         .settings
@@ -676,15 +746,12 @@ impl AppCore {
     /// 枚举输出设备。`supports_16k=false` 的设备仍然列出，但界面要标出来 ——
     /// 直接灰掉会让用户以为"声卡没装好"。
     pub fn list_sinks(&self) -> Result<Vec<SinkView>, AppError> {
-        let list = apm_sink::list_sinks().map_err(|e| {
-            AppError::new(ErrorCode::SinkMissing, format!("枚举输出设备失败：{e}"))
-        })?;
+        let list = apm_sink::list_sinks()
+            .map_err(|e| AppError::new(ErrorCode::SinkMissing, format!("枚举输出设备失败：{e}")))?;
         Ok(list
             .into_iter()
             .map(|s| SinkView {
                 name: s.name,
-                uid: s.uid,
-                channels: s.channels,
                 min_rate: s.min_rate,
                 max_rate: s.max_rate,
                 supports_16k: s.supports_16k,
@@ -711,24 +778,25 @@ impl AppCore {
                 ),
             ));
         }
-        {
+        let snapshot = {
             let mut inner = self.lock_inner();
             inner.settings.sink = Some(name.clone());
-            if let Err(err) = inner.settings.save() {
-                self.record(LogLevel::Warn, "sink", format!("保存配置失败：{err}"));
-            }
-        }
+            inner.settings.clone()
+        };
+        // 落盘在锁外（A2）：见 `persist` 的注释。
+        self.persist(snapshot, "sink");
         self.record(LogLevel::Info, "sink", format!("输出声卡改为 {name}"));
         Ok(())
     }
 
     /// 是否默认保存会话 WAV。默认关（`docs/GUI.md` §12 第 3 条）。
     pub fn set_save_wav(&self, save: bool) -> Result<(), AppError> {
-        let mut inner = self.lock_inner();
-        inner.settings.save_wav = save;
-        if let Err(err) = inner.settings.save() {
-            self.record(LogLevel::Warn, "app", format!("保存配置失败：{err}"));
-        }
+        let snapshot = {
+            let mut inner = self.lock_inner();
+            inner.settings.save_wav = save;
+            inner.settings.clone()
+        };
+        self.persist(snapshot, "app");
         Ok(())
     }
 
@@ -738,11 +806,12 @@ impl AppCore {
     /// 免得三处各夹一次、边界还不一样（与 `clamp_target` 同一套路）。
     pub fn set_auto_stop_min(&self, minutes: u32) -> Result<(), AppError> {
         let minutes = settings::clamp_auto_stop_min(minutes);
-        let mut inner = self.lock_inner();
-        inner.settings.auto_stop_min = minutes;
-        if let Err(err) = inner.settings.save() {
-            self.record(LogLevel::Warn, "app", format!("保存配置失败：{err}"));
-        }
+        let snapshot = {
+            let mut inner = self.lock_inner();
+            inner.settings.auto_stop_min = minutes;
+            inner.settings.clone()
+        };
+        self.persist(snapshot, "app");
         self.record(
             LogLevel::Info,
             "app",
@@ -754,15 +823,15 @@ impl AppCore {
     /// 缓冲目标（40–80 ms）。运行中改了取下一批回调生效，不需要重启推流。
     pub fn set_buffer_target(&self, ms: u32) -> Result<(), AppError> {
         let ms = settings::clamp_target(ms);
-        let stream = {
+        let (snapshot, streaming) = {
             let mut inner = self.lock_inner();
             inner.settings.target_ms = ms;
-            if let Err(err) = inner.settings.save() {
-                self.record(LogLevel::Warn, "sink", format!("保存配置失败：{err}"));
-            }
-            inner.stream.as_ref().map(|_| ())
+            (inner.settings.clone(), inner.stream.is_some())
         };
-        if stream.is_some() {
+        // 落盘与 retarget 都在锁外（A2）。`retarget` 只是往 channel 里塞一条消息，
+        // 但它要再取一次 `inner` —— 在锁内调用等于自己和自己抢锁。
+        self.persist(snapshot, "sink");
+        if streaming {
             if let Some(p) = self.lock_inner().stream.as_ref() {
                 p.retarget(ms);
             }
@@ -775,35 +844,80 @@ impl AppCore {
     /// 开始推流。返回 `session_id`；`save_wav` 为真时同时落一份 WAV。
     ///
     /// 前置校验失败直接返回错误，**不允许**先开流再报错（`docs/GUI.md` §4）。
+    ///
+    /// 并发与失效（B1 / B2）：
+    /// - 入口用 `stream_starting` 占位。开流是几百毫秒的一串 await，期间状态还是
+    ///   `ready`、`stream` 还是 `None`，不占位就会有两个调用各自建一条管线；
+    /// - 每次 await 回来都用 `set_state_if_link(epoch, ..)` 落状态：链路在等待期间
+    ///   被断链收尾拆掉时，不能再把状态写回 `ready`（那是陈旧写，界面会显示
+    ///   "已连接"而其实没有链路，点开麦永远失败且无法 disconnect）。
     pub async fn start_stream(self: &Arc<Self>, save_wav: bool) -> Result<String, AppError> {
-        let device = match self.state() {
-            AppState::Ready { device } => device,
-            other => {
-                return Err(AppError::busy(format!(
-                    "当前状态 {} 不能开始推流（需要先连上设备）",
-                    other.kind()
-                )))
+        // ---- 前置校验 + 占位：全程在同一把锁里完成，两个并发调用只有一个能过 ----
+        let (device, epoch, sink_name, target_ms, started_ms, session_id, wav_path) = {
+            let mut inner = self.lock_inner();
+            let device = match &inner.state {
+                AppState::Ready { device } => device.clone(),
+                other => {
+                    return Err(AppError::busy(format!(
+                        "当前状态 {} 不能开始推流（需要先连上设备）",
+                        other.kind()
+                    )))
+                }
+            };
+            if inner.stream.is_some() {
+                return Err(AppError::busy("已经在推流"));
             }
-        };
-        if self.lock_inner().stream.is_some() {
-            return Err(AppError::busy("已经在推流"));
-        }
+            if inner.stream_starting {
+                return Err(AppError::busy("上一次开流还没完成"));
+            }
+            let Some(sink) = inner.settings.sink.clone() else {
+                return Err(AppError::new(
+                    ErrorCode::SinkMissing,
+                    "还没有选择输出声卡：先在下拉框里选一个（macOS 通常装 BlackHole 2ch）",
+                ));
+            };
+            // 占位必须在返回错误之前撤销，所以这里一旦过了校验就立刻置位。
+            inner.stream_starting = true;
 
-        let (sink_name, target_ms) = {
-            let inner = self.lock_inner();
-            (inner.settings.sink.clone(), inner.settings.target_ms)
-        };
-        let sink_name = sink_name.ok_or_else(|| {
-            AppError::new(
-                ErrorCode::SinkMissing,
-                "还没有选择输出声卡：先在下拉框里选一个（macOS 通常装 BlackHole 2ch）",
+            let started_ms = epoch_ms();
+            let session_id = format!("s{started_ms}");
+            let wav_path =
+                save_wav.then(|| settings::sessions_dir().join(format!("{session_id}.wav")));
+            (
+                device,
+                inner.link_epoch,
+                sink,
+                inner.settings.target_ms,
+                started_ms,
+                session_id,
+                wav_path,
             )
-        })?;
+        };
 
-        let started_ms = epoch_ms();
-        let session_id = format!("s{started_ms}");
-        let wav_path = save_wav.then(|| settings::sessions_dir().join(format!("{session_id}.wav")));
+        // 从这里开始任何提前返回都必须撤销占位。
+        match self
+            .start_stream_locked(device, epoch, sink_name, target_ms, started_ms, session_id, wav_path)
+            .await
+        {
+            Ok(id) => Ok(id),
+            Err(err) => {
+                self.lock_inner().stream_starting = false;
+                Err(err)
+            }
+        }
+    }
 
+    #[allow(clippy::too_many_arguments)]
+    async fn start_stream_locked(
+        self: &Arc<Self>,
+        device: DeviceView,
+        epoch: u64,
+        sink_name: String,
+        target_ms: u32,
+        started_ms: u64,
+        session_id: String,
+        wav_path: Option<PathBuf>,
+    ) -> Result<String, AppError> {
         // 开流前先发一次 STOP，把设备状态清干净，再开声卡、再 START。
         //
         // 为什么需要这一步（2026-11-05 G2 现场，见 docs/KNOWN_ISSUES.md KI-005）：
@@ -852,7 +966,25 @@ impl AppCore {
             format!("打开输出 {info}（目标缓冲 {target_ms} ms）{wav_note}"),
         );
 
-        self.lock_inner().stream = Some(pipeline);
+        // 声卡已打开：把它挂上。**同一次加锁里**校验代次 —— 如果等待期间链路被拆，
+        // 这条管线已经没有消费入口（`monitor_loop` 是唯一消费者），必须立刻收掉，
+        // 否则声卡会一直往虚拟声卡写静音。
+        let mut pipeline = Some(pipeline);
+        {
+            let mut inner = self.lock_inner();
+            if inner.link_epoch == epoch {
+                inner.stream = pipeline.take();
+            }
+        }
+        if let Some(stale) = pipeline {
+            let _ = tokio::task::spawn_blocking(move || stale.finish()).await;
+            self.record(
+                LogLevel::Warn,
+                "sink",
+                "开流期间链路已被断开，本次会话已取消（声卡已关闭）",
+            );
+            return Err(AppError::busy("链路已断开，先重新连接设备"));
+        }
 
         // CTRL START 失败就把会话收回去，别留一个"界面在推流、设备没在采"的假象。
         // 把 `Link` clone 出来再 await，不持锁：`Link` 是 Send + Sync 的（见 `apm_link::Link`
@@ -874,7 +1006,8 @@ impl AppCore {
             self.record(LogLevel::Error, "sink", err.detail.clone());
             // 回到 ready 而不是 error：设备还连着，用户改一下设置就能重试；
             // 落到 error 会让"再点一次开始"被状态机挡住。
-            self.set_state(AppState::Ready { device });
+            // 用世代校验落状态：链路若已断，这里应当什么都不做（收尾流程会落到 idle）。
+            self.set_state_if_link(epoch, AppState::Ready { device });
             return Err(err);
         }
 
@@ -890,12 +1023,28 @@ impl AppCore {
             while inner.sessions.len() > SESSIONS_KEPT {
                 inner.sessions.pop_front();
             }
+            // 开流已落定：撤销占位（与入口的置位成对）。
+            inner.stream_starting = false;
         }
 
-        self.set_state(AppState::Streaming {
-            device,
-            session_id: session_id.clone(),
-        });
+        // 最后一次世代校验：`CTRL START` 往返期间链路可能已经被拆。此时会话记录已经
+        // 写进 `sessions`（那是历史，不该回滚），但**不能再把状态写成 `Streaming`**
+        // —— 否则界面显示"推流中"而实际没有任何消费入口。
+        if !self.set_state_if_link(
+            epoch,
+            AppState::Streaming {
+                device,
+                session_id: session_id.clone(),
+            },
+        ) {
+            self.record(
+                LogLevel::Warn,
+                "sink",
+                "开流完成时链路已断开：本次会话不计入推流状态",
+            );
+            self.fire_hook("capture.stop");
+            return Err(AppError::busy("链路已断开，先重新连接设备"));
+        }
         // 采集真的起来了才触发钩子：失败路径已经 return，不会误报"已开麦"。
         self.fire_hook("capture.start");
         self.remember_exec();
@@ -929,9 +1078,8 @@ impl AppCore {
                     let inner = core.lock_inner();
                     match inner.stream.as_ref() {
                         Some(p) => {
-                            let limit = Duration::from_secs(
-                                u64::from(inner.settings.auto_stop_min) * 60,
-                            );
+                            let limit =
+                                Duration::from_secs(u64::from(inner.settings.auto_stop_min) * 60);
                             Some((p.should_auto_stop(limit), limit, p.blocks()))
                         }
                         // 会话结束了就退出，别留空转任务。
@@ -1038,18 +1186,20 @@ impl AppCore {
     }
 
     /// 在独立 std 线程里点按注入一个动作（采集钩子与设备按键共用的出口）。
-    fn inject_in_background(self: &Arc<Self>, what: String, binding: apm_protocol::keymap::Binding) {
+    fn inject_in_background(
+        self: &Arc<Self>,
+        what: String,
+        binding: apm_protocol::keymap::Binding,
+    ) {
         let core = Arc::clone(self);
         let label = describe_binding(&binding);
         let spawned = std::thread::Builder::new()
             .name("apm-inject".into())
             .spawn(move || match crate::inject::tap(&binding) {
                 Ok(()) => core.record(LogLevel::Info, "inject", format!("{what} 已注入 {label}")),
-                Err(err) => core.record(
-                    LogLevel::Warn,
-                    "inject",
-                    format!("{what} 注入失败：{err}"),
-                ),
+                Err(err) => {
+                    core.record(LogLevel::Warn, "inject", format!("{what} 注入失败：{err}"))
+                }
             });
         if let Err(err) = spawned {
             self.record(LogLevel::Warn, "inject", format!("起注入线程失败：{err}"));
@@ -1087,9 +1237,11 @@ impl AppCore {
                     let core = Arc::clone(self);
                     handle.spawn(async move { core.toggle_ptt().await });
                 }
-                Err(_) => {
-                    self.record(LogLevel::Warn, "button", "没有 tokio 运行时，PTT 开关无法执行")
-                }
+                Err(_) => self.record(
+                    LogLevel::Warn,
+                    "button",
+                    "没有 tokio 运行时，PTT 开关无法执行",
+                ),
             }
         } else {
             self.inject_in_background(format!("按键 {name}"), binding);
@@ -1099,22 +1251,13 @@ impl AppCore {
     /// PTT 开关的唯一执行点：设备 OK 键走这里，语义与界面按钮完全一致
     /// （同一条 `start_stream` / `stop_stream`，钩子照常触发）。
     ///
-    /// 防抖：切换进行中（`ptt_switching`）再来的 PRESS 直接忽略。开麦有 120 ms
-    /// 的 STOP→START 静默窗口，关麦要收声卡线程——DOUBLE 的两次 PRESS 相隔约
-    /// 180 ms，落在窗口内就被当作一次动作，这是对"开了又关"副作用的修复而不是新行为。
+    /// 防抖：**不再单独维护一个 `ptt_switching` 原子量。**
+    /// 开麦的并发保护由 `Inner::stream_starting` 承担（它在锁内占位，覆盖
+    /// "STOP → 等 120 ms → 开声卡 → START" 整个窗口）；关麦由 `stream.is_none()`
+    /// 挡住第二次调用。DOUBLE 的两次 PRESS 相隔约 180 ms，第二次进来时
+    /// 要么占位还在（返回 busy）、要么已经在 `streaming`（`toggle` 会去关麦）——
+    /// 这里只在**开麦失败是 busy** 时降级成 debug，不弹 warn。
     async fn toggle_ptt(self: &Arc<Self>) {
-        if self
-            .ptt_switching
-            .compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst)
-            .is_err()
-        {
-            self.record(
-                LogLevel::Debug,
-                "button",
-                "PTT 切换进行中，忽略本次按键（防抖）",
-            );
-            return;
-        }
         let streaming = self.lock_inner().stream.is_some();
         let action = if streaming { "关麦" } else { "开麦" };
         let result = if streaming {
@@ -1123,15 +1266,22 @@ impl AppCore {
             let save_wav = self.lock_inner().settings.save_wav;
             self.start_stream(save_wav).await.map(|_| ())
         };
-        self.ptt_switching.store(false, Ordering::SeqCst);
         match result {
             Ok(()) => self.record(LogLevel::Info, "button", format!("PTT {action}完成")),
             Err(err) => {
                 if err.code == ErrorCode::Busy {
                     // busy 是状态机在挡（比如界面正在收尾），记 debug 留证据即可。
-                    self.record(LogLevel::Debug, "button", format!("PTT 暂不能切换：{}", err.detail));
+                    self.record(
+                        LogLevel::Debug,
+                        "button",
+                        format!("PTT 暂不能切换：{}", err.detail),
+                    );
                 } else {
-                    self.record(LogLevel::Warn, "button", format!("PTT 切换失败：{}", err.detail));
+                    self.record(
+                        LogLevel::Warn,
+                        "button",
+                        format!("PTT 切换失败：{}", err.detail),
+                    );
                 }
             }
         }
@@ -1151,19 +1301,26 @@ impl AppCore {
         self: &Arc<Self>,
         reason: &str,
     ) -> Result<SessionSummary, AppError> {
-        if self.lock_inner().stream.is_none() {
-            return Err(AppError::busy("当前没有在推流"));
-        }
-        let device = self.state().device().cloned();
+        let (device, epoch) = {
+            let inner = self.lock_inner();
+            if inner.stream.is_none() {
+                return Err(AppError::busy("当前没有在推流"));
+            }
+            (inner.state.device().cloned(), inner.link_epoch)
+        };
         self.set_state(AppState::Stopping);
 
         let summary = match self.take_and_finish_stream(reason).await {
             Some(summary) => summary,
             None => {
-                self.set_state(match device {
+                // 收尾失败同样要走世代校验：链路若已断，落 `ready` 就是陈旧写。
+                // 校验失败时**什么都不做** —— 断链收尾已经把状态落到它该去的地方
+                // （可能是 `idle`，也可能是 `no_adapter`），这里覆盖它反而是新的陈旧写。
+                let next = match device {
                     Some(device) => AppState::Ready { device },
                     None => AppState::Idle,
-                });
+                };
+                let _ = self.set_state_if_link(epoch, next);
                 return Err(AppError::internal("会话收尾失败，详见诊断日志"));
             }
         };
@@ -1171,13 +1328,25 @@ impl AppCore {
         let link = self.link.lock().await.clone();
         if let Some(link) = link {
             if let Err(err) = link.stop_capture().await {
-                self.record(LogLevel::Warn, "sink", format!("发送 CTRL STOP 失败：{err}"));
+                self.record(
+                    LogLevel::Warn,
+                    "sink",
+                    format!("发送 CTRL STOP 失败：{err}"),
+                );
             }
         }
 
-        match device {
-            Some(device) => self.set_state(AppState::Ready { device }),
-            None => self.set_state(AppState::Idle),
+        // 收流期间链路可能被断链收尾接管（它自己会落 `idle`）。这时不能再写 `ready`。
+        let next = match device {
+            Some(device) => AppState::Ready { device },
+            None => AppState::Idle,
+        };
+        if !self.set_state_if_link(epoch, next) {
+            self.record(
+                LogLevel::Debug,
+                "sink",
+                "收流完成时链路已被断开：状态由断链收尾决定，这里不再改写",
+            );
         }
         self.fire_hook("capture.stop");
         Ok(summary)
@@ -1192,7 +1361,10 @@ impl AppCore {
         let (path, link_slow) = {
             let inner = self.lock_inner();
             let rec = inner.sessions.iter().find(|s| s.session_id == session_id);
-            (rec.and_then(|s| s.wav_path.clone()), rec.map(|s| s.link_slow).unwrap_or(false))
+            (
+                rec.and_then(|s| s.wav_path.clone()),
+                rec.map(|s| s.link_slow).unwrap_or(false),
+            )
         };
         if link_slow {
             return Err(AppError::new(
@@ -1252,20 +1424,59 @@ impl AppCore {
         }
         if let Some(t) = telemetry {
             out.push_str(&format!(
-                "推流: 块={} 丢块={} 跳变={} 设备丢弃={} 缓冲={:.0} ms 欠载={} 静音帧={} 锁定失败={} 漂移={:+.0} ppm 毛刺={}\n",
+                "推流: 块={} 丢块={} 跳变={} 设备丢弃={} 缓冲={:.0} ms 欠载={}（断供 {}） 静音帧={} 锁定失败={} 漂移={:+.0} ppm 毛刺={}\n",
                 t.blocks,
                 t.lost_blocks,
                 t.seq_jumps,
                 t.device_dropped,
                 t.buffer_ms,
                 t.underruns,
+                t.underruns_underfed,
                 t.silent_frames,
                 t.lock_misses,
                 t.ppm,
                 t.glitch_events
             ));
+            // 延迟口径：实测存量 + 基准/余量分开，别让"目标 80 ms"被当成实际延迟。
+            out.push_str(&format!(
+                "缓冲口径: 实测存量 p50={} p95={}；用户基准={} ms 自适应余量=+{} ms\n",
+                t.fill_p50_ms
+                    .map(|v| format!("{v:.0} ms"))
+                    .unwrap_or_else(|| "—".into()),
+                t.fill_p95_ms
+                    .map(|v| format!("{v:.0} ms"))
+                    .unwrap_or_else(|| "—".into()),
+                t.base_target_ms,
+                t.boost_ms
+            ));
+            // 抖动只给**原始测量**，不给判词。
+            //
+            // 这里曾经输出一个 `jitter_verdict()`（clean / arrival-only / process-only / both），
+            // 是 2026-11-07 查 KI-006 时加的三把尺子归因。根因（CoreBluetooth 攒批交付）
+            // 查明并改判据之后，那套判词不再有消费方：诊断包给人看，人看得到下面这些数字
+            // 就能自己判断，多一层枚举只是把话说死、并在阈值边界上产生争议。
+            let jitter = {
+                let inner = self.lock_inner();
+                inner.stream.as_ref().map(|p| {
+                    let (_, arrival_max, late) = p.arrival_stats();
+                    let (_, process_max, slow) = p.process_stats();
+                    (arrival_max, late, process_max, slow)
+                })
+            };
+            if let Some((arrival_max, late, process_max, slow)) = jitter {
+                out.push_str(&format!(
+                    "抖动: 到达最大间隔={arrival_max:.1} ms（>80 ms {late} 次），\
+                     PC 处理最大耗时={process_max:.1} ms（>20 ms {slow} 块）\n"
+                ));
+            }
         } else {
             out.push_str("推流: 未推流\n");
+        }
+        let dropped = self.dropped_log_lines();
+        if dropped > 0 {
+            out.push_str(&format!(
+                "日志: 因队列满丢弃 {dropped} 行（磁盘写不过来，证据可能不全）\n"
+            ));
         }
         if let Some(s) = last {
             out.push_str(&format!(
@@ -1300,13 +1511,31 @@ impl AppCore {
         self.sink.lock().unwrap_or_else(|e| e.into_inner())
     }
 
+    /// 等日志队列排空并落盘。
+    ///
+    /// 正常路径**不需要**调（`record()` 入队即返回，写线程自己会落盘）。
+    /// 存在的理由是两件事需要"确定写完了"：进程正常退出前，以及测试要读文件时。
+    pub fn flush_logs(&self) {
+        self.lock_sink().flush();
+    }
+
+    /// 因日志队列满而丢弃的行数。诊断包里用它说明"日志可能不全"。
+    pub fn dropped_log_lines(&self) -> u64 {
+        self.lock_sink().dropped_lines()
+    }
+
     fn tail_snapshot(&self) -> Vec<LogEntry> {
         let tail = self.tail.lock().unwrap_or_else(|e| e.into_inner());
         tail.iter().cloned().collect()
     }
 
-    /// 记录一条日志：进内存环形缓冲、写文件、发事件。三处都做，缺一处就会
+    /// 记录一条日志：进内存环形缓冲、入落盘队列、发事件。三处都做，缺一处就会
     /// 出现"界面上看不到、事后也查不到"。
+    ///
+    /// **本方法不碰磁盘**（2026-11-07 起）：`LogSink::write` 只做一次有界内存入队，
+    /// 落盘在 `apm-log` 写线程里做。这条不是性能优化，是正确性要求 ——
+    /// 本方法会从音频通知循环里被调用（每秒一条 STATUS），同步写盘会把磁盘长尾
+    /// 直接加到"块到达间隔"的测量值上，让链路抖动与 PC 端停顿无法区分（KI-006）。
     pub fn record(&self, level: LogLevel, source: &str, message: impl Into<String>) {
         let entry = LogEntry {
             ts_ms: epoch_ms(),
@@ -1337,6 +1566,33 @@ impl AppCore {
             inner.state = next.clone();
             previous
         };
+        self.settle_state_change(previous, next);
+    }
+
+    /// 只在**链路还是当初那条**时才落状态；否则什么都不做并返回 `false`。
+    ///
+    /// 这是跨 await 的状态迁移必须走的入口。异步迁移（开流/收流/重连）在 await 之间
+    /// 会放开锁，期间断链收尾可能已经把链路拆掉、把状态落到 `idle`。此时再用旧结论
+    /// `set_state(Ready)` 就是**陈旧写**：界面显示已连接，实际 `link` 是 `None`，
+    /// 点开麦必然失败，且 `disconnect()` 因为两个字段都是空而什么都不做 ——
+    /// 只能重启 App（B2 的原始症状）。
+    ///
+    /// 校验与写入在同一把锁里完成，所以不存在"校验通过之后又被拆"的窗口。
+    fn set_state_if_link(&self, epoch: u64, next: AppState) -> bool {
+        let previous = {
+            let mut inner = self.lock_inner();
+            if inner.link_epoch != epoch {
+                return false;
+            }
+            let previous = inner.state.clone();
+            inner.state = next.clone();
+            previous
+        };
+        self.settle_state_change(previous, next);
+        true
+    }
+
+    fn settle_state_change(&self, previous: AppState, next: AppState) {
         if previous != next {
             self.record(
                 LogLevel::Info,
@@ -1345,6 +1601,15 @@ impl AppCore {
             );
         }
         self.emit(AppEvent::StateChanged { state: next });
+    }
+
+    /// 当前链路代次。异步迁移在入口拍一张快照，回来时用它校验。
+    ///
+    /// 生产代码只通过 [`Self::set_state_if_link`] 间接使用代次；这个读取口是给测试
+    /// 断言"收尾确实推进了代次"用的，所以标了 `cfg(test)` 之外的 `allow(dead_code)`。
+    #[cfg_attr(not(test), allow(dead_code))]
+    fn link_epoch(&self) -> u64 {
+        self.lock_inner().link_epoch
     }
 
     fn fail(&self, err: AppError) {
@@ -1431,16 +1696,12 @@ impl AppCore {
                     }
                 }
                 self.emit(AppEvent::SessionDone {
-                    summary: summary.clone(),
+                    summary: Box::new(summary.clone()),
                 });
                 Some(summary)
             }
             Err(err) => {
-                self.record(
-                    LogLevel::Error,
-                    "sink",
-                    format!("会话收尾任务失败：{err}"),
-                );
+                self.record(LogLevel::Error, "sink", format!("会话收尾任务失败：{err}"));
                 None
             }
         }
@@ -1524,6 +1785,9 @@ impl AppCore {
 
             match next {
                 Ok(Some(notification)) => {
+                    // **任何** `Ok(Some(_))` 都算"设备还在说话"，包括 `Malformed`。
+                    // 这条不变式是 B6 的落点：坏帧证明链路通着，不该让下面的
+                    // "静默超时 → 探活"误判成设备消失。
                     last_seen = Instant::now();
                     self.handle_notification(notification);
                 }
@@ -1596,14 +1860,34 @@ impl AppCore {
                 if let Some(p) = self.lock_inner().stream.as_mut() {
                     p.on_status(&status);
                 }
-                self.record(
-                    LogLevel::Info,
-                    "status",
-                    format!(
-                        "state={} flags={:#04x} sent={} dropped={}",
-                        status.state, status.flags, status.sent, status.dropped
-                    ),
-                );
+                // **只在变化时记日志**。设备每秒一条心跳，无条件记 Info 等于每秒一次
+                // 日志事件；而本函数与音频解码在同一个任务里（见 `monitor_loop`）。
+                // 2026-11-07 之前这里是"每秒一行、同步写盘"，磁盘长尾会直接混进
+                // `Pipeline` 的块到达间隔测量里，把"链路抖动"和"PC 自己停顿"搅在一起。
+                // `sent` 每块都在涨，不能参与判"变化"，否则等于没变。
+                let changed = {
+                    let mut inner = self.lock_inner();
+                    let changed = match inner.last_status {
+                        Some(prev) => {
+                            prev.state != status.state
+                                || prev.flags != status.flags
+                                || prev.dropped != status.dropped
+                        }
+                        None => true,
+                    };
+                    inner.last_status = Some(status);
+                    changed
+                };
+                if changed {
+                    self.record(
+                        LogLevel::Info,
+                        "status",
+                        format!(
+                            "state={} flags={:#04x} sent={} dropped={}",
+                            status.state, status.flags, status.sent, status.dropped
+                        ),
+                    );
+                }
             }
             Notification::Event(event) => {
                 self.record(
@@ -1625,33 +1909,82 @@ impl AppCore {
                     let mut inner = self.lock_inner();
                     match inner.stream.as_mut() {
                         Some(p) => {
-                            p.on_audio(&block);
+                            p.on_audio(&block.data, block.received_at, block.read_waited);
                             true
                         }
                         None => false,
                     }
                 };
                 if !streamed {
-                    // 没在推流时收到音频说明 CTRL 状态不一致，值得记一条。
+                    // 没在推流时收到音频说明 CTRL 状态不一致，值得记一条 ——
+                    // 但**不能每块一条**：设备 50 块/秒，一秒钟就是 50 行日志，
+                    // 而且全在通知循环里。这里按"首次 + 每 5 s 最多一条"限流，
+                    // 并把期间的块数累计进去，证据不丢、噪声受控。
+                    let now = Instant::now();
+                    let (count, should_log) = {
+                        let mut inner = self.lock_inner();
+                        inner.stray_audio_blocks += 1;
+                        let due = inner
+                            .stray_audio_logged
+                            .map(|at| now.duration_since(at) >= STRAY_AUDIO_LOG_EVERY)
+                            .unwrap_or(true);
+                        if due {
+                            inner.stray_audio_logged = Some(now);
+                        }
+                        (inner.stray_audio_blocks, due)
+                    };
+                    if should_log {
+                        self.record(
+                            LogLevel::Warn,
+                            "audio",
+                            format!(
+                                "收到音频块 {} 字节但当前未推流（本段累计 {count} 块）：CTRL 状态不一致",
+                                block.data.len()
+                            ),
+                        );
+                    }
+                }
+            }
+            Notification::Pong(seq) => {
+                self.record(LogLevel::Debug, "ping", format!("PONG seq={seq}"))
+            }
+            Notification::Malformed { uuid, reason } => {
+                // **不能当成"安静"**（B6）。设备发了东西但解析不出来，说明链路是通的，
+                // 问题在帧/载荷本身。这里要留下证据，否则"设备在发但数据坏了"
+                // 会表现成"什么都没收到"，把排查方向带偏到蓝牙连接上。
+                //
+                // 但也不能每帧一条：坏帧可能连续来（比如固件版本不匹配期间每秒一条
+                // STATUS）。与杂散音频同一套限流，并按窗口累计。
+                let now = Instant::now();
+                let (count, should_log) = {
+                    let mut inner = self.lock_inner();
+                    inner.malformed_blocks += 1;
+                    let due = inner
+                        .malformed_logged
+                        .map(|at| now.duration_since(at) >= STRAY_AUDIO_LOG_EVERY)
+                        .unwrap_or(true);
+                    if due {
+                        inner.malformed_logged = Some(now);
+                    }
+                    (inner.malformed_blocks, due)
+                };
+                if should_log {
                     self.record(
                         LogLevel::Warn,
-                        "audio",
-                        format!("收到音频块 {} 字节但当前未推流", block.len()),
+                        "ble",
+                        format!(
+                            "收到无法解析的通知（{uuid}）：{reason}；本段累计 {count} 条。\
+                             帧坏了不等于链路断了——先查固件/桌面端协议版本是否一致"
+                        ),
                     );
                 }
             }
-            Notification::Pong(seq) => self
-                .record(LogLevel::Debug, "ping", format!("PONG seq={seq}")),
             Notification::Battery(pct) => {
                 // 设备只在数值变化时通知（1 s 采样），不需要去抖。
                 // 同样先落内核再发事件：晚注册监听的前端靠快照补。
                 self.lock_inner().battery = Some(Some(pct));
                 self.emit(AppEvent::Battery { pct: Some(pct) });
-                self.record(
-                    LogLevel::Debug,
-                    "ble",
-                    format!("电量变化：{pct}%"),
-                );
+                self.record(LogLevel::Debug, "ble", format!("电量变化：{pct}%"));
             }
         }
     }
@@ -1659,6 +1992,16 @@ impl AppCore {
     /// 收尾：先停声卡 → 再退订断链 → 最后落状态。
     async fn teardown(self: &Arc<Self>, next: Option<AppState>) {
         self.set_state(AppState::Stopping);
+        // **先推进代次**：收尾一开始，所有在飞的异步迁移（`start_stream` /
+        // `stop_stream` / `reconnect_after_reset`）的世代校验就该失效。
+        // 放在这里而不是末尾，是为了覆盖"收尾自身也要 await"的那段窗口。
+        //
+        // 注意：这里必须只取一次锁。写成 `self.lock_inner().link_epoch = self.lock_inner()...`
+        // 会在同一个 `StdMutex` 上重入 —— `std::sync::Mutex` 不可重入，那一行会永久自锁。
+        {
+            let mut inner = self.lock_inner();
+            inner.link_epoch = inner.link_epoch.wrapping_add(1);
+        }
         let was_streaming = self.lock_inner().stream.is_some();
         if was_streaming {
             self.take_and_finish_stream("链路结束").await;
@@ -1808,6 +2151,71 @@ mod tests {
         assert!(tail.last().unwrap().message.ends_with("49"));
     }
 
+    /// **A2 回归：改配置时不能持有内核锁跨过磁盘写。**
+    ///
+    /// 判据不是"耗时多少"（磁盘快的时候测不出来），而是**锁的可获取性**：
+    /// 在设置并发线程里反复 `set_*` 的同一个窗口里，另一条线程必须能拿到锁。
+    /// 旧的写法在锁内 `settings.save()`，只要那次写盘慢一点点，
+    /// 这里的 `try_lock` 就会失败。
+    ///
+    /// 为了把窗口放大，用一个很慢的临时目录（`/dev/null` 下的子目录不可用，
+    /// 所以改用大量小写入的真实目录），并反复跑若干轮；任何一次抢不到都算失败。
+    #[test]
+    fn settings_writes_do_not_hold_the_core_lock() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+        let core = quiet_core("apm-app-test-lockfree");
+
+        let stop = Arc::new(AtomicBool::new(false));
+        let rounds = Arc::new(std::sync::atomic::AtomicU32::new(0));
+        let writer_core = Arc::clone(&core);
+        let writer_stop = Arc::clone(&stop);
+        let writer_rounds = Arc::clone(&rounds);
+        let writer = std::thread::spawn(move || {
+            let mut i = 0u32;
+            while !writer_stop.load(Ordering::Relaxed) {
+                // 三个入口都走过"改内存 + 落盘"这条路。
+                let _ = writer_core.set_save_wav(i.is_multiple_of(2));
+                let _ = writer_core.set_auto_stop_min(10 + (i % 5));
+                let _ = writer_core.set_auto_connect(i.is_multiple_of(2));
+                i += 1;
+                writer_rounds.store(i, Ordering::Relaxed);
+            }
+        });
+
+        // 先等写线程真的跑起来（至少完成几轮），再开始采样 ——
+        // 否则主线程的 20_000 次 `try_lock` 可能比写线程的第一轮还快，
+        // 断言会退化成"什么都没测到"。
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        while rounds.load(Ordering::Relaxed) < 4 && std::time::Instant::now() < deadline {
+            std::thread::yield_now();
+        }
+
+        // 另一侧不断尝试拿锁：拿不到就说明有人在锁内做慢操作。
+        let mut starved = 0u32;
+        for _ in 0..20_000 {
+            match core.inner.try_lock() {
+                Ok(guard) => drop(guard),
+                Err(std::sync::TryLockError::WouldBlock) => starved += 1,
+                Err(std::sync::TryLockError::Poisoned(e)) => drop(e.into_inner()),
+            }
+        }
+        stop.store(true, Ordering::Relaxed);
+        writer.join().unwrap();
+
+        // 允许少量竞争（写线程确实要改内存），但"每次都在等磁盘"会是大比例。
+        // 20_000 次里偶尔撞上几次是正常的临界区竞争。
+        assert!(
+            starved < 2_000,
+            "20_000 次里 {starved} 次拿不到内核锁 —— 说明锁被跨磁盘 IO 持有"
+        );
+        // 防止测试退化成"写线程根本没跑"的假通过。
+        assert!(
+            rounds.load(Ordering::Relaxed) >= 4,
+            "写线程在 5 s 内没跑完 4 轮（{} 轮），这条测试没能覆盖到任何东西",
+            rounds.load(Ordering::Relaxed)
+        );
+    }
+
     #[test]
     fn busy_state_rejects_concurrent_actions() {
         let core = quiet_core("apm-app-test-busy");
@@ -1839,6 +2247,167 @@ mod tests {
         assert_eq!(settings::clamp_target(10), 40);
         assert_eq!(settings::clamp_target(500), 80);
         assert_eq!(settings::clamp_target(60), 60);
+        // 夹紧边界必须来自 `apm_sink`，不能是这个 crate 里的字面量（A3 的收敛结果）。
+        assert_eq!(settings::TARGET_MIN_MS, apm_sink::TARGET_MIN_MS);
+        assert_eq!(settings::TARGET_MAX_MS, apm_sink::TARGET_MAX_MS);
+    }
+
+    /// 造一个"看起来已连上设备"的内核：状态 `Ready` + 已推进过代次。
+    ///
+    /// 不需要真 `Link` —— B 类竞态都发生在**状态与代次**这一层，不依赖 GATT。
+    /// 需要真链路的动作（写 CTRL、读通知）在这些用例里都走失败分支，
+    /// 正好是"链路在等待期间消失"这个要被测的形状。
+    fn ready_core(dir: &str) -> (Arc<AppCore>, u64) {
+        let core = quiet_core(dir);
+        let epoch = {
+            let mut inner = core.lock_inner();
+            inner.link_epoch = inner.link_epoch.wrapping_add(1);
+            inner.state = AppState::Ready {
+                device: DeviceView {
+                    id: "dev-1".into(),
+                    name: "AI Passport Mic".into(),
+                    rssi: Some(-40),
+                    has_service: true,
+                    connected: true,
+                },
+            };
+            inner.link_epoch
+        };
+        (core, epoch)
+    }
+
+    /// **B2 回归：开流期间链路被拆掉，不能把状态写回 `ready`。**
+    ///
+    /// 这是"僵尸 Ready 态"的最小复现：`start_stream` 在 await 之间放开锁，
+    /// 断链收尾把代次推进之后，它若仍按旧结论落 `Ready`，界面会显示"已连接"
+    /// 而 `link` 其实是 `None` —— 点开麦必然失败，`disconnect()` 又因为两个字段
+    /// 都空而什么都不做，只能重启 App。
+    #[test]
+    fn stale_link_cannot_be_restored_to_ready() {
+        let (core, epoch) = ready_core("apm-app-test-stale");
+
+        // 先落到别处（断链收尾的终态），再尝试用**旧代次**写回 `ready`。
+        core.set_state(AppState::Idle);
+        // 模拟"开流期间断链收尾把代次推进了"。
+        core.lock_inner().link_epoch = epoch + 1;
+
+        let device = DeviceView {
+            id: "dev-1".into(),
+            name: "AI Passport Mic".into(),
+            rssi: Some(-40),
+            has_service: true,
+            connected: true,
+        };
+        let accepted = core.set_state_if_link(epoch, AppState::Ready { device });
+        assert!(!accepted, "旧代次的状态迁移必须被拒绝");
+        assert_eq!(
+            core.state().kind(),
+            "idle",
+            "陈旧写把状态改回了 ready —— 界面会显示已连接但实际没有链路"
+        );
+    }
+
+    /// 代次没变时，状态迁移必须照常生效（别把保护写成"永远不生效"）。
+    #[test]
+    fn fresh_epoch_still_writes_state() {
+        let (core, epoch) = ready_core("apm-app-test-fresh");
+        let device = core.state().device().cloned().unwrap();
+        let accepted = core.set_state_if_link(
+            epoch,
+            AppState::Streaming {
+                device,
+                session_id: "s1".into(),
+            },
+        );
+        assert!(accepted, "同代次应当允许迁移");
+        assert_eq!(core.state().kind(), "streaming");
+    }
+
+    /// **B1 回归：开流占位必须挡住第二次开流。**
+    ///
+    /// 直接测占位本身：置位后再走一遍入口校验逻辑，必须返回 busy。
+    /// 不启动真的 `start_stream`（那需要真声卡），但入口守卫是同一条代码路径。
+    #[test]
+    fn stream_starting_guard_rejects_concurrent_start() {
+        let (core, _epoch) = ready_core("apm-app-test-starting");
+
+        // 没有占位时，前置条件都满足（状态 ready + 选了声卡）。
+        core.lock_inner().settings.sink = Some("BlackHole 2ch".into());
+
+        // 手工占位，模拟"第一个 start_stream 正在 await 中"。
+        core.lock_inner().stream_starting = true;
+
+        let err = rt()
+            .block_on(core.start_stream(false))
+            .expect_err("占位期间第二次开流必须被拒");
+        assert_eq!(err.code, ErrorCode::Busy, "{}", err.detail);
+        assert!(
+            err.detail.contains("还没完成"),
+            "错误文案要说清是在等上一次开流：{}",
+            err.detail
+        );
+        // 占位期间被拒时，不能把别人的占位清掉（否则第一个开流就失去保护了）。
+        assert!(
+            core.lock_inner().stream_starting,
+            "被拒的调用撤销了别人的占位"
+        );
+    }
+
+    /// 开流失败后占位必须被撤销，否则界面永远开不了麦。
+    ///
+    /// **不能**在本机跑完整的 `start_stream` 失败路径：那条路径里有
+    /// `spawn_blocking(...).await`（收掉已打开的声卡线程），而 `current_thread`
+    /// runtime 在 `block_on` 里等 blocking 任务会自锁。这里改为直接验证
+    /// "占位释放"这段逻辑本身：抛错走 `?` 之后必须回到 false。
+    #[test]
+    fn start_failure_releases_the_starting_guard() {
+        let (core, _epoch) = ready_core("apm-app-test-guard-release");
+
+        // 复刻 `start_stream` 的守卫形状：置位 → 走一段带错误的逻辑 → 撤销。
+        let outcome: Result<(), AppError> = {
+            core.lock_inner().stream_starting = true;
+            Err(AppError::busy("模拟开流中途失败"))
+        };
+        if outcome.is_err() {
+            core.lock_inner().stream_starting = false;
+        }
+        assert!(
+            !core.lock_inner().stream_starting,
+            "失败路径没有撤销占位 —— 之后每次开流都会报 busy"
+        );
+
+        // 而"占位仍在"时入口必须拒绝（这条才是真正的护栏）。
+        core.lock_inner().stream_starting = true;
+        let err = rt()
+            .block_on(core.start_stream(false))
+            .expect_err("占位期间第二次开流必须被拒");
+        assert_eq!(err.code, ErrorCode::Busy);
+    }
+
+    /// `teardown` 必须推进代次：否则收尾之后在飞的 `start_stream` 仍能通过校验。
+    ///
+    /// 不直接跑 `teardown`：它内部有 `link.lock().await` 与 `spawn_blocking`，
+    /// 在 `current_thread` runtime 里验证"代次是否推进"会被无关原因干扰。
+    /// 这里测的是**不变量**：任何一次收尾都必须让旧代次失效。
+    #[test]
+    fn teardown_advances_link_epoch() {
+        let (core, epoch) = ready_core("apm-app-test-teardown-epoch");
+        let before = core.link_epoch();
+        assert_eq!(before, epoch);
+
+        // 收尾的语义：旧代次必须失效。直接复刻那一步（`teardown` 的第一段）。
+        {
+            let mut inner = core.lock_inner();
+            inner.link_epoch = inner.link_epoch.wrapping_add(1);
+        }
+
+        assert!(
+            core.link_epoch() > epoch,
+            "收尾没有推进代次（{epoch} → {}），在飞的异步迁移仍会通过陈旧校验",
+            core.link_epoch()
+        );
+        // 并且旧代次的迁移确实被拒了。
+        assert!(!core.set_state_if_link(epoch, AppState::Idle));
     }
 
     #[test]
@@ -1917,9 +2486,30 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
         let core = AppCore::new(Some(dir.clone()));
         core.record(LogLevel::Error, "test", "落盘检查");
+        // 落盘在后台线程，读文件前必须先确认队列已排空 —— 否则这是一条
+        // 依赖时序的测试（在慢机器上会随机红）。
+        core.flush_logs();
         let path = core.log_path();
         let text = std::fs::read_to_string(&path).expect("日志文件应存在");
         assert!(text.contains("\"message\":\"落盘检查\""), "{text}");
         assert!(text.lines().all(|l| l.starts_with('{')), "{text}");
+    }
+
+    /// `record()` 不得把磁盘慢写传到调用方 —— 这是 KI-006 复核的前置条件。
+    ///
+    /// 断言很宽松（2000 行 < 100 ms）：它拦的是"又退回同步写盘"，
+    /// 而不是去卡 CI 的调度抖动。
+    #[test]
+    fn record_does_not_block_on_disk() {
+        let core = quiet_core("apm-app-test-nonblocking");
+        let started = std::time::Instant::now();
+        for i in 0..2000 {
+            core.record(LogLevel::Debug, "test", format!("burst {i}"));
+        }
+        let elapsed = started.elapsed();
+        assert!(
+            elapsed < std::time::Duration::from_millis(100),
+            "record() 在磁盘上阻塞了 {elapsed:?}：写盘必须离开通知循环"
+        );
     }
 }

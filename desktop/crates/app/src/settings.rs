@@ -14,9 +14,12 @@ const APP_DIR: &str = "com.cnryb.ai-passport-mic";
 
 /// 抖动缓冲默认 80 ms：实测 60 时会摆到 28–60，80 时稳在 76–104（`cli/main.rs` 的注释）。
 pub const DEFAULT_TARGET_MS: u32 = 80;
-/// 缓冲目标下限 / 上限（`docs/ARCHITECTURE.md` 的 40–80 ms）。
-pub const TARGET_MIN_MS: u32 = 40;
-pub const TARGET_MAX_MS: u32 = 80;
+/// 缓冲目标下限 / 上限。
+///
+/// **不要在这里写死字面量**：`apm_sink` 是抖动缓冲的实现方，边界属于它的契约
+/// （`docs/ARCHITECTURE.md` 的 40–80 ms）。这边只做转出，改上限时只改一处。
+pub const TARGET_MIN_MS: u32 = apm_sink::TARGET_MIN_MS;
+pub const TARGET_MAX_MS: u32 = apm_sink::TARGET_MAX_MS;
 
 /// 关麦兜底的默认时长：连续采集 10 分钟自动停。
 ///

@@ -87,6 +87,10 @@ enum Command {
         /// 不连设备，直接往声卡推 440 Hz 正弦（-20 dBFS），用来单独验证声卡直通
         #[arg(long)]
         tone: bool,
+        /// 同时采集链路 RTT（PING/PONG），用于判断到达尖峰归链路还是归音频通知队列。
+        /// 与录音走同一条连接、同一时间轴，不额外开连接。
+        #[arg(long)]
+        rtt: bool,
         #[arg(long)]
         device: Option<String>,
     },
@@ -177,8 +181,17 @@ fn main() -> anyhow::Result<()> {
                     Command::Ping { device, count, interval_ms, timeout_ms, json } => {
                         cmd::ping(device.as_deref(), count, interval_ms, timeout_ms, json).await
                     }
-                    Command::Sink { to, seconds, target_ms, verify, tone, device } => {
-                        cmd::sink(&to, seconds, target_ms, verify, tone, device.as_deref()).await
+                    Command::Sink { to, seconds, target_ms, verify, tone, rtt, device } => {
+                        cmd::sink(
+                            &to,
+                            seconds,
+                            target_ms,
+                            verify,
+                            tone,
+                            rtt,
+                            device.as_deref(),
+                        )
+                        .await
                     }
                     _ => unreachable!("同步命令已在上面处理"),
                 }

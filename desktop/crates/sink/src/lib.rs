@@ -15,8 +15,8 @@
 mod playout;
 
 pub use playout::{
+    Playout, Stats, GAP_BUCKETS_MS, MAX_SLIP, TARGET_MAX_MS, TARGET_MIN_MS, UNDERFED_MS,
     UNDERRUN_LOG,
-    Playout, Stats, DRIFT_TAU_SEC, GAP_BUCKETS_MS, MAX_SLIP, TARGET_MAX_MS, TARGET_MIN_MS,
 };
 
 use anyhow::{anyhow, Context, Result};
@@ -34,8 +34,10 @@ pub struct Sink {
     target_ms: u32,
 }
 
-/// 列出所有输出设备名，供选错设备时提示用。
-pub fn output_devices() -> Result<Vec<String>> {
+/// 枚举所有输出设备名，供选错设备时提示用。
+///
+/// 只在 `open()` 找不到匹配设备时用来列出现有选项，所以不给 crate 外暴露。
+fn output_devices() -> Result<Vec<String>> {
     let host = cpal::default_host();
     let devices = host.output_devices().context("枚举输出设备失败")?;
     Ok(devices
@@ -45,15 +47,12 @@ pub fn output_devices() -> Result<Vec<String>> {
 
 /// 一个输出设备的能力摘要，供 GUI 的声卡下拉框判断"这个能不能用"。
 ///
-/// `uid` 用 cpal 0.18 的 `Device::id()`（macOS 上是 CoreAudio 的 UID 字符串），取不到时才
-/// 回退设备名。留这个字段是为了以后上 WASAPI 时不用改前端契约
-/// （`docs/GUI.md` §8 提到 Windows 要按 UID 匹配）。
+/// 只有界面真正会判读的字段。`Device::id()`（CoreAudio UID）与声道数曾经也在这里，
+/// 理由是"以后上 WASAPI 按 UID 匹配时不用改契约"——但那个"以后"没有排期，
+/// 而这两项在全仓没有任何消费方。真要做 Windows 时再加。
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SinkInfo {
     pub name: String,
-    pub uid: String,
-    /// 报告的最大声道数；读不到配置时为 0。
-    pub channels: u16,
     pub min_rate: u32,
     pub max_rate: u32,
     /// 是否原生支持 16 kHz。不支持时界面要提前拦住，而不是等 `open` 才报错。
@@ -61,9 +60,6 @@ pub struct SinkInfo {
 }
 
 /// 枚举输出设备。读不到配置的设备（如被独占）跳过而不是让整次枚举失败。
-///
-/// `uid` 用 cpal 0.18 的 `Device::id()`（macOS 上是 CoreAudio 的 UID 字符串），
-/// 而不是设备名 —— 同名设备（两块同型号 USB 声卡）以前会被认成一个。
 pub fn list_sinks() -> Result<Vec<SinkInfo>> {
     let host = cpal::default_host();
     let devices = host.output_devices().context("枚举输出设备失败")?;
@@ -71,13 +67,11 @@ pub fn list_sinks() -> Result<Vec<SinkInfo>> {
     for device in devices {
         let Ok(desc) = device.description() else { continue };
         let name = desc.name().to_string();
-        let mut channels = 0u16;
         let mut min_rate = u32::MAX;
         let mut max_rate = 0u32;
         let mut supports_16k = false;
         if let Ok(configs) = device.supported_output_configs() {
             for range in configs {
-                channels = channels.max(range.channels());
                 min_rate = min_rate.min(range.min_sample_rate());
                 max_rate = max_rate.max(range.max_sample_rate());
                 if (range.min_sample_rate()..=range.max_sample_rate()).contains(&16_000) {
@@ -85,15 +79,8 @@ pub fn list_sinks() -> Result<Vec<SinkInfo>> {
                 }
             }
         }
-        // 拿不到 id 时退回设备名：宁可 UID 不唯一，也不能让这个设备从列表里消失。
-        let uid = device
-            .id()
-            .map(|id| id.to_string())
-            .unwrap_or_else(|_| name.clone());
         out.push(SinkInfo {
-            uid,
             name,
-            channels,
             min_rate: if min_rate == u32::MAX { 0 } else { min_rate },
             max_rate,
             supports_16k,
@@ -254,12 +241,28 @@ impl Sink {
         self.channels
     }
 
-    /// 当前抖动缓冲目标（会自适应变化）
+    /// 当前**实际生效**的抖动缓冲目标（基准 + 自适应余量，被上限夹住）。
+    ///
+    /// 注意与 [`Self::base_target_ms`] 的区别：这个是内部控制器算出来的，
+    /// **不是**用户选的那个数。报告里说"缓冲目标 80 ms"时应当引基准值。
     pub fn target_ms(&self) -> u32 {
         self.playout
             .lock()
             .map(|p| p.target_ms())
             .unwrap_or(self.target_ms)
+    }
+
+    /// 用户选的基准目标（滑块上的那个数）。自适应不会改它。
+    pub fn base_target_ms(&self) -> u32 {
+        self.playout
+            .lock()
+            .map(|p| p.base_ms())
+            .unwrap_or(self.target_ms)
+    }
+
+    /// 自适应临时加上的余量（毫秒）。会话收尾报告用它说明"有没有被抬过"。
+    pub fn boost_ms(&self) -> u32 {
+        self.playout.lock().map(|p| p.boost_ms()).unwrap_or(0)
     }
 
     /// 运行期改缓冲目标（40–80 ms）。超出范围夹住，不报错 ——

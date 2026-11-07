@@ -5,10 +5,15 @@
 //!
 //! 已知限制：btleplug 不暴露协商后的 MTU，所以 PC 端无法直接断言"能单包发 165 字节"。
 //! 设备侧会检查并在 STATUS / 日志里报告；PC 侧只能从实际收到的块长度反推。
+//!
+//! 音频通知带 [`AudioBlock::received_at`]（btleplug 交出的时刻）。计时点放在这一层
+//! 而不是消费层，是为了让"链路到达抖动"能被单独测量——见 KI-006 的 2026-11-07 复核。
 
 pub mod device;
 
-pub use device::{connect, probe_adapter, scan, scan_stream, DeviceInfo, Link, Notification};
+pub use device::{
+    connect, probe_adapter, scan, scan_stream, AudioBlock, DeviceInfo, Link, Notification,
+};
 
 /// 固件里音频块长度（165）—— 收满这个长度才算一个完整块。
 pub const AUDIO_BLOCK_LEN: usize = apm_protocol::AUDIO_BLOCK_LEN;

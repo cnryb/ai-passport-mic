@@ -118,31 +118,13 @@ pub enum ErrorCode {
     Internal,
 }
 
-impl ErrorCode {
-    /// 给用户看的下一步动作（不是给开发者看的堆栈）。
-    pub fn hint(&self) -> &'static str {
-        match self {
-            Self::BtUnauthorized => "系统设置 → 隐私与安全性 → 蓝牙，允许本 App 后重新检测",
-            Self::BtUnavailable => "确认系统蓝牙已打开；虚拟机与远程会话通常没有可用适配器",
-            Self::DeviceNotFound => "确认设备已上电并在广播（开机后 3 秒内开始广播）",
-            Self::ConnectTimeout => "设备可能已被其他主机占用，靠近一点再试",
-            Self::SubscribeFailed => "重连一次；连续失败请重启设备",
-            Self::SinkMissing => "选定的虚拟声卡不见了，点「重新枚举」或检查 BlackHole 是否已加载",
-            Self::SinkRateUnsupported => "该声卡不支持 16 kHz，请换一个原生支持 16 kHz 的输出",
-            Self::ProtocolMismatch => "固件与桌面端版本不一致，重新烧录同一版本",
-            Self::KeymapInvalid => "键名或修饰键不在支持列表内；PTT 的停止通道不能删（见 config/README.md）",
-            Self::FlashNoDevice => "用数据线直连电脑（不要经无源 HUB），确认设备已上电，再换个 USB 口试一次",
-            Self::FirmwareImageInvalid => "安装包里的固件损坏或缺失，重新安装本软件",
-            Self::FlashFailed => "重插设备后重试；反复失败可以按住 BOOT 键再插线（强制进下载模式）",
-            Self::FlashVerifyFailed => "写入的内容和镜像对不上，设备大概率还在下载模式，直接重试一次",
-            Self::CaptureNotStarting => {
-                "设备没开始发送音频（链路慢档或半死态）：复位设备后重连再试；反复出现见 KI-005"
-            }
-            Self::Busy => "当前状态下不能这么做，先停止正在进行的操作",
-            Self::Internal => "查看诊断日志；这属于未预期错误",
-        }
-    }
-}
+// 给用户看的"下一步做什么"，**只有一份**，在
+// `crates/gui/frontend/src/lib/types.ts` 的 `ERROR_HINTS`。
+//
+// 这里曾经也有一份 16 条的 Rust 副本（`ErrorCode::hint()`），但除它自己的单测外
+// 没有任何调用方——CLI 走 `anyhow` 文案，GUI 走前端那张表。两份很快就漂了
+// （"点「重新检测」"、"点「重新枚举」或检查 BlackHole"这些差异就是漂移的痕迹）。
+// 与其维护两个来源，不如让真正展示给人看的那一份当唯一来源。
 
 /// 跨 IPC 的错误载荷：永远是 `{code, detail}`，前端不需要解析文本。
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -277,28 +259,5 @@ mod tests {
         let got = classify(&anyhow!("unexpected"));
         assert_eq!(got.code, ErrorCode::Internal);
         assert_eq!(got.detail, "unexpected");
-    }
-
-    #[test]
-    fn error_code_hints_are_not_empty() {
-        for code in [
-            ErrorCode::BtUnauthorized,
-            ErrorCode::BtUnavailable,
-            ErrorCode::DeviceNotFound,
-            ErrorCode::ConnectTimeout,
-            ErrorCode::SubscribeFailed,
-            ErrorCode::SinkMissing,
-            ErrorCode::SinkRateUnsupported,
-            ErrorCode::ProtocolMismatch,
-            ErrorCode::KeymapInvalid,
-            ErrorCode::FlashNoDevice,
-            ErrorCode::FirmwareImageInvalid,
-            ErrorCode::FlashFailed,
-            ErrorCode::FlashVerifyFailed,
-            ErrorCode::Busy,
-            ErrorCode::Internal,
-        ] {
-            assert!(!code.hint().is_empty(), "{code:?}");
-        }
     }
 }

@@ -56,7 +56,9 @@ pub enum AppEvent {
         telemetry: Telemetry,
     },
     SessionDone {
-        summary: SessionSummary,
+        /// Boxed：`SessionSummary` 有 30+ 字段（~400 字节），直接内联会让
+        /// `AppEvent` 的每个变体都按最大值占位。这是低频事件，一次堆分配无成本。
+        summary: Box<SessionSummary>,
     },
     /// 设备电量百分比（0..100）。只在数值变化或连接后首次读到时发一次，不是心跳。
     ///

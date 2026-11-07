@@ -3,7 +3,9 @@
 
 use anyhow::{anyhow, Context, Result};
 use apm_protocol::frame::{self, msg, Event, Status};
-use apm_protocol::{AUDIO_UUID, BATTERY_LEVEL_UUID, CTRL_UUID, EVENT_UUID, PROFILE_UUID, SERVICE_UUID, STATUS_UUID};
+use apm_protocol::{
+    AUDIO_UUID, BATTERY_LEVEL_UUID, CTRL_UUID, EVENT_UUID, PROFILE_UUID, SERVICE_UUID, STATUS_UUID,
+};
 use btleplug::api::{
     Central, CentralState, Characteristic, Manager as _, Peripheral as _, ScanFilter,
     ValueNotification, WriteType,
@@ -12,7 +14,7 @@ use btleplug::platform::{Adapter, Manager, Peripheral};
 use futures::stream::StreamExt;
 use std::pin::Pin;
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 use tokio::sync::Mutex as AsyncMutex;
 use uuid::Uuid;
 
@@ -44,16 +46,50 @@ pub struct DeviceInfo {
     pub connected: bool,
 }
 
+/// 一条音频通知，带**真到达时刻**与**等待时长**。
+///
+/// `received_at` 是 btleplug 把这条通知交出来的那一刻，在 `next_notification` 里
+/// 立刻打点。它存在的唯一理由：让"块到达间隔"与"我们处理得慢不慢"成为两个
+/// **独立可测**的量。
+///
+/// 2026-11-07 之前，到达间隔是在 `Pipeline::on_audio` 里用 `Instant::now()` 量的
+/// —— 而那个函数跑在消费循环里，前面还排着 STATUS 心跳的日志落盘。于是量到的
+/// "到达间隔"里混进了 PC 自己停顿的时间，用它去证明"链路抖动是根因"是不成立的
+/// （见 `docs/KNOWN_ISSUES.md` KI-006 的 2026-11-07 复核）。
+///
+/// `read_waited` 是**第三把尺子**，用来补掉仍能骗过前两把的那个情形：
+/// 如果消费循环在两次读取之间卡住（例如每秒一次的 `println!` 写文件），
+/// 数据其实早就躺在队列里，但 `received_at` 依然会被推迟到我们回来才取，
+/// 于是"到达间隔"变长、"处理耗时"依然接近 0。有了 `read_waited` 就能分辨：
+/// - `read_waited` 也很长 → 数据确实还没到，是链路/主机蓝牙栈晚交的；
+/// - `read_waited` ≈ 0 而间隔很长 → **我们问晚了**，是我们自己卡在别处。
+#[derive(Debug, Clone)]
+pub struct AudioBlock {
+    pub data: Vec<u8>,
+    /// 通知真正到达 PC 的时刻（btleplug 交出即打点）。
+    pub received_at: Instant,
+    /// 本次等待花了多久：从开始 await 到通知交出来。
+    pub read_waited: Duration,
+}
+
 /// 连上之后能收到的东西。
 #[derive(Debug, Clone)]
 pub enum Notification {
-    Audio(Vec<u8>),
+    Audio(AudioBlock),
     Status(Status),
     Event(Event),
     /// PONG 回显的 seq。PONG 与 EVENT 共用特征值，靠 `frame.msg` 区分。
     Pong(u32),
     /// 标准 Battery Service（0x2A19）的电量百分比。旧固件没有该服务时不出现。
     Battery(u8),
+    /// **收到了一条通知，但解析不出来**（帧 CRC 错、载荷长度不对、电量值越界、
+    /// 或未知特征值）。
+    ///
+    /// 单独一个变体而不是返回 `Ok(None)`：`Ok(None)` 的语义是"这段时间真的没有通知"，
+    /// 而这里恰恰相反 —— 设备发了东西，链路是通的。混成 `Ok(None)` 会让
+    /// `monitor_loop` 的"静默 5 s → 探活"把坏帧当成安静，推迟故障发现，
+    /// 也让"设备在发但帧坏了"这个现象在日志里完全消失（B6）。
+    Malformed { uuid: Uuid, reason: String },
 }
 
 /// 连上之后的链路。
@@ -88,7 +124,10 @@ async fn default_adapter() -> Result<Adapter> {
         .ok_or_else(|| anyhow!("没有可用的蓝牙适配器（macOS 上检查系统设置里的蓝牙权限）"))
 }
 
-fn describe(peripheral: &Peripheral, props: Option<&btleplug::api::PeripheralProperties>) -> DeviceInfo {
+fn describe(
+    peripheral: &Peripheral,
+    props: Option<&btleplug::api::PeripheralProperties>,
+) -> DeviceInfo {
     let name = props.and_then(|p| p.local_name.clone()).unwrap_or_default();
     let has_service = props
         .map(|p| p.services.iter().any(|u| *u == service_uuid()))
@@ -129,9 +168,7 @@ pub async fn probe_adapter() -> Result<()> {
         .context("读取蓝牙适配器状态失败")?
     {
         CentralState::PoweredOn => Ok(()),
-        CentralState::PoweredOff => {
-            Err(anyhow!("蓝牙已关闭：请在菜单栏或系统设置里打开蓝牙"))
-        }
+        CentralState::PoweredOff => Err(anyhow!("蓝牙已关闭：请在菜单栏或系统设置里打开蓝牙")),
         CentralState::Unknown => Err(anyhow!(
             "蓝牙状态未知（刚启动或尚未授权）：检查系统设置 → 隐私与安全性 → 蓝牙"
         )),
@@ -183,7 +220,10 @@ where
         // 只在变化时回调：RSSI 抖动会让"变化"过频，所以比较 id 集合而不是整个结构。
         let changed = !emitted
             || found.len() != last.len()
-            || found.iter().zip(&last).any(|(a, b)| a.id != b.id || a.rssi != b.rssi);
+            || found
+                .iter()
+                .zip(&last)
+                .any(|(a, b)| a.id != b.id || a.rssi != b.rssi);
         if changed {
             on_update(&found);
             emitted = true;
@@ -271,7 +311,8 @@ pub async fn connect(selector: Option<&str>, timeout: Duration) -> Result<Link> 
 
             let matched = match selector {
                 Some(want) => {
-                    info.name.to_lowercase().contains(&want.to_lowercase()) || info.id.contains(want)
+                    info.name.to_lowercase().contains(&want.to_lowercase())
+                        || info.id.contains(want)
                 }
                 None => info.has_service,
             };
@@ -313,10 +354,7 @@ pub async fn connect(selector: Option<&str>, timeout: Duration) -> Result<Link> 
         let _ = peripheral.subscribe(chr).await;
     }
 
-    let notifications = peripheral
-        .notifications()
-        .await
-        .context("打开通知流失败")?;
+    let notifications = peripheral.notifications().await.context("打开通知流失败")?;
 
     Ok(Link {
         peripheral,
@@ -346,7 +384,8 @@ impl Link {
 
     /// 写 CTRL 帧。CTRL 带 WRITE_NO_RSP，所以默认不等待响应。
     pub async fn send_ctrl(&self, msg_type: u8, payload: &[u8]) -> Result<()> {
-        let bytes = frame::encode(msg_type, payload).map_err(|e| anyhow!("编码 CTRL 帧失败: {e}"))?;
+        let bytes =
+            frame::encode(msg_type, payload).map_err(|e| anyhow!("编码 CTRL 帧失败: {e}"))?;
         self.peripheral
             .write(&self.ctrl, &bytes, WriteType::WithoutResponse)
             .await
@@ -398,13 +437,29 @@ impl Link {
         Ok((pct <= 100).then_some(pct))
     }
 
-    /// 取下一个通知。超时返回 `Ok(None)`，链路断了返回 `Err`。
+    /// 取下一个通知。
+    ///
+    /// 返回值有三种语义，**不能混为一谈**：
+    /// - `Ok(Some(_))`：收到一条能解析的通知（含 AUDIO / STATUS / EVENT / PONG / 电量）；
+    /// - `Ok(None)`：**这段时间真的没有通知**（超时）。调用方据此判断"设备安静了"；
+    /// - `Err(_)`：通知流结束（设备断开）—— 明确是故障。
+    ///
+    /// 帧解析失败 / 载荷长度不对 / 电量值越界走 `Err` 的**第四种**：
+    /// `Ok(Some(Notification::Malformed { .. }))`。这不是"安静"——设备明明发了东西，
+    /// 它恰恰证明链路是通的。旧实现把它返回成 `Ok(None)`，于是 `monitor_loop` 的
+    /// "静默超过 5 s 就探活"会把一条 CRC 错的 STATUS 当成"什么都没收到"，
+    /// 既推迟探活，也让日志里少了一条本该有的"收到坏帧"证据。
     ///
     /// 只锁通知流本身（不是整个 `Link`），所以 CTRL 写入不会被通知消费挡住；
     /// 反过来同一时刻也只有一个消费者能读流，语义与原来的 `&mut self` 一致。
     pub async fn next_notification(&self, timeout: Duration) -> Result<Option<Notification>> {
         let mut stream = self.notifications.lock().await;
+        let asked = Instant::now();
         let next = tokio::time::timeout(timeout, stream.next()).await;
+        // 打点必须紧跟 `next()` 返回：这里是"通知到达 PC"的最早可观测时刻。
+        // 之后无论调用方排队多久才处理，`received_at` 都不会被那段等待污染。
+        let received_at = Instant::now();
+        let read_waited = received_at.saturating_duration_since(asked);
         let Some(item) = (match next {
             Ok(v) => v,
             Err(_) => return Ok(None),
@@ -413,46 +468,22 @@ impl Link {
         };
 
         if item.uuid == self.audio.uuid {
-            return Ok(Some(Notification::Audio(item.value)));
+            return Ok(Some(Notification::Audio(AudioBlock {
+                data: item.value,
+                received_at,
+                read_waited,
+            })));
         }
-        if let Some(chr) = &self.battery {
-            if item.uuid == chr.uuid {
-                if let Some(&pct) = item.value.first() {
-                    if pct <= 100 {
-                        return Ok(Some(Notification::Battery(pct)));
-                    }
-                }
-                return Ok(None);
-            }
-        }
-        if item.uuid == self.status.uuid {
-            if let Ok((f, _)) = frame::decode(&item.value) {
-                if let Some(status) = Status::decode(f.payload) {
-                    return Ok(Some(Notification::Status(status)));
-                }
-            }
-            return Ok(None);
-        }
-        if item.uuid == self.event.uuid {
-            // EVENT 与 PONG 共用这个特征值，必须按 msg 分派，不能按特征值猜类型。
-            if let Ok((f, _)) = frame::decode(&item.value) {
-                match f.msg {
-                    msg::EVENT => {
-                        if let Some(event) = Event::decode(f.payload) {
-                            return Ok(Some(Notification::Event(event)));
-                        }
-                    }
-                    msg::PONG => {
-                        if let Some(seq) = pong_seq(f.payload) {
-                            return Ok(Some(Notification::Pong(seq)));
-                        }
-                    }
-                    _ => {}
-                }
-            }
-            return Ok(None);
-        }
-        Ok(None)
+        // 控制面/状态面统一走纯函数解析：抽出来是为了能单测"坏帧必须变成
+        // `Malformed` 而不是 `Ok(None)`"（B6）—— 内联在这里就没法测。
+        let parsed = classify_frame_notification(
+            &item.uuid,
+            &item.value,
+            self.status.uuid,
+            self.event.uuid,
+            self.battery.as_ref().map(|c| c.uuid),
+        );
+        Ok(parsed)
     }
 
     /// 发一次 PING 并等**匹配 seq** 的 PONG，返回往返时延。
@@ -492,13 +523,77 @@ impl Link {
     }
 }
 
+/// 把一条（非音频的）通知解析成 [`Notification`]，**永不返回 `None`**。
+///
+/// 这是 B6 的核心口径：只要收到了通知，返回值就必须是 `Some(_)`。
+/// 解析失败的进 `Malformed`，绝不退化成"这段时间没有通知"。
+///
+/// 抽成纯函数（不碰 `&self`、不 await）是为了能被单测覆盖：
+/// 真实外设造不出"CRC 错的 STATUS 通知"，而在生产环境里恰恰是这种帧
+/// 决定了 `monitor_loop` 会不会误判设备消失。
+fn classify_frame_notification(
+    uuid: &Uuid,
+    value: &[u8],
+    status_uuid: Uuid,
+    event_uuid: Uuid,
+    battery_uuid: Option<Uuid>,
+) -> Option<Notification> {
+    let malformed = |reason: String| {
+        Some(Notification::Malformed {
+            uuid: *uuid,
+            reason,
+        })
+    };
+
+    if Some(*uuid) == battery_uuid {
+        return match value.first() {
+            Some(&pct) if pct <= 100 => Some(Notification::Battery(pct)),
+            Some(&pct) => malformed(format!("Battery Level 值越界（{pct}）")),
+            None => malformed("Battery Level 载荷为空".to_string()),
+        };
+    }
+
+    if *uuid == status_uuid {
+        return match frame::decode(value) {
+            Ok((f, _)) => match Status::decode(f.payload) {
+                Some(status) => Some(Notification::Status(status)),
+                None => malformed(format!("STATUS 载荷 {} 字节，不足 8", f.payload.len())),
+            },
+            Err(e) => malformed(format!("STATUS 帧解析失败：{e}")),
+        };
+    }
+
+    if *uuid == event_uuid {
+        // EVENT 与 PONG 共用这个特征值，必须按 msg 分派，不能按特征值猜类型。
+        let Ok((f, _)) = frame::decode(value) else {
+            return malformed("EVENT 帧解析失败".to_string());
+        };
+        return match f.msg {
+            msg::EVENT => match Event::decode(f.payload) {
+                Some(event) => Some(Notification::Event(event)),
+                None => malformed(format!("EVENT 载荷 {} 字节，不足 3", f.payload.len())),
+            },
+            msg::PONG => match pong_seq(f.payload) {
+                Some(seq) => Some(Notification::Pong(seq)),
+                None => malformed(format!("PONG 载荷 {} 字节，必须是 4", f.payload.len())),
+            },
+            other => malformed(format!("EVENT 特征值上出现未知 msg=0x{other:02X}")),
+        };
+    }
+
+    // 未知特征值的通知：不是错误，但也不该被当成"安静"（说明有别的客户端在写）。
+    malformed("未订阅的特征值送来通知".to_string())
+}
+
 /// PONG 载荷就是 PING 的 4 字节 seq（小端）。长度不对返回 `None` ——
 /// 与设备侧 `apm_build_pong` 的要求一致，两端都不做任意长度透传。
 fn pong_seq(payload: &[u8]) -> Option<u32> {
     if payload.len() != 4 {
         return None;
     }
-    Some(u32::from_le_bytes([payload[0], payload[1], payload[2], payload[3]]))
+    Some(u32::from_le_bytes([
+        payload[0], payload[1], payload[2], payload[3],
+    ]))
 }
 
 /// 连接时分不清"设备没起来"和"权限没给"，这里统一给出可执行的提示。
@@ -572,6 +667,73 @@ mod tests {
         assert_eq!(pong_seq(&[]), None);
         assert_eq!(pong_seq(&[1, 2, 3]), None);
         assert_eq!(pong_seq(&[1, 2, 3, 4, 5]), None);
+    }
+
+    /// **B6 的核心口径：坏帧不能变成"这段时间没有通知"。**
+    ///
+    /// `monitor_loop` 靠 `Ok(None)` 判断"设备安静了，该探活了"。如果 CRC 错的
+    /// STATUS 也返回 `Ok(None)`，设备明明在发却被当成消失，探活会推迟、
+    /// 日志里也少一条"收到坏帧"的证据。
+    #[test]
+    fn malformed_frames_are_never_reported_as_silence() {
+        let status = Uuid::parse_str(STATUS_UUID).unwrap();
+        let event = Uuid::parse_str(EVENT_UUID).unwrap();
+        let battery = Uuid::parse_str(BATTERY_LEVEL_UUID).unwrap();
+        let parse = |uuid: Uuid, value: &[u8]| {
+            classify_frame_notification(&uuid, value, status, event, Some(battery))
+        };
+
+        // ① CRC 错的 STATUS：改一个字节即可（帧层会报 CRC）。
+        let mut bad_status = frame::encode(msg::STATUS, &[0u8; 8]).unwrap();
+        bad_status[3] ^= 0xFF;
+        match parse(status, &bad_status) {
+            Some(Notification::Malformed { reason, .. }) => {
+                assert!(reason.contains("STATUS"), "{reason}");
+            }
+            other => panic!("坏 STATUS 帧必须报 Malformed，实得 {other:?}"),
+        }
+
+        // ② 载荷太短的 STATUS（帧本身合法）。
+        let short = frame::encode(msg::STATUS, &[0u8; 3]).unwrap();
+        assert!(matches!(
+            parse(status, &short),
+            Some(Notification::Malformed { .. })
+        ));
+
+        // ③ 载荷不是 4 字节的 PONG：设备侧也拒绝，这里必须报出来。
+        let bad_pong = frame::encode(msg::PONG, &[1, 2, 3]).unwrap();
+        assert!(matches!(
+            parse(event, &bad_pong),
+            Some(Notification::Malformed { .. })
+        ));
+
+        // ④ 电量值越界（>100）。
+        assert!(matches!(
+            parse(battery, &[0xFF]),
+            Some(Notification::Malformed { .. })
+        ));
+
+        // ⑤ 未知特征值：不是安静，是"别人在写"。
+        assert!(matches!(
+            parse(Uuid::from_u128(0xdead_beef), &[1, 2, 3]),
+            Some(Notification::Malformed { .. })
+        ));
+
+        // 反例：合法帧必须正常解析（别把保护写成"一律报错"）。
+        let ok_status = frame::encode(msg::STATUS, &[1, 0, 0, 0, 0, 0, 0, 0]).unwrap();
+        assert!(matches!(
+            parse(status, &ok_status),
+            Some(Notification::Status(_))
+        ));
+        let ok_pong = frame::encode(msg::PONG, &[1, 2, 3, 4]).unwrap();
+        match parse(event, &ok_pong) {
+            Some(Notification::Pong(seq)) => assert_eq!(seq, 0x0403_0201),
+            other => panic!("合法 PONG 应当解析成 seq，实得 {other:?}"),
+        }
+        assert!(matches!(
+            parse(battery, &[87]),
+            Some(Notification::Battery(87))
+        ));
     }
 
     #[test]

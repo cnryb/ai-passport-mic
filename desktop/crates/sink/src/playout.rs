@@ -27,12 +27,31 @@
 use std::collections::VecDeque;
 use std::time::Instant;
 
-/// 抖动缓冲目标下限 / 上限（毫秒），与 `docs/ARCHITECTURE.md` 的 40–80 ms 一致。
+/// 抖动缓冲目标下限 / 上限（毫秒）。**这是全仓唯一一份**：
+/// `apm_app::settings` 只转出，`session.rs` 也不再自己 `clamp(40, 80)`
+/// （历史上三处各存一份，改上限时漏改就分叉）。
 pub const TARGET_MIN_MS: u32 = 40;
 pub const TARGET_MAX_MS: u32 = 80;
 
-/// 漂移控制器的时间常数（秒）。越小纠得越快、变调越明显。
-pub const DRIFT_TAU_SEC: f64 = 2.0;
+/// 自适应抬升的步长（毫秒）。只在**真的欠载**时抬。
+const TARGET_STEP_MS: u32 = 5;
+
+/// 判断"这次欠载是被饿着"的阈值（毫秒）：距上一次推入超过这个时长仍没数据，
+/// 说明消费端在等链路，而不是消费得比生产快。
+///
+/// 取 1.5 个块周期（30 ms）：正常节奏下每 20 ms 必有一块进来，
+/// 超过 30 ms 还没推入就不是"节奏稍慢"，是真的断供了。
+pub const UNDERFED_MS: f64 = 30.0;
+
+/// 缓冲填充量的直方图桶宽（毫秒）与桶数：覆盖 0–256 ms。
+///
+/// 存在的理由是 **A4**：契约里写的是"抖动缓冲 40–80 ms"，但稳态实际存量并不等于
+/// 目标值（修剪守卫把它留在 `目标 + TRIM_BACK_MS` 附近）。拿"目标 80 ms"当延迟结论
+/// 会系统性低估二三十毫秒。这里直接测**实际存量分布**，报告用 p50/p95，
+/// 而不是用一个假设值去糊弄延迟预算。
+const FILL_BUCKET_MS: f64 = 4.0;
+const FILL_BUCKETS: usize = 64;
+
 /// 单样本插删的速率上限（1% = 10000 ppm）。实测漂移约 4200 ppm，留出一倍余量。
 pub const MAX_SLIP: f64 = 0.01;
 
@@ -77,7 +96,7 @@ fn capacity_frames(target_ms: u32, rate: u32) -> usize {
     (rate as usize * ms as usize) / 1000
 }
 
-#[derive(Debug, Clone, Copy, Default)]
+#[derive(Debug, Clone, Copy)]
 pub struct Stats {
     /// 收到的帧（单声道采样）数
     pub frames_pushed: u64,
@@ -87,22 +106,24 @@ pub struct Stats {
     pub underruns: u64,
     /// 欠载时补进去的帧数（用上一个样本填充，避免爆音）
     pub frames_silenced: u64,
+    /// **因链路断供**造成的欠载次数（A5：欠载归因）。
+    ///
+    /// 判据见 [`Playout::push`] 与 `fill`：欠载发生时，如果距上一次推入
+    /// 超过 [`UNDERFED_MS`]，就是"生产端没喂上"（链路/通知循环），
+    /// 否则是"消费端跑得比生产快"（真正的缓冲目标不够）。
+    /// **两者要分开报**：混成一个数字时，调缓冲目标会把链路问题一起"修好"，
+    /// 于是根因永远查不清 —— KI-006 就是这么绕了两轮。
+    pub underruns_underfed: u64,
     /// 超出容量被丢弃的最旧帧数（兜底路径，正常不该触顶）
     pub frames_overflow: u64,
     /// 延迟守卫一次性修剪掉的最旧帧数（停摆积压，不是漂移补偿）
     pub frames_trimmed: u64,
     /// 推入样本的平方和，用于算写入侧 RMS（和回环侧对比）
     pub sum_sq: f64,
-    /// 因欠载抬高目标缓冲的次数
-    pub target_raises: u64,
-    /// 因稳定收回目标缓冲的次数
-    pub target_lowers: u64,
     /// 漂移补偿补出来的样本数（生产慢于消费）
     pub frames_inserted: u64,
     /// 漂移补偿丢掉的样本数（生产快于消费）
     pub frames_skipped: u64,
-    /// 延迟守卫一次性修剪掉的最旧帧数（停摆积压，不是漂移补偿）
-    pub trim_events: u64,
     /// 声卡回调的间隔统计（`docs/KNOWN_ISSUES.md` KI-006 要的"停摆时长分布"）。
     pub callbacks: u64,
     /// 回调间隔超过 1.5× 应有周期的次数（= 明显的回调停摆）
@@ -111,6 +132,12 @@ pub struct Stats {
     pub max_callback_gap_ms: f64,
     /// 按间隔分桶的回调次数（桶边界见 [`GAP_BUCKETS_MS`]）
     pub gap_histogram: [u64; 8],
+    /// **实际存量分布**（每 [`FILL_BUCKET_MS`] 一桶，共 [`FILL_BUCKETS`] 桶）。
+    ///
+    /// A4：报告里的"延迟"必须用实测存量，不能用目标值。桶 0 覆盖 0–4 ms。
+    pub fill_histogram: [u64; FILL_BUCKETS],
+    /// `fill_histogram` 的样本总数（每轮回调记一次）。
+    pub fill_samples: u64,
     /// 每次欠载发生的时刻（毫秒，相对第一次 `fill`；最多记 [`UNDERRUN_LOG`] 条）。
     ///
     /// 只记时刻、不做任何 IO / 分配：音频回调里不能 malloc，也不能 log。
@@ -126,6 +153,33 @@ pub struct Stats {
 /// 用 16 而不是 64：`Stats` 整个结构体要保持 `Copy`（回调里按值取快照），
 /// 而 `[f64; 64]` 没有 `Default`，`derive(Default)` 会编译不过。
 pub const UNDERRUN_LOG: usize = 16;
+
+/// `Stats` 手写 `Default`：`[u64; FILL_BUCKETS]` 超出标准库为数组实现 `Default`
+/// 的长度上限（32），`derive` 会编译不过。
+impl Default for Stats {
+    fn default() -> Self {
+        Self {
+            frames_pushed: 0,
+            frames_consumed: 0,
+            underruns: 0,
+            frames_silenced: 0,
+            underruns_underfed: 0,
+            frames_overflow: 0,
+            frames_trimmed: 0,
+            sum_sq: 0.0,
+            frames_inserted: 0,
+            frames_skipped: 0,
+            callbacks: 0,
+            stalled_callbacks: 0,
+            max_callback_gap_ms: 0.0,
+            gap_histogram: [0; 8],
+            fill_histogram: [0; FILL_BUCKETS],
+            fill_samples: 0,
+            underrun_at_ms: [0.0; UNDERRUN_LOG],
+            underruns_logged: 0,
+        }
+    }
+}
 
 /// 回调间隔直方图的桶边界（毫秒）。
 ///
@@ -146,11 +200,49 @@ impl Stats {
             }
         }
     }
+
+    /// 记一次实际存量（由 `fill` 每轮回调调用）。
+    fn note_fill(&mut self, ms: f32) {
+        let idx = (ms as f64 / FILL_BUCKET_MS).floor();
+        let idx = if idx < 0.0 {
+            0
+        } else if idx >= FILL_BUCKETS as f64 {
+            FILL_BUCKETS - 1
+        } else {
+            idx as usize
+        };
+        self.fill_histogram[idx] += 1;
+        self.fill_samples += 1;
+    }
+
+    /// 实际存量的分位数（毫秒）。桶内取中点，桶宽 4 ms，误差 ≤ ±2 ms。
+    ///
+    /// `None` = 样本不足（还没跑够一轮）。
+    pub fn fill_percentile_ms(&self, pct: f64) -> Option<f64> {
+        if self.fill_samples == 0 {
+            return None;
+        }
+        let target = (self.fill_samples as f64 * pct.clamp(0.0, 1.0)).ceil();
+        let target = (target.max(1.0)) as u64;
+        let mut acc = 0u64;
+        for (i, &count) in self.fill_histogram.iter().enumerate() {
+            acc += count;
+            if acc >= target {
+                return Some((i as f64 + 0.5) * FILL_BUCKET_MS);
+            }
+        }
+        Some((FILL_BUCKETS as f64 - 0.5) * FILL_BUCKET_MS)
+    }
 }
 
 pub struct Playout {
     buf: VecDeque<i16>,
     rate: u32,
+    /// 用户选的基准目标（滑块）。自适应不动它。
+    base_ms: u32,
+    /// 自适应临时加的余量（欠载时 +5 ms、稳定后 −5 ms，封顶到 `TARGET_MAX_MS`）。
+    boost_ms: u32,
+    /// 实际生效的目标 = `base_ms + boost_ms`（被 `TARGET_MAX_MS` 夹住）。
     target_ms: u32,
     target_frames: usize,
     capacity: usize,
@@ -176,6 +268,8 @@ pub struct Playout {
     first_callback: Option<Instant>,
     /// 相邻两次回调之间"应该"有多少帧，用来判断这次回调是不是明显迟到。
     frames_per_callback: usize,
+    /// 上一次**推入**的时刻。A5 靠它区分"链路断供"与"消费端跑太快"。
+    last_push_at: Option<Instant>,
     stats: Stats,
 }
 
@@ -217,13 +311,15 @@ struct Arrival {
 
 impl Playout {
     pub fn new(rate: u32, target_ms: u32) -> Self {
-        let target_ms = target_ms.clamp(TARGET_MIN_MS, TARGET_MAX_MS);
+        let base_ms = target_ms.clamp(TARGET_MIN_MS, TARGET_MAX_MS);
         let rate = rate.max(1);
         Self {
             buf: VecDeque::with_capacity(capacity_frames(TARGET_MAX_MS, rate)),
             rate,
-            target_ms,
-            target_frames: rate as usize * target_ms as usize / 1000,
+            base_ms,
+            boost_ms: 0,
+            target_ms: base_ms,
+            target_frames: rate as usize * base_ms as usize / 1000,
             capacity: capacity_frames(TARGET_MAX_MS, rate),
             playing: false,
             stable_frames: 0,
@@ -234,6 +330,7 @@ impl Playout {
             last_callback: None,
             first_callback: None,
             frames_per_callback: 0,
+            last_push_at: None,
             stats: Stats::default(),
         }
     }
@@ -281,19 +378,39 @@ impl Playout {
 
     /// 运行期改抖动缓冲目标（GUI 的缓冲滑块）。取下一批回调生效，
     /// 不重建流、不断音。
+    ///
+    /// **这是用户意图，不是自适应的当前值。** 自适应只能在它之上临时加余量
+    /// （见 [`Playout::boost_ms`]），绝不能把用户明确选的 80 悄悄降到 40 ——
+    /// 那会让"我把缓冲调大了"变成一句谎话，而且下次一阵抖动立刻欠载。
     pub fn set_target_ms(&mut self, ms: u32) {
-        self.target_ms = ms.clamp(TARGET_MIN_MS, TARGET_MAX_MS);
-        self.target_frames = self.rate as usize * self.target_ms as usize / 1000;
+        self.base_ms = ms.clamp(TARGET_MIN_MS, TARGET_MAX_MS);
+        self.recompute_target();
     }
 
-    /// 稳定判定窗口：连续这么多帧没有欠载才考虑收回缓冲（默认 5 秒）。
+    /// 用户选的基准目标（毫秒）。
+    pub fn base_ms(&self) -> u32 {
+        self.base_ms
+    }
+
+    /// 自适应临时加上的余量（毫秒）。0 = 正在用用户选的基准值。
+    pub fn boost_ms(&self) -> u32 {
+        self.boost_ms
+    }
+
+    fn recompute_target(&mut self) {
+        let ms = (self.base_ms + self.boost_ms).min(TARGET_MAX_MS);
+        self.target_ms = ms;
+        self.target_frames = self.rate as usize * ms as usize / 1000;
+    }
+
+    /// 稳定判定窗口：连续这么多帧没有欠载才考虑收回临时余量（默认 5 秒）。
     fn stable_window(&self) -> u64 {
         self.rate as u64 * 5
     }
 
-    /// 收回缓冲的前提：现存量要比目标还多出一截，否则会立刻又欠载。
+    /// 收回临时余量的前提：现存量要比目标还多出一截，否则会立刻又欠载。
     fn can_lower(&self) -> bool {
-        self.target_ms > TARGET_MIN_MS
+        self.boost_ms > 0
             && self.buf.len() > self.target_frames + (self.rate as usize / 50) // +20 ms
     }
 
@@ -301,6 +418,7 @@ impl Playout {
     pub fn push(&mut self, samples: &[i16]) {
         self.buf.extend(samples.iter().copied());
         self.stats.sum_sq += samples.iter().map(|&s| (s as f64) * (s as f64)).sum::<f64>();
+        self.last_push_at = Some(self.clock.now());
         // 真·超容量兜底：正常路径不应该走到这里（延迟守卫会先把存量压住），
         // 走到说明消费端已经停摆很久，宁可丢最旧的也不要让延迟无限涨。
         while self.buf.len() > self.capacity {
@@ -318,6 +436,9 @@ impl Playout {
         self.slip = 0.0;
         self.stable_frames = 0;
         self.drift_base = None;
+        // 下一次 `push` 之前不该被当成"断供"：清空后 `last_push_at` 是过去时刻，
+        // 但此刻会话已经结束，`fill` 不会再被调用。
+        self.last_push_at = None;
     }
 
     /// 声卡自己报错时补记一次欠载（由 `Sink` 的错误回调调用）。
@@ -352,6 +473,14 @@ impl Playout {
         }
         self.frames_per_callback = out.len();
 
+        // **A4：测实际存量，不要用目标值代替延迟。**
+        // 在消费之前记，得到的是"这一轮回调开始时缓冲里有多少毫秒"——
+        // 那就是这块音频要等多久才会被播出去的量级。
+        // 只有在播放中的样本才有意义：预填阶段存量必然在涨，混进来会把 p95 抬高。
+        if self.playing {
+            self.stats.note_fill(self.fill_ms());
+        }
+
         if !self.playing {
             if self.buf.len() >= self.target_frames {
                 self.playing = true;
@@ -380,7 +509,6 @@ impl Playout {
                 self.buf.pop_front();
             }
             self.stats.frames_trimmed += drop as u64;
-            self.stats.trim_events += 1;
         }
 
         // 漂移补偿速率**只看墙钟漂移估计，不看缓冲存量**。
@@ -416,9 +544,9 @@ impl Playout {
                         if self.stable_frames >= self.stable_window() {
                             self.stable_frames = 0;
                             if self.can_lower() {
-                                let next = self.target_ms.saturating_sub(5);
-                                self.set_target_ms(next);
-                                self.stats.target_lowers += 1;
+                                // 只收回临时余量，绝不动用户选的基准。
+                                self.boost_ms = self.boost_ms.saturating_sub(TARGET_STEP_MS);
+                                self.recompute_target();
                             }
                         }
                         s
@@ -427,12 +555,13 @@ impl Playout {
                         // 一次回调里缺多少帧都只算一次欠载事件；缺的帧数单独记
                         shortage = true;
                         self.stats.frames_silenced += 1;
-                        // 欠载说明余量不够：抬高一档，并沿用上一个样本避免爆音
+                        // 欠载说明余量不够：抬高一档临时余量（不动用户的基准值），
+                        // 并沿用上一个样本避免爆音。
                         self.stable_frames = 0;
                         if self.target_ms < TARGET_MAX_MS {
-                            let next = (self.target_ms + 5).min(TARGET_MAX_MS);
-                            self.set_target_ms(next);
-                            self.stats.target_raises += 1;
+                            let room = TARGET_MAX_MS - self.target_ms;
+                            self.boost_ms += room.min(TARGET_STEP_MS);
+                            self.recompute_target();
                         }
                         self.last
                     }
@@ -443,16 +572,25 @@ impl Playout {
         }
         if shortage {
             self.stats.underruns += 1;
+            // **A5：欠载要分两种。** 消费端读空时，如果距上一次推入已经超过
+            // `UNDERFED_MS`，说明这期间我们一直没拿到新数据 —— 是链路/上游断供，
+            // 不是缓冲目标不够。混在一起报时，把目标从 60 抬到 80 会让数字变好，
+            // 于是"链路偶尔断 100 ms"这个真因被永久掩盖（KI-006 踩过两轮）。
+            //
+            // 判据用"距上次推入的时长"而不是"存量"：存量在欠载那一刻必然是 0，
+            // 它无法区分"刚刚推进来就被抽干"和"根本没东西推"。
+            let starvation = self
+                .last_push_at
+                .map(|at| now.saturating_duration_since(at).as_secs_f64() * 1000.0)
+                .unwrap_or(f64::INFINITY);
+            if starvation > UNDERFED_MS {
+                self.stats.underruns_underfed += 1;
+            }
             // 记下这次欠载的时刻（相对第一次回调）。音频回调里不能分配、不能 IO，
             // 所以只写进预分配的定长数组，打印留给调用方。
             if self.stats.underruns_logged < UNDERRUN_LOG {
                 if let Some(first) = self.first_callback {
-                    let at = self
-                        .clock
-                        .now()
-                        .saturating_duration_since(first)
-                        .as_secs_f64()
-                        * 1000.0;
+                    let at = now.saturating_duration_since(first).as_secs_f64() * 1000.0;
                     self.stats.underrun_at_ms[self.stats.underruns_logged] = at;
                     self.stats.underruns_logged += 1;
                 }
@@ -577,8 +715,8 @@ mod tests {
 
     /// 延迟守卫与自适应目标不能互相打架。
     ///
-    /// `can_lower()` 要求"存量 > 目标 + 20 ms"才肯把目标降一档。修剪保留的余量若小于
-    /// 这个门槛，缓冲就永远回不到"够低"，目标只升不降、延迟长期偏高
+    /// `can_lower()` 要求"存量 > 目标 + 20 ms"才肯收回临时余量。修剪保留的余量若小于
+    /// 这个门槛，临时余量就永远收不回来，延迟长期偏高
     /// （2026-11-06 真机实测：中位 117 ms、13 个整秒 >150 ms）。
     ///
     /// 用编译期断言而不是运行时 `assert!`：这几个都是常量，改坏了应该直接编不过，
@@ -587,11 +725,17 @@ mod tests {
         const CAN_LOWER_GATE_MS: u32 = 20;
         assert!(
             TRIM_BACK_MS > CAN_LOWER_GATE_MS,
-            "TRIM_BACK_MS 必须大于 can_lower 门槛，否则目标卡在 80 ms 降不下来"
+            "TRIM_BACK_MS 必须大于 can_lower 门槛，否则临时余量收不回来"
         );
         assert!(
             TRIM_OVER_MS > TRIM_BACK_MS,
             "修剪上限必须大于保留余量，否则守卫自相矛盾"
+        );
+        // 抬升步长必须能整除可用上限，否则 `boost` 会在 75/80 之间来回跳一格。
+        assert!(
+            TARGET_MAX_MS.is_multiple_of(TARGET_STEP_MS)
+                && TARGET_MIN_MS.is_multiple_of(TARGET_STEP_MS),
+            "STEP 必须能整除上下限，否则自适应会出现非整档的目标"
         );
     };
 
@@ -631,5 +775,129 @@ mod tests {
         out.fill(1);
         p.fill(&mut out);
         assert!(out.iter().all(|&v| v == 0), "clear 之后还在出声");
+    }
+
+    /// **A3 回归：自适应不许把用户选的基准值降下来。**
+    ///
+    /// 旧实现里 `set_target_ms(target - 5)` 直接改 `target_ms`，于是用户把滑块拉到
+    /// 80 ms、跑稳 5 s 之后目标会一路降到 40 ms —— 界面上还显示 80。
+    /// 现在的口径：`base_ms` 只由用户改，自适应只动 `boost_ms`。
+    #[test]
+    fn adaptive_never_lowers_the_user_set_base() {
+        let mut p = Playout::new(RATE, 80);
+        assert_eq!(p.base_ms(), 80);
+        assert_eq!(p.boost_ms(), 0);
+
+        // 跑一段完全稳态的仿真：不断喂、不断取，永远不会欠载。
+        let mut out = vec![0i16; 160];
+        for _ in 0..(30 * 100) {
+            p.clock.advance(std::time::Duration::from_millis(10));
+            p.push(&vec![100i16; 160]);
+            p.fill(&mut out);
+        }
+
+        assert_eq!(p.base_ms(), 80, "用户选的基准被偷偷改了");
+        assert_eq!(p.boost_ms(), 0, "稳态下不该有临时余量");
+        assert_eq!(p.target_ms(), 80, "实际生效目标应当仍是 80");
+
+        // 用户主动调小才允许变：这是唯一能改 base 的入口。
+        p.set_target_ms(60);
+        assert_eq!(p.base_ms(), 60);
+        assert_eq!(p.target_ms(), 60);
+    }
+
+    /// 自适应抬升只加在 `boost` 上，且到上限就停。
+    #[test]
+    fn adaptive_boost_stops_at_target_max() {
+        let mut p = Playout::new(RATE, 80);
+        let mut out = vec![0i16; 160];
+        // 先推满，让 playing = true。
+        p.push(&vec![100i16; RATE as usize / 10]);
+        p.clock.advance(std::time::Duration::from_millis(10));
+        p.fill(&mut out);
+        // 之后一直不喂，欠载 → 抬 boost。基准 80 已在上限，boost 没有可用空间。
+        for _ in 0..50 {
+            p.clock.advance(std::time::Duration::from_millis(10));
+            p.fill(&mut out);
+        }
+        assert!(p.stats().underruns > 0, "不喂数据必须欠载");
+        assert_eq!(p.base_ms(), 80, "基准不该被改");
+        assert_eq!(p.target_ms(), TARGET_MAX_MS, "目标不该超过上限");
+        assert_eq!(p.boost_ms(), 0, "基准已到上限时没有可加的余量");
+    }
+
+    /// **A5：欠载必须区分"链路断供"与"消费太快"。**
+    ///
+    /// 两种情形都在同一个 `fill` 里读到空缓冲，但归因不同：
+    /// - 距上次推入 > `UNDERFED_MS` → 上游没喂上（`underruns_underfed`）；
+    /// - 距上次推入很近 → 我们消费得比生产快（只计 `underruns`）。
+    ///
+    /// 混成一个数字是 KI-006 绕两轮的根源：抬缓冲目标会让前者也"变好"，
+    /// 于是链路问题被当成缓冲不够。
+    #[test]
+    fn underruns_are_attributed_to_starvation_or_consumption() {
+        let mut out = vec![0i16; 160];
+
+        // 情形 A：先喂够让它播起来，然后彻底断供 → 断供型。
+        let mut starved = Playout::new(RATE, 40);
+        // 目标 40 ms = 640 帧；先给 50 ms，确保预填完成、`playing = true`。
+        starved.push(&vec![100i16; RATE as usize * 50 / 1000]);
+        for _ in 0..40 {
+            starved.clock.advance(std::time::Duration::from_millis(20));
+            starved.fill(&mut out);
+        }
+        let a = starved.stats();
+        assert!(a.underruns > 0, "断供必须欠载");
+        assert_eq!(
+            a.underruns_underfed, a.underruns,
+            "一直没喂数据时，欠载应当全部归到断供（实得 {}/{}）",
+            a.underruns_underfed, a.underruns
+        );
+
+        // 情形 B：每拍都喂，但喂得比取得少（消费快于生产）→ 消费型。
+        let mut fast = Playout::new(RATE, 40);
+        // 先攒够预填量，让 playing = true。
+        fast.push(&vec![100i16; RATE as usize * 40 / 1000 + 160]);
+        fast.clock.advance(std::time::Duration::from_millis(1));
+        fast.fill(&mut out);
+        for _ in 0..200 {
+            // 每 10 ms 只喂 100 帧（相当于 10 ms 需要 160 帧）→ 必然逐渐抽干。
+            fast.clock.advance(std::time::Duration::from_millis(10));
+            fast.push(&[100i16; 100]);
+            fast.fill(&mut out);
+        }
+        let b = fast.stats();
+        assert!(b.underruns > 0, "喂得比取得少，迟早欠载");
+        assert!(
+            b.underruns_underfed < b.underruns,
+            "持续喂数据时不该全部归成断供（断供 {}/总 {}）",
+            b.underruns_underfed,
+            b.underruns
+        );
+    }
+
+    /// **A4：报告延迟要用实测存量，不能拿目标值糊弄。**
+    ///
+    /// 目标 80 ms 时，修剪守卫会把稳态存量留在"目标 + 余量"附近，
+    /// 实际 p50 明显高于 80。这条测试钉住"我们确实在测存量分布"，
+    /// 而不是只回一个常数。
+    #[test]
+    fn fill_percentiles_reflect_measured_buffer() {
+        let mut s = Sim::new();
+        s.run(1.0, 30.0, None);
+        let st = s.p.stats();
+
+        let p50 = st.fill_percentile_ms(0.5).expect("跑够 30 s 应当有样本");
+        let p95 = st.fill_percentile_ms(0.95).expect("跑够 30 s 应当有样本");
+
+        // 目标 80 ms；实测应当落在同一量级，且 p95 ≥ p50。
+        assert!(p50 > 40.0, "存量中位数只有 {p50} ms，说明没在测");
+        assert!(p95 >= p50, "p95 {p95} 竟然小于 p50 {p50}");
+        assert!(
+            p50 < 200.0 && p95 < 260.0,
+            "存量 {p50}/{p95} ms 超出桶范围，直方图可能需要加宽"
+        );
+        // 桶宽 4 ms，样本足够时误差应当很小。
+        assert!(st.fill_samples > 1000, "样本太少：{}", st.fill_samples);
     }
 }

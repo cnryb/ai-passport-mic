@@ -29,6 +29,15 @@ use std::time::Instant;
 /// 音频块通道容量。32 块 ≈ 640 ms：真满了说明声卡线程已经卡死，
 /// 这时候丢新的比丢旧的更安全（旧数据至少是连续的）。
 const PCM_CHANNEL: usize = 32;
+
+/// 复用缓冲池大小（块）。`push` 从池里借一个 `Vec` 拷进去，声卡线程处理完还回来；
+/// 池空时才新分配。
+///
+/// **为什么要有这个（A6）**：以前每块都 `pcm.to_vec()`，50 块/秒 × 20 分钟 ≈
+/// 6 万次小块分配，全部发生在 BLE 通知任务里。分配本身不慢，但它会在 tokio worker
+/// 上引入不可预测的停顿，而这条线程的停顿会直接表现为"块到达间隔变长"
+/// —— 正是 KI-006 要区分的那件事。池大小取 channel 容量的两倍，够覆盖最坏积压。
+const PCM_POOL: usize = PCM_CHANNEL * 2;
 /// 峰值保持时长与释放速率（`docs/GUI.md` §7）。
 const PEAK_HOLD_S: f64 = 1.5;
 const PEAK_RELEASE_DB_PER_S: f32 = 12.0;
@@ -48,8 +57,19 @@ pub struct Telemetry {
     pub peak_dbfs: Option<f64>,
     /// 声卡侧可用样本折合的毫秒数，**不是** channel 深度。
     pub buffer_ms: f32,
-    /// 当前抖动缓冲目标（会自适应）。
+    /// 实测存量中位数（ms，整场累计）。`None` = 还没跑够样本。
+    ///
+    /// **报告里的延迟应当引这个，而不是 `target_ms`。** 修剪守卫会把稳态存量
+    /// 留在"目标 + 余量"附近，用目标值当延迟会系统性低估二三十毫秒。
+    pub fill_p50_ms: Option<f64>,
+    /// 实测存量 p95（ms）。延迟预算（`p95 ≤ 150 ms`）里"抖动缓冲"那一项应当用它。
+    pub fill_p95_ms: Option<f64>,
+    /// 当前**实际生效**的抖动缓冲目标（基准 + 自适应余量）。
     pub target_ms: u32,
+    /// 用户选的基准目标。自适应不会改它（A3）。
+    pub base_target_ms: u32,
+    /// 自适应临时加上的余量（ms）。非 0 说明最近发生过欠载。
+    pub boost_ms: u32,
     pub blocks: u64,
     /// 序号跳变推算出的缺失块数。
     pub lost_blocks: u32,
@@ -58,6 +78,9 @@ pub struct Telemetry {
     /// 设备 STATUS 上报的发送阶段丢弃，与 `lost_blocks` 分开显示。
     pub device_dropped: u16,
     pub underruns: u64,
+    /// 其中**上游断供**造成的次数（A5）。与 `underruns` 分开：
+    /// 断供型调缓冲目标没用，得查链路；消费型才是缓冲不够。
+    pub underruns_underfed: u64,
     pub silent_frames: u64,
     pub lock_misses: u64,
     pub bytes_written: u64,
@@ -86,14 +109,19 @@ struct MeterState {
     peak_hold_at: f64,
     buffer_ms: f32,
     target_ms: u32,
+    base_target_ms: u32,
+    boost_ms: u32,
     ppm: f64,
     underruns: u64,
+    underruns_underfed: u64,
     silent_frames: u64,
     lock_misses: u64,
     bytes_written: u64,
     overflow: u64,
     glitch_events: u64,
     glitch_muted: u64,
+    fill_p50_ms: Option<f64>,
+    fill_p95_ms: Option<f64>,
 }
 
 /// 声卡侧指标的一次快照。抽成结构体是为了让 `publish_sink` 的参数不失控，
@@ -102,11 +130,20 @@ struct MeterState {
 struct SinkSnapshot {
     buffer_ms: f32,
     target_ms: u32,
+    /// 用户选的基准目标（自适应不会改它）。
+    base_target_ms: u32,
+    /// 自适应临时余量。
+    boost_ms: u32,
     ppm: f64,
     underruns: u64,
+    /// 其中"上游断供"造成的次数（A5）。
+    underruns_underfed: u64,
     silent_frames: u64,
     lock_misses: u64,
     bytes_written: u64,
+    /// 实测存量分位数（A4）。
+    fill_p50_ms: Option<f64>,
+    fill_p95_ms: Option<f64>,
 }
 
 /// 声卡线程与聚合线程共用的指标盒。锁只在微秒级持有，不跨任何 IO。
@@ -127,14 +164,19 @@ impl Meter {
                 peak_hold_at: 0.0,
                 buffer_ms: 0.0,
                 target_ms,
+                base_target_ms: target_ms,
+                boost_ms: 0,
                 ppm: 0.0,
                 underruns: 0,
+                underruns_underfed: 0,
                 silent_frames: 0,
                 lock_misses: 0,
                 bytes_written: 0,
                 overflow: 0,
                 glitch_events: 0,
                 glitch_muted: 0,
+                fill_p50_ms: None,
+                fill_p95_ms: None,
             }),
         }
     }
@@ -214,11 +256,16 @@ impl Meter {
         };
         g.buffer_ms = snap.buffer_ms;
         g.target_ms = snap.target_ms;
+        g.base_target_ms = snap.base_target_ms;
+        g.boost_ms = snap.boost_ms;
         g.ppm = snap.ppm;
         g.underruns = snap.underruns;
+        g.underruns_underfed = snap.underruns_underfed;
         g.silent_frames = snap.silent_frames;
         g.lock_misses = snap.lock_misses;
         g.bytes_written = snap.bytes_written;
+        g.fill_p50_ms = snap.fill_p50_ms;
+        g.fill_p95_ms = snap.fill_p95_ms;
     }
 
     fn note_glitch(&self, events: u64, muted_samples: u64) {
@@ -241,8 +288,13 @@ impl Meter {
             rms_dbfs: rms,
             peak_dbfs: peak,
             buffer_ms: g.buffer_ms,
+            fill_p50_ms: g.fill_p50_ms,
+            fill_p95_ms: g.fill_p95_ms,
             target_ms: g.target_ms,
+            base_target_ms: g.base_target_ms,
+            boost_ms: g.boost_ms,
             underruns: g.underruns,
+            underruns_underfed: g.underruns_underfed,
             silent_frames: g.silent_frames,
             lock_misses: g.lock_misses,
             bytes_written: g.bytes_written,
@@ -320,6 +372,11 @@ pub struct SessionSummary {
     pub wav_path: Option<String>,
     pub bytes_written: u64,
     pub underruns: u64,
+    /// 其中**上游断供**（距上次推入 > 30 ms）造成的次数（A5）。
+    ///
+    /// `underruns - underruns_underfed` = 消费端跑得比生产快的次数 ——
+    /// 只有这一部分能靠"把缓冲目标调大"改善。
+    pub underruns_underfed: u64,
     pub silent_frames: u64,
     pub frames_dropped: u64,
     /// 延迟守卫一次性修剪掉的旧帧数（回调停摆造成的积压，不是链路问题）
@@ -328,8 +385,16 @@ pub struct SessionSummary {
     pub ppm: f64,
     pub frames_inserted: u64,
     pub frames_skipped: u64,
+    /// 会话开始时**用户选的**缓冲基准（ms）。自适应不改它。
     pub target_start_ms: u32,
+    /// 会话结束时用户选的基准（运行中滑块改过就会变）。
     pub target_end_ms: u32,
+    /// 会话期间自适应临时加过的最大余量（ms）。0 = 全程没被抬过。
+    pub target_boost_max_ms: u32,
+    /// 实测存量中位数（ms，整场累计）。报告里的"抖动缓冲延迟"用它。
+    pub buffer_p50_ms: Option<f64>,
+    /// 实测存量 p95（ms）。延迟预算里"抖动缓冲"那一项用它。
+    pub buffer_p95_ms: Option<f64>,
     pub glitch_events: u64,
     pub glitch_muted_ms: f64,
     pub lost_blocks: u32,
@@ -339,18 +404,89 @@ pub struct SessionSummary {
     pub overflow_drops: u64,
     /// 设备报过 `LINK_SLOW`（连接间隔 > 40 ms）。这一场的数字不能进音质对比。
     pub link_slow: bool,
+    /// 本场最大块到达间隔（ms，链路层打点，不含我们自己的处理时间）。
+    pub max_arrival_gap_ms: f64,
+    /// 本场到达间隔超过 80 ms 缓冲上限的次数。
+    pub late_arrivals: u64,
+    /// 本场单块处理耗时最大值（ms）：链路交给我们 → 解码完成推入声卡。
+    pub max_process_gap_ms: f64,
+    /// 本场处理耗时超过 20 ms（超过一个块的时长）的块数。
+    pub slow_process_blocks: u64,
+    /// 本场最长一次到达间隔期间，读取实际等了多久（ms）。
+    ///
+    /// `max_arrival_gap_ms - 这一项` = 我们在那一刻自己花掉的时间。
+    pub gap_read_wait_ms: f64,
+    /// 本场读取等待的最大值（ms）：反映"我们问链路问得够不够勤"。
+    pub max_read_wait_ms: f64,
+    /// 通知交付模式：`even`（逐块）/ `clumped`（攒批）/ `unclear` / `insufficient`。
+    ///
+    /// 这是 G2 判据（方案 D 阈值）的直接依据：攒批交付下"偶尔一次长间隔"是机制固有形状。
+    pub delivery_pattern: String,
+    /// 相邻间隔 <5 ms 的比例（攒批的直接证据）。
+    pub delivery_clumped_ratio: f64,
+    /// 间隔落在 15–25 ms 的比例（逐块交付的证据）。
+    pub delivery_even_ratio: f64,
 }
 
 enum Msg {
-    Pcm(Vec<i16>),
+    /// PCM 块 + 它来自哪个池槽位（`None` = 池空时新分配的，还不属于池）。
+    Pcm { pcm: Vec<i16>, slot: Option<usize> },
     Retarget(u32),
     Stop,
+}
+
+/// 复用缓冲池。声卡线程用完把槽位还回来，生产者下次直接复用。
+///
+/// `SessionHandle::push` 借一个、`worker` 处理完还回来。池空时退回新分配
+/// （与旧行为一致），所以它只影响"常见路径少一次 malloc/free"，不影响正确性。
+struct PcmPool {
+    /// 空闲槽位下标。
+    free: Vec<usize>,
+    /// 槽位本体。`take` 会把 `Vec` 取走（`mem::take`），`give_back` 再放回。
+    slots: Vec<Vec<i16>>,
+    /// 每个槽位当前是否被借走。用于防重复归还，O(1) 判断。
+    taken: Vec<bool>,
+}
+
+impl PcmPool {
+    fn new() -> Self {
+        Self {
+            // 先全部登记为空闲；槽位本体第一次借用时才扩容，
+            // 免得开流瞬间就分配 64 个块。
+            free: (0..PCM_POOL).rev().collect(),
+            slots: vec![Vec::new(); PCM_POOL],
+            taken: vec![false; PCM_POOL],
+        }
+    }
+
+    /// 借一个槽位：返回 `(slot_index, buffer)`。池空时返回 `None`。
+    fn take(&mut self) -> Option<(usize, Vec<i16>)> {
+        let idx = self.free.pop()?;
+        self.taken[idx] = true;
+        Some((idx, std::mem::take(&mut self.slots[idx])))
+    }
+
+    /// 还回槽位。`idx` 必须来自 [`Self::take`]；越界或重复归还直接忽略，
+    /// 宁可少一个缓冲也不要在音频路径上 panic。
+    fn give_back(&mut self, idx: usize, mut buf: Vec<i16>) {
+        if idx >= self.slots.len() || !self.taken[idx] {
+            return;
+        }
+        // 保留容量、不保留数据：下次 `clear()` + `extend_from_slice` 复用同一块内存。
+        buf.clear();
+        self.slots[idx] = buf;
+        self.taken[idx] = false;
+        self.free.push(idx);
+    }
 }
 
 /// 主线程握着的句柄。`Drop` 时若还没 `finish`，会自动发 stop 并等线程收尾，
 /// 避免 GUI 退出时留下一条还在往声卡写静音的线程。
 pub struct SessionHandle {
     tx: SyncSender<Msg>,
+    /// 复用缓冲池：生产者借、声卡线程还。锁只包住一次 `Vec` 移动（百纳秒级），
+    /// 不跨任何 IO，也不跨 `sink.push`。
+    pool: Arc<Mutex<PcmPool>>,
     meter: Arc<Meter>,
     join: Option<JoinHandle<WorkerOutcome>>,
     info: SessionInfo,
@@ -364,6 +500,7 @@ struct WorkerOutcome {
     frames: u64,
     bytes_written: u64,
     underruns: u64,
+    underruns_underfed: u64,
     silent_frames: u64,
     frames_dropped: u64,
     frames_trimmed: u64,
@@ -373,6 +510,9 @@ struct WorkerOutcome {
     frames_skipped: u64,
     target_start_ms: u32,
     target_end_ms: u32,
+    target_boost_max_ms: u32,
+    buffer_p50_ms: Option<f64>,
+    buffer_p95_ms: Option<f64>,
     glitch_events: u64,
     glitch_muted: u64,
 }
@@ -387,11 +527,48 @@ impl SessionHandle {
     }
 
     /// 喂一块**已解码**的 PCM。满了就丢并计数，永不阻塞。
+    ///
+    /// 走缓冲池：常见路径上不再每块 `to_vec()`（见 [`PCM_POOL`]）。
+    /// 池空时退回新分配，所以行为与旧实现一致，只是少了分配噪声。
     pub fn push(&self, pcm: &[i16]) {
-        match self.tx.try_send(Msg::Pcm(pcm.to_vec())) {
+        let (slot, mut buf) = match self.pool.lock() {
+            Ok(mut pool) => match pool.take() {
+                Some((slot, buf)) => (Some(slot), buf),
+                None => (None, Vec::with_capacity(pcm.len())),
+            },
+            Err(e) => {
+                let mut pool = e.into_inner();
+                match pool.take() {
+                    Some((slot, buf)) => (Some(slot), buf),
+                    None => (None, Vec::with_capacity(pcm.len())),
+                }
+            }
+        };
+        buf.clear();
+        buf.extend_from_slice(pcm);
+
+        match self.tx.try_send(Msg::Pcm { pcm: buf, slot }) {
             Ok(()) => {}
-            Err(TrySendError::Full(_)) => self.meter.note_overflow(),
-            Err(TrySendError::Disconnected(_)) => {}
+            Err(TrySendError::Full(msg)) => {
+                self.meter.note_overflow();
+                // 没送出去就把槽位还回池子，否则池会一路漏空、退回每块分配。
+                if let Msg::Pcm { pcm, slot } = msg {
+                    self.give_back(slot, pcm);
+                }
+            }
+            Err(TrySendError::Disconnected(msg)) => {
+                if let Msg::Pcm { pcm, slot } = msg {
+                    self.give_back(slot, pcm);
+                }
+            }
+        }
+    }
+
+    fn give_back(&self, slot: Option<usize>, buf: Vec<i16>) {
+        let Some(idx) = slot else { return };
+        match self.pool.lock() {
+            Ok(mut pool) => pool.give_back(idx, buf),
+            Err(e) => e.into_inner().give_back(idx, buf),
         }
     }
 
@@ -433,6 +610,7 @@ impl SessionHandle {
             wav_path: self.info.wav_path.clone(),
             bytes_written: o.bytes_written,
             underruns: o.underruns,
+            underruns_underfed: o.underruns_underfed,
             silent_frames: o.silent_frames,
             frames_dropped: o.frames_dropped,
             frames_trimmed: o.frames_trimmed,
@@ -442,6 +620,9 @@ impl SessionHandle {
             frames_skipped: o.frames_skipped,
             target_start_ms: o.target_start_ms,
             target_end_ms: o.target_end_ms,
+            target_boost_max_ms: o.target_boost_max_ms,
+            buffer_p50_ms: o.buffer_p50_ms,
+            buffer_p95_ms: o.buffer_p95_ms,
             glitch_events,
             glitch_muted_ms: if self.info.rate == 0 {
                 0.0
@@ -472,21 +653,27 @@ impl Drop for SessionHandle {
 /// 开一条会话。**返回成功即代表声卡已经打开**（错误在开线程阶段同步回传），
 /// 所以界面可以在 start_stream 的返回值上直接报 `sink_missing`。
 pub fn start(opts: SessionOptions) -> Result<SessionHandle, AppError> {
-    let target_ms = opts.target_ms.clamp(40, 80);
+    // 唯一一份夹紧：`apm_sink` 的常量就是契约，不在这里再写一遍字面量。
+    let target_ms = opts
+        .target_ms
+        .clamp(apm_sink::TARGET_MIN_MS, apm_sink::TARGET_MAX_MS);
     let meter = Arc::new(Meter::new(target_ms));
+    let pool = Arc::new(Mutex::new(PcmPool::new()));
     let (tx, rx) = sync_channel::<Msg>(PCM_CHANNEL);
     let (ready_tx, ready_rx) = sync_channel::<Result<SessionInfo, AppError>>(1);
 
     let meter_thread = Arc::clone(&meter);
+    let pool_thread = Arc::clone(&pool);
     let opts_thread = opts.clone();
     let join = thread::Builder::new()
         .name("apm-sink".into())
-        .spawn(move || worker(rx, meter_thread, opts_thread, ready_tx))
+        .spawn(move || worker(rx, meter_thread, pool_thread, opts_thread, ready_tx))
         .map_err(|e| AppError::internal(format!("创建声卡线程失败：{e}")))?;
 
     match ready_rx.recv() {
         Ok(Ok(info)) => Ok(SessionHandle {
             tx,
+            pool,
             meter,
             join: Some(join),
             info,
@@ -508,6 +695,7 @@ pub fn start(opts: SessionOptions) -> Result<SessionHandle, AppError> {
 fn worker(
     rx: Receiver<Msg>,
     meter: Arc<Meter>,
+    pool: Arc<Mutex<PcmPool>>,
     opts: SessionOptions,
     ready: SyncSender<Result<SessionInfo, AppError>>,
 ) -> WorkerOutcome {
@@ -535,7 +723,12 @@ fn worker(
         sink_device: sink.as_ref().map(|s| s.device_name().to_string()),
         rate: sink.as_ref().map(|s| s.rate()).unwrap_or(AUDIO_SAMPLE_RATE),
         channels: sink.as_ref().map(|s| s.channels()).unwrap_or(1),
-        target_ms: sink.as_ref().map(|s| s.target_ms()).unwrap_or(opts.target_ms),
+        // `SessionInfo::target_ms` 对外表达的是**用户选的基准**，不是自适应当前值。
+        // 报告里写"目标 80 ms"必须对应滑块上的那个数，否则界面与报告会互相矛盾。
+        target_ms: sink
+            .as_ref()
+            .map(|s| s.base_target_ms())
+            .unwrap_or(opts.target_ms),
         wav_path: opts.wav_path.as_ref().map(|p| p.display().to_string()),
     };
     let target_start_ms = info.target_ms;
@@ -544,10 +737,12 @@ fn worker(
     let mut suppressor = glitch::Suppressor::new();
     let mut frames = 0u64;
     let mut ticks = 0u32;
+    // 会话期间自适应临时余量的峰值（ms）。
+    let mut boost_max = 0u32;
 
     loop {
         match rx.recv() {
-            Ok(Msg::Pcm(mut pcm)) => {
+            Ok(Msg::Pcm { mut pcm, slot }) => {
                 // 先压毛刺再进声卡/文件：垃圾数据不该被会议软件听到，也不该进音质报告。
                 suppressor.process(&mut pcm);
                 meter.observe(&pcm, 0.0);
@@ -562,19 +757,34 @@ fn worker(
                     s.push(&pcm);
                 }
                 frames += pcm.len() as u64;
+                // 用完立刻还回缓冲池：`sink.push` 已经把样本拷进 `Playout` 的
+                // `VecDeque`，这里之后不会再读这块内存。
+                if let Some(idx) = slot {
+                    match pool.lock() {
+                        Ok(mut p) => p.give_back(idx, pcm),
+                        Err(e) => e.into_inner().give_back(idx, pcm),
+                    }
+                }
                 ticks += 1;
                 if ticks.is_multiple_of(5) {
                     meter.note_glitch(suppressor.events, suppressor.muted_samples);
                     if let Some(s) = sink.as_ref() {
                         let st = s.stats();
+                        let boost = s.boost_ms();
+                        boost_max = boost_max.max(boost);
                         meter.publish_sink(SinkSnapshot {
                             buffer_ms: s.fill_ms(),
                             target_ms: s.target_ms(),
+                            base_target_ms: s.base_target_ms(),
+                            boost_ms: boost,
                             ppm: s.ppm(),
                             underruns: st.underruns,
+                            underruns_underfed: st.underruns_underfed,
                             silent_frames: st.frames_silenced,
                             lock_misses: s.lock_misses(),
                             bytes_written: frames * 2,
+                            fill_p50_ms: st.fill_percentile_ms(0.5),
+                            fill_p95_ms: st.fill_percentile_ms(0.95),
                         });
                     }
                 }
@@ -599,6 +809,7 @@ fn worker(
         glitch_events: suppressor.events,
         glitch_muted: suppressor.muted_samples,
         target_start_ms,
+        target_boost_max_ms: boost_max,
         ..WorkerOutcome::default()
     };
     if let Some(mut s) = sink {
@@ -606,6 +817,7 @@ fn worker(
         s.clear();
         let st = s.stats();
         outcome.underruns = st.underruns;
+        outcome.underruns_underfed = st.underruns_underfed;
         outcome.silent_frames = st.frames_silenced;
         // 报告里的"超容量丢弃"只算真·容量兜底；延迟守卫修剪的旧数据另记，
         // 两者混在一起会让人以为链路出了问题。
@@ -615,7 +827,12 @@ fn worker(
         outcome.ppm = s.ppm();
         outcome.frames_inserted = st.frames_inserted;
         outcome.frames_skipped = st.frames_skipped;
-        outcome.target_end_ms = s.target_ms();
+        // 收尾报告：基准是用户的意图，自适应余量单独报峰值。
+        outcome.target_end_ms = s.base_target_ms();
+        outcome.target_boost_max_ms = boost_max.max(s.boost_ms());
+        // 实测存量分位数（A4）：报告里的延迟用它，不用目标值。
+        outcome.buffer_p50_ms = st.fill_percentile_ms(0.5);
+        outcome.buffer_p95_ms = st.fill_percentile_ms(0.95);
     } else {
         outcome.target_end_ms = target_start_ms;
     }
@@ -657,6 +874,34 @@ struct WavWriter {
     path: PathBuf,
 }
 
+/// 44 字节 PCM16 单声道 WAV 头。**开头写一次、收尾回填一次**，两处必须完全一致，
+/// 所以只留这一个拼装点：以前 `write_header` 与 `finalize` 各拼一遍，
+/// 字段写法还不一样（一个是变量 `channels`，一个是硬编码 `1u16`）——
+/// 改一处忘另一处就是一个能录不能放的文件。
+fn wav_header(data_len: u32) -> Vec<u8> {
+    const CHANNELS: u16 = 1;
+    const BITS: u16 = 16;
+    const PCM: u16 = 1;
+    let rate = AUDIO_SAMPLE_RATE;
+    let block_align = CHANNELS * BITS / 8;
+
+    let mut head = Vec::with_capacity(44);
+    head.extend_from_slice(b"RIFF");
+    head.extend_from_slice(&(36 + data_len).to_le_bytes());
+    head.extend_from_slice(b"WAVE");
+    head.extend_from_slice(b"fmt ");
+    head.extend_from_slice(&16u32.to_le_bytes()); // fmt 块长度
+    head.extend_from_slice(&PCM.to_le_bytes());
+    head.extend_from_slice(&CHANNELS.to_le_bytes());
+    head.extend_from_slice(&rate.to_le_bytes());
+    head.extend_from_slice(&(rate * block_align as u32).to_le_bytes()); // 字节率
+    head.extend_from_slice(&block_align.to_le_bytes());
+    head.extend_from_slice(&BITS.to_le_bytes());
+    head.extend_from_slice(b"data");
+    head.extend_from_slice(&data_len.to_le_bytes());
+    head
+}
+
 impl WavWriter {
     fn create(path: &Path) -> std::io::Result<Self> {
         if let Some(dir) = path.parent() {
@@ -673,23 +918,7 @@ impl WavWriter {
     }
 
     fn write_header(&mut self) -> std::io::Result<()> {
-        let data_len = self.data_bytes as u32;
-        let rate = AUDIO_SAMPLE_RATE;
-        let channels = 1u16;
-        let mut head = Vec::with_capacity(44);
-        head.extend_from_slice(b"RIFF");
-        head.extend_from_slice(&(36 + data_len).to_le_bytes());
-        head.extend_from_slice(b"WAVE");
-        head.extend_from_slice(b"fmt ");
-        head.extend_from_slice(&16u32.to_le_bytes());
-        head.extend_from_slice(&1u16.to_le_bytes()); // PCM
-        head.extend_from_slice(&channels.to_le_bytes());
-        head.extend_from_slice(&rate.to_le_bytes());
-        head.extend_from_slice(&(rate * channels as u32 * 2).to_le_bytes());
-        head.extend_from_slice(&(channels * 2).to_le_bytes());
-        head.extend_from_slice(&16u16.to_le_bytes());
-        head.extend_from_slice(b"data");
-        head.extend_from_slice(&data_len.to_le_bytes());
+        let head = wav_header(self.data_bytes as u32);
         self.file.write_all(&head)
     }
 
@@ -705,22 +934,7 @@ impl WavWriter {
         self.file.flush()?;
         let mut file = self.file.get_ref();
         file.seek(SeekFrom::Start(0))?;
-        let data_len = self.data_bytes as u32;
-        let rate = AUDIO_SAMPLE_RATE;
-        let mut head = Vec::with_capacity(44);
-        head.extend_from_slice(b"RIFF");
-        head.extend_from_slice(&(36 + data_len).to_le_bytes());
-        head.extend_from_slice(b"WAVE");
-        head.extend_from_slice(b"fmt ");
-        head.extend_from_slice(&16u32.to_le_bytes());
-        head.extend_from_slice(&1u16.to_le_bytes());
-        head.extend_from_slice(&1u16.to_le_bytes());
-        head.extend_from_slice(&rate.to_le_bytes());
-        head.extend_from_slice(&(rate * 2).to_le_bytes());
-        head.extend_from_slice(&2u16.to_le_bytes());
-        head.extend_from_slice(&16u16.to_le_bytes());
-        head.extend_from_slice(b"data");
-        head.extend_from_slice(&data_len.to_le_bytes());
+        let head = wav_header(self.data_bytes as u32);
         file.write_all(&head)?;
         file.flush()?;
         Ok(())
@@ -752,12 +966,90 @@ mod tests {
         let (rms, peak, t) = m.snapshot(0.1);
         assert!(rms.unwrap() > -10.0 && rms.unwrap() < 0.0, "{rms:?}");
         assert!(peak.unwrap() > -10.0, "{peak:?}");
-        assert_eq!(t.target_ms, 80);
+        assert_eq!(t.base_target_ms, 80, "基准目标应当就是构造时给的值");
+        assert_eq!(t.boost_ms, 0, "刚开会话不该有自适应余量");
 
         // 保持 1.5 s 后开始按 12 dB/s 释放；10 s 后应归零。
         m.observe(&vec![0i16; 320], 1.6);
         let (_rms2, peak2, _) = m.snapshot(10.0);
         assert!(peak2.is_none(), "峰值没有释放：{peak2:?}");
+    }
+
+    /// **A6：缓冲池必须真的被复用，且送不出去的槽位要还回来。**
+    ///
+    /// 判据用"池里空闲槽位数"而不是分配次数（分配次数测不到）。
+    /// 池大小固定，所以只要 push 之后不泄漏、worker 归还，长期稳态应当是满的。
+    #[test]
+    fn pcm_pool_recycles_and_does_not_leak_on_full_channel() {
+        let mut pool = PcmPool::new();
+        assert_eq!(pool.free.len(), PCM_POOL);
+
+        // 借空整个池：必须借得到，且拿到的都是空 Vec。
+        let mut held = Vec::new();
+        for _ in 0..PCM_POOL {
+            let (idx, buf) = pool.take().expect("池没满时应当借得到");
+            assert!(buf.is_empty(), "借出的缓冲必须是空的");
+            held.push(idx);
+        }
+        assert!(pool.take().is_none(), "借空之后应当返回 None（退回新分配）");
+
+        // 全部归还后应当恢复原样。
+        for idx in held {
+            pool.give_back(idx, Vec::with_capacity(4));
+        }
+        assert_eq!(pool.free.len(), PCM_POOL, "归还后池没有恢复");
+
+        // 重复归还同一个槽位不能把空闲表撑大（那会让两个生产者拿到同一块内存）。
+        let (idx, buf) = pool.take().unwrap();
+        pool.give_back(idx, buf.clone());
+        pool.give_back(idx, buf);
+        assert_eq!(pool.free.len(), PCM_POOL, "重复归还污染了空闲表");
+    }
+
+    /// 真正的 `SessionHandle::push` 路径：channel 满时槽位要还回去，不能一路漏空。
+    #[test]
+    fn push_returns_pool_slot_when_channel_is_full() {
+        let dir = std::env::temp_dir().join("apm-app-pool-full");
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("pool.wav");
+        let _ = std::fs::remove_file(&path);
+
+        let h = start(SessionOptions {
+            session_id: "pool".into(),
+            sink: None,
+            target_ms: 80,
+            wav_path: Some(path.clone()),
+        })
+        .unwrap();
+
+        let block = vec![100i16; apm_protocol::AUDIO_BLOCK_SAMPLES];
+        // 灌远超 channel 容量的块：前 PCM_CHANNEL 个能进，其余全部 Full。
+        for _ in 0..(PCM_CHANNEL * 4) {
+            h.push(&block);
+        }
+        // 池不泄漏的直接证据：所有槽位都能借到（说明被 Full 拒掉的那些都还回来了）。
+        {
+            let mut pool = h.pool.lock().unwrap_or_else(|e| e.into_inner());
+            let mut taken = Vec::new();
+            while let Some((idx, _)) = pool.take() {
+                taken.push(idx);
+            }
+            assert!(
+                !taken.is_empty(),
+                "池被漏空了 —— channel 满时槽位没有归还"
+            );
+            for idx in taken {
+                pool.give_back(idx, Vec::new());
+            }
+        }
+        // 溢出应当被计数，而不是被静默吞掉。
+        assert!(
+            h.meter().snapshot(1.0).2.overflow_drops > 0,
+            "channel 满丢块没有计数"
+        );
+
+        let _ = h.finish();
+        let _ = std::fs::remove_file(&path);
     }
 
     /// 有声卡时跑一遍真实写入路径。
@@ -795,7 +1087,10 @@ mod tests {
             std::thread::sleep(std::time::Duration::from_millis(4));
         }
         let summary = h.finish();
-        assert_eq!(summary.frames, 25 * apm_protocol::AUDIO_BLOCK_SAMPLES as u64);
+        assert_eq!(
+            summary.frames,
+            25 * apm_protocol::AUDIO_BLOCK_SAMPLES as u64
+        );
         assert!(summary.target_start_ms >= 40);
         assert_eq!(summary.wav_path, None);
     }
@@ -821,7 +1116,11 @@ mod tests {
                 h.push(&vec![200i16; apm_protocol::AUDIO_BLOCK_SAMPLES]);
             }
             let s = h.finish();
-            assert_eq!(s.frames, 3 * apm_protocol::AUDIO_BLOCK_SAMPLES as u64, "第 {round} 轮");
+            assert_eq!(
+                s.frames,
+                3 * apm_protocol::AUDIO_BLOCK_SAMPLES as u64,
+                "第 {round} 轮"
+            );
             let _ = std::fs::remove_file(&path);
         }
     }
@@ -885,7 +1184,8 @@ mod tests {
     fn sink_errors_map_to_fixed_codes() {
         let missing = classify_sink_error("没有名字包含 \"BlackHole\" 的输出设备");
         assert_eq!(missing.code, ErrorCode::SinkMissing);
-        let rate = classify_sink_error("输出设备 \"x\" 不支持 16000 Hz 原生采样率；本项目不隐式重采样");
+        let rate =
+            classify_sink_error("输出设备 \"x\" 不支持 16000 Hz 原生采样率；本项目不隐式重采样");
         assert_eq!(rate.code, ErrorCode::SinkRateUnsupported);
     }
 
@@ -910,7 +1210,11 @@ mod tests {
         let summary = h.finish();
         assert_eq!(summary.blocks, 0, "块数由 Pipeline 填，这里应为 0");
         assert_eq!(summary.frames, 5 * apm_protocol::AUDIO_BLOCK_SAMPLES as u64);
-        assert!((summary.duration_s - 0.1).abs() < 0.001, "{}", summary.duration_s);
+        assert!(
+            (summary.duration_s - 0.1).abs() < 0.001,
+            "{}",
+            summary.duration_s
+        );
         assert!(std::path::Path::new(summary.wav_path.as_ref().unwrap()).exists());
         let _ = std::fs::remove_file(&path);
     }

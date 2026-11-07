@@ -41,7 +41,11 @@ pub fn analyze(path: &Path, as_json: bool) -> Result<()> {
         report.channels,
         report.duration_s,
         report.samples,
-        if report.downmixed { "，已下混为单声道" } else { "" }
+        if report.downmixed {
+            "，已下混为单声道"
+        } else {
+            ""
+        }
     );
     if let Some(note) = report::rate_note(report.sample_rate) {
         println!("注意: {note}");
@@ -77,8 +81,13 @@ pub fn analyze(path: &Path, as_json: bool) -> Result<()> {
 fn display_width(text: &str) -> usize {
     text.chars()
         .map(|c| match c as u32 {
-            0x1100..=0x115F | 0x2E80..=0xA4CF | 0xAC00..=0xD7A3 | 0xF900..=0xFAFF
-            | 0xFE30..=0xFE6F | 0xFF00..=0xFF60 | 0xFFE0..=0xFFE6 => 2,
+            0x1100..=0x115F
+            | 0x2E80..=0xA4CF
+            | 0xAC00..=0xD7A3
+            | 0xF900..=0xFAFF
+            | 0xFE30..=0xFE6F
+            | 0xFF00..=0xFF60
+            | 0xFFE0..=0xFFE6 => 2,
             _ => 1,
         })
         .sum()
@@ -195,7 +204,10 @@ pub fn selftest(explicit: Option<&Path>) -> Result<()> {
             .unwrap_or_default();
         let got_decoded =
             apm_protocol::adpcm::decode_block(&want_block, apm_protocol::AUDIO_BLOCK_SAMPLES);
-        check(got_decoded == want_decoded, &format!("块 {index} 解码与 C 一致"));
+        check(
+            got_decoded == want_decoded,
+            &format!("块 {index} 解码与 C 一致"),
+        );
     }
 
     println!();
@@ -216,7 +228,8 @@ pub fn selftest(explicit: Option<&Path>) -> Result<()> {
 
 /// 默认随包镜像：仓库里的构建产物。安装包里的是 `Resources/firmware/`，那是 GUI 的事。
 fn default_image_path() -> Result<PathBuf> {
-    let p = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../../device/build/ai-passport-mic-merged.bin");
+    let p = Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("../../../device/build/ai-passport-mic-merged.bin");
     if p.is_file() {
         return Ok(p);
     }
@@ -281,14 +294,26 @@ pub fn firmware_probe(port: Option<&str>, image: Option<&Path>) -> Result<()> {
     let image = apm_app::firmware::load_image(&image_path)?;
 
     println!("串口: {port}");
-    println!("镜像: {}（版本 {}，{} 字节）", image_path.display(), image.info.version, image.info.bytes);
+    println!(
+        "镜像: {}（版本 {}，{} 字节）",
+        image_path.display(),
+        image.info.version,
+        image.info.bytes
+    );
     println!("检测会让设备复位进下载模式，正在推流会断……");
 
     let r = apm_app::firmware::probe(&port, &image)?;
     println!("芯片: {}", r.chip);
-    println!("设备版本: {}", r.current_version.as_deref().unwrap_or("（读不到 / 空片）"));
+    println!(
+        "设备版本: {}",
+        r.current_version.as_deref().unwrap_or("（读不到 / 空片）")
+    );
     println!("镜像版本: {}", r.image_version);
-    println!("状态: {:?}{}", r.state, if r.first_flash { "（首烧）" } else { "" });
+    println!(
+        "状态: {:?}{}",
+        r.state,
+        if r.first_flash { "（首烧）" } else { "" }
+    );
     Ok(())
 }
 
@@ -301,7 +326,11 @@ pub fn firmware_flash(port: Option<&str>, image: Option<&Path>) -> Result<()> {
     let image = apm_app::firmware::load_image(&image_path)?;
 
     println!("串口: {port}");
-    println!("镜像: {}（版本 {}）", image_path.display(), image.info.version);
+    println!(
+        "镜像: {}（版本 {}）",
+        image_path.display(),
+        image.info.version
+    );
     println!("烧写会让设备复位；只写 bootloader / 分区表 / app，不动 NVS。");
 
     let mut last = 255u8;
@@ -320,7 +349,11 @@ pub fn firmware_flash(port: Option<&str>, image: Option<&Path>) -> Result<()> {
         report.to_version,
         report.bytes_written,
         report.elapsed_ms as f64 / 1000.0,
-        if report.verified { "通过" } else { "未通过" }
+        if report.verified {
+            "通过"
+        } else {
+            "未通过"
+        }
     );
     println!("app 分区 MD5 {}", report.md5);
     Ok(())
@@ -351,8 +384,20 @@ pub async fn scan(timeout_s: u64) -> Result<()> {
         println!(
             "{}{}{}{}",
             pad(&d.id, 38),
-            pad(if d.name.is_empty() { "(无名)" } else { &d.name }, 20),
-            pad(&d.rssi.map(|r| format!("{r} dBm")).unwrap_or_else(|| "-".into()), 10),
+            pad(
+                if d.name.is_empty() {
+                    "(无名)"
+                } else {
+                    &d.name
+                },
+                20
+            ),
+            pad(
+                &d.rssi
+                    .map(|r| format!("{r} dBm"))
+                    .unwrap_or_else(|| "-".into()),
+                10
+            ),
             if d.has_service { "yes" } else { "no" }
         );
     }
@@ -407,13 +452,18 @@ pub async fn status(device: Option<&str>, timeout_s: u64) -> Result<()> {
                 );
             }
             Ok(Some(Notification::Audio(block))) => {
-                println!("收到音频块 {} 字节（未订阅录音，忽略）", block.len());
+                println!("收到音频块 {} 字节（未订阅录音，忽略）", block.data.len());
             }
             Ok(Some(Notification::Pong(seq))) => {
                 println!("PONG seq={seq}（本命令不测延迟，用 `apmctl ping`）");
             }
             Ok(Some(Notification::Battery(pct))) => {
                 println!("电量 {pct}%");
+            }
+            Ok(Some(Notification::Malformed { uuid, reason })) => {
+                // 坏帧不是"安静"：设备发了东西，链路是通的。如实打出来，
+                // 别让它看起来像"什么都没收到"（B6）。
+                println!("无法解析的通知（{uuid}）：{reason}");
             }
             Ok(None) => {}
             Err(e) => {
@@ -518,12 +568,25 @@ pub async fn record(path: &Path, seconds: u64, device: Option<&str>) -> Result<(
     println!("已写入 {}", path.display());
     println!(
         "块: {} 个（{:.2} s），序号跳变丢失: {}（跳变 {} 次），长度异常: {}",
-        summary.blocks, summary.duration_s, summary.lost_blocks, summary.seq_jumps, summary.bad_len_blocks
+        summary.blocks,
+        summary.duration_s,
+        summary.lost_blocks,
+        summary.seq_jumps,
+        summary.bad_len_blocks
     );
     if summary.device_dropped > 0 {
         println!(
             "设备侧丢弃: {} 块（发送阶段丢的，序号没发出来，PC 端统计不到）",
             summary.device_dropped
+        );
+    }
+    // 慢档会话的数据不能当音质结论用（KI-005 / KI-006 的口径陷阱）。
+    // GUI 侧的 `analyze_session` 已经硬拒，CLI 这里至少要说出来，
+    // 否则"录了一份能分析的 WAV"会被当成可用基线。
+    if summary.link_slow {
+        println!(
+            "⚠ 本场设备报过 LINK_SLOW（连接间隔 > 40 ms）：欠载与丢块是链路假象，\
+             这份 WAV **不能**进音质对比"
         );
     }
     if summary.glitch_events > 0 {
@@ -563,12 +626,13 @@ pub async fn sink(
     target_ms: u32,
     verify: bool,
     tone: bool,
+    rtt: bool,
     device: Option<&str>,
 ) -> Result<()> {
     if tone {
         // 只验声卡这一段，不碰 BLE：先把权限/采样率/直通从链路里剥离出来。
-        let mut out = apm_sink::Sink::open(to, AUDIO_SAMPLE_RATE, target_ms)
-            .context("打开虚拟声卡失败")?;
+        let mut out =
+            apm_sink::Sink::open(to, AUDIO_SAMPLE_RATE, target_ms).context("打开虚拟声卡失败")?;
         return sink_tone(&mut out, seconds, verify);
     }
 
@@ -590,7 +654,10 @@ pub async fn sink(
     let link = apm_link::connect(device, Duration::from_secs(15))
         .await
         .map_err(|e| anyhow!("{e}\n提示: {}", apm_link::device::hint_for_error(&e)))?;
-    println!("已连接设备，开始采集（{} 秒）。会议软件里把麦克风选成该设备即可。", seconds);
+    println!(
+        "已连接设备，开始采集（{} 秒）。会议软件里把麦克风选成该设备即可。",
+        seconds
+    );
     reset_capture_state(&link).await;
     link.start_capture().await?;
 
@@ -614,12 +681,65 @@ pub async fn sink(
     let mut next_report = tokio::time::Instant::now() + Duration::from_secs(1);
     let mut elapsed_s = 0u64;
 
+    // `--rtt`：在同一条连接上定期发 PING，用来把"停顿"归因到链路还是音频通知队列。
+    //
+    // 为什么不直接复用 `link.ping()`：那个函数会**自己消费通知流**（它内部循环
+    // next_notification 直到拿到匹配的 PONG），并行跑就会把音频块吃掉。
+    // 设备只支持 1 条 BLE 连接（`CONFIG_BT_NIMBLE_MAX_CONNECTIONS=1`），
+    // 也开不了第二个进程。所以只能在这里自己发、由本循环统一收 PONG。
+    let mut next_ping = tokio::time::Instant::now();
+    let mut ping_seq = 0u32;
+    // 在途 PING：(seq, 发出时刻, 相对会话起点的 ms)
+    let mut inflight: Option<(u32, std::time::Instant, f64)> = None;
+    let session_start = std::time::Instant::now();
+    let mut rtt_timeouts = 0u32;
+    if rtt {
+        println!("链路 RTT 采样已开启（每 500 ms 一次）：用来判断停顿归链路还是归音频通知队列");
+    }
+
     while tokio::time::Instant::now() < deadline {
+        // 到点就发一个新 PING（同一时刻只保留一个在途，避免自己制造拥塞）。
+        if rtt && inflight.is_none() && tokio::time::Instant::now() >= next_ping {
+            ping_seq = ping_seq.wrapping_add(1).max(1);
+            match link.send_ctrl(apm_protocol::frame::msg::PING, &ping_seq.to_le_bytes()).await {
+                Ok(()) => {
+                    let at = session_start.elapsed().as_secs_f64() * 1000.0;
+                    inflight = Some((ping_seq, std::time::Instant::now(), at));
+                }
+                Err(e) => println!("PING 发送失败（继续录音）：{e}"),
+            }
+            next_ping += Duration::from_millis(500);
+        }
+
         match link.next_notification(Duration::from_millis(500)).await {
             Ok(Some(notification)) => {
-                pipeline.on_notification(&notification);
+                // PONG 只喂给 RTT 记录器，不进 Pipeline（它不是音频，也不该影响统计）。
+                match &notification {
+                    Notification::Pong(got) => {
+                        if let Some((seq, sent_at, at_ms)) = inflight {
+                            if *got == seq {
+                                pipeline.note_rtt(
+                                    session_start + Duration::from_millis(at_ms as u64),
+                                    sent_at.elapsed(),
+                                );
+                                inflight = None;
+                            }
+                        }
+                    }
+                    _ => {
+                        pipeline.on_notification(&notification);
+                    }
+                }
             }
-            Ok(None) => {}
+            Ok(None) => {
+                // 在途 PING 超时：记一次但不清空 inflight（等下一个 500 ms 窗口重发）。
+                if let Some((_, sent_at, _)) = inflight {
+                    if sent_at.elapsed() > Duration::from_millis(1500) {
+                        rtt_timeouts += 1;
+                        inflight = None;
+                    }
+                }
+            }
             Err(e) => {
                 println!("通知流出错: {e}");
                 break;
@@ -632,7 +752,13 @@ pub async fn sink(
             let t: Telemetry = pipeline.telemetry();
             println!(
                 "  [{:>3}s] 块={} 缓冲={:.0} ms 欠载={} 静音帧={} 溢出={} 漂移={:+.0} ppm",
-                elapsed_s, t.blocks, t.buffer_ms, t.underruns, t.silent_frames, t.overflow_drops, t.ppm
+                elapsed_s,
+                t.blocks,
+                t.buffer_ms,
+                t.underruns,
+                t.silent_frames,
+                t.overflow_drops,
+                t.ppm
             );
         }
     }
@@ -640,9 +766,25 @@ pub async fn sink(
     // 先停写再断链：STOP 有一次 BLE 往返，期间声卡还在消费缓冲，
     // 拖到最后才 clear 会白掉一段静音（实测尾巴上多出 3 次欠载）。
     let written = pipeline.written_rms();
+    // 这几样都要在 `finish()` 之前取：它消费掉 pipeline。
     let (arrival_hist, arrival_max_ms, late_arrivals) = {
         let (h, m, l) = pipeline.arrival_stats();
         (*h, m, l)
+    };
+    let (process_hist, process_max_ms, slow_process) = {
+        let (h, m, s) = pipeline.process_stats();
+        (*h, m, s)
+    };
+    let (read_hist, read_max_ms, slow_reads) = {
+        let (h, m, s) = pipeline.read_wait_stats();
+        (*h, m, s)
+    };
+    let gap_read_wait = pipeline.gap_read_wait_ms();
+    let rtt_count = pipeline.rtt_samples().len();
+    let rtt_raw: Vec<(f64, f64)> = pipeline.rtt_samples().to_vec();
+    let (fine_hist, fine_overflow, _) = {
+        let (h, o, c) = pipeline.fine_gaps();
+        (*h, o, c)
     };
     let summary = pipeline.finish();
     link.stop_capture().await.ok();
@@ -650,11 +792,21 @@ pub async fn sink(
 
     print_summary(&summary);
 
-    // 块到达间隔：KI-006 的判据就在这里。平均 50 块/秒不够，要看**间隔的抖动**。
-    if arrival_hist.iter().sum::<u64>() > 0 {
-        let edges = apm_app::pipeline::ARRIVAL_BUCKETS_MS;
+    // 抖动诊断：**只给原始测量，不给判词**。
+    //
+    // 这里曾经有 `抖动归因` / `尖峰时间形状` / `停顿归属` 三条判词（clean / arrival-only /
+    // periodic / audio-queue-only …），是 2026-11-07 查 KI-006 时加的。那套判词最终
+    // 互相否决过（"尖峰看着有节律" vs "RTT 已证明链路通畅"），根因查明是 CoreBluetooth
+    // 攒批交付之后就不再需要：交付模式 + 下面这几个直方图，看报告的人自己就能判。
+    //
+    // 三把尺子的含义（不要合并成一个数）：
+    // - 链路到达间隔：链路层打点，不含我们的处理时间；
+    // - PC 处理耗时：received_at → 解码完成，量我们自己花了多久；
+    // - 读取等待：问下一条实际等了多久，能分开"数据晚到"与"我们问晚了"。
+    let edges = apm_app::pipeline::ARRIVAL_BUCKETS_MS;
+    let hist_line = |hist: &[u64; 8]| -> String {
         let mut line = String::new();
-        for (i, &count) in arrival_hist.iter().enumerate() {
+        for (i, &count) in hist.iter().enumerate() {
             if count == 0 {
                 continue;
             }
@@ -666,28 +818,105 @@ pub async fn sink(
                 line.push_str(&format!("{lo:.0}-{hi:.0}ms:{count}  "));
             }
         }
-        println!("块到达间隔: 最大 {arrival_max_ms:.1} ms，超过 80 ms 缓冲上限 {late_arrivals} 次");
-        println!("到达间隔分布: {line}");
-        // 注意：迟到次数 ≠ 欠载次数。存量接近目标时，80–100 ms 的间隔大多被存量吸收，
-        // 只有尖峰（>100 ms）几乎必然欠载。2026-11-07 两轮实测：迟到 100/113 次，
-        // 欠载只有 14/15 次，而 >100 ms 的尖峰恰是 5/6 次。
-        if late_arrivals > 0 && summary.underruns > 0 {
-            println!(
-                "判定: 有 {late_arrivals} 次到达间隔 > 80 ms（尖峰最大 {arrival_max_ms:.0} ms），\
-                 欠载 {} 次 —— 欠载由**链路到达抖动突破缓冲上限**造成（KI-006 根因）",
-                summary.underruns
-            );
-            println!(
-                "      迟到次数远多于欠载次数是正常的：存量接近目标时 80–100 ms 的间隔能被吸收，\
-                 只有更长的尖峰才必然欠载"
-            );
-        } else if late_arrivals == 0 && summary.underruns > 0 {
-            println!(
-                "判定: 到达间隔始终 ≤ 80 ms，但仍有 {} 次欠载 —— 抖动不是主因，\
-                 需继续查 Pipeline → Playout 这一段（channel / 锁）",
-                summary.underruns
-            );
+        line
+    };
+    println!();
+    if arrival_hist.iter().sum::<u64>() > 0 {
+        println!(
+            "链路到达间隔: 最大 {arrival_max_ms:.1} ms，超过 80 ms 缓冲上限 {late_arrivals} 次"
+        );
+        println!("  分布: {}", hist_line(&arrival_hist));
+    }
+    if process_hist.iter().sum::<u64>() > 0 {
+        println!(
+            "PC 处理耗时: 最大 {process_max_ms:.1} ms，超过 20 ms（一个块时长）{slow_process} 块"
+        );
+        println!("  分布: {}", hist_line(&process_hist));
+    }
+    if read_hist.iter().sum::<u64>() > 0 {
+        println!(
+            "读取等待: 最大 {read_max_ms:.1} ms，超过 80 ms {slow_reads} 次\
+             （长 = 数据确实没到；短 = 是我们问晚了）"
+        );
+        println!("  分布: {}", hist_line(&read_hist));
+    }
+    // 把最长那次间隔拆成"等链路"与"我们自己"两段。这是唯一需要的算术：
+    // 到达间隔 = 读取等待 + 我们自己花掉的。
+    if summary.max_arrival_gap_ms > 0.0 {
+        let local_ms = (summary.max_arrival_gap_ms - gap_read_wait).max(0.0);
+        println!(
+            "最长间隔拆解: {:.1} ms = 等链路 {:.1} ms + 我们自己 {:.1} ms",
+            summary.max_arrival_gap_ms, gap_read_wait, local_ms
+        );
+    }
+
+    // 交付模式：G2 判据（方案 D）的依据，必须留着。
+    println!();
+    println!(
+        "通知交付模式: {}（相邻 <5 ms {:.0}%、15–25 ms {:.0}%）",
+        summary.delivery_pattern,
+        summary.delivery_clumped_ratio * 100.0,
+        summary.delivery_even_ratio * 100.0
+    );
+    println!("  {}", delivery_explain(&summary.delivery_pattern));
+    if fine_hist.iter().sum::<u64>() + fine_overflow > 0 {
+        let mut line = String::new();
+        let mut lo = 0.0;
+        for (i, &c) in fine_hist.iter().enumerate() {
+            if c == 0 {
+                lo = apm_app::pipeline::FINE_BUCKETS_MS[i];
+                continue;
+            }
+            line.push_str(&format!("{lo:.0}-{:.0}ms:{c}  ", apm_app::pipeline::FINE_BUCKETS_MS[i]));
+            lo = apm_app::pipeline::FINE_BUCKETS_MS[i];
         }
+        if fine_overflow > 0 {
+            line.push_str(&format!(">40ms:{fine_overflow}  "));
+        }
+        println!("  细粒度分布: {line}");
+    }
+    if rtt_count > 0 {
+        // RTT 只打原始统计，不打"停顿归属"的判词。
+        //
+        // 判词（link-wide / audio-queue-only）曾经用来自动否决"尖峰有节律 → 改连接参数"
+        // 那条建议。现在建议本身没了，判词也就没有意义；而 RTT 与到达尖峰的对应关系
+        // 人看一眼两张序列就能判断，不需要中间那层枚举。
+        let raw: Vec<String> = rtt_raw
+            .iter()
+            .take(6)
+            .map(|(at, rtt)| format!("{:.0}ms→{:.2}ms", at, rtt))
+            .collect();
+        println!("链路 RTT 原始采样（前 6 个）: {}", raw.join("  "));
+        let mut sorted: Vec<f64> = rtt_raw.iter().map(|(_, r)| *r).collect();
+        sorted.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+        let n = sorted.len();
+        let median = if n % 2 == 1 {
+            sorted[n / 2]
+        } else {
+            (sorted[n / 2 - 1] + sorted[n / 2]) / 2.0
+        };
+        let p95 = sorted[((n as f64 * 0.95).ceil() as usize).saturating_sub(1).min(n - 1)];
+        println!(
+            "链路 RTT: {} 个采样，中位 {:.1} ms，p95 {:.1} ms{}",
+            rtt_count,
+            median,
+            p95,
+            if rtt_timeouts > 0 {
+                format!("；另有 {rtt_timeouts} 次 PING 超时")
+            } else {
+                String::new()
+            }
+        );
+    }
+
+    // 欠载与到达间隔的关系：迟到次数 ≠ 欠载次数。存量接近目标时，80–100 ms 的间隔
+    // 大多被存量吸收，只有更大的尖峰几乎必然欠载。
+    if summary.underruns > 0 && late_arrivals > 0 {
+        println!(
+            "提示: {late_arrivals} 次到达间隔 > 80 ms（最大 {:.0} ms，其中 {gap_read_wait:.0} ms \
+             在等链路）、欠载 {} 次",
+            summary.max_arrival_gap_ms, summary.underruns
+        );
     }
 
     if let Some(p) = probe {
@@ -715,7 +944,9 @@ pub async fn sink(
                 if diff <= 3.0 {
                     println!("判定: 回环与写入电平差 {diff:.1} dB（≤3 dB）→ 音频确实进了声卡");
                 } else {
-                    println!("判定: 电平差 {diff:.1} dB，超过 3 dB —— 声卡可能没在直通，或采样率不一致");
+                    println!(
+                        "判定: 电平差 {diff:.1} dB，超过 3 dB —— 声卡可能没在直通，或采样率不一致"
+                    );
                 }
             }
             _ => println!("判定: 样本不足，无法比较（检查权限或把 --seconds 调大）"),
@@ -729,12 +960,17 @@ fn print_summary(summary: &SessionSummary) {
     println!();
     println!(
         "块: {} 个，序号跳变丢失: {}（跳变 {} 次），长度异常: {}，设备侧丢弃: {}",
-        summary.blocks, summary.lost_blocks, summary.seq_jumps, summary.bad_len_blocks, summary.device_dropped
+        summary.blocks,
+        summary.lost_blocks,
+        summary.seq_jumps,
+        summary.bad_len_blocks,
+        summary.device_dropped
     );
     println!(
-        "声卡: 已播 {:.2} s，欠载 {} 次（静音 {} 帧 ≈ {:.0} ms），超容量丢弃 {} 帧，停摆修剪 {} 帧",
+        "声卡: 已播 {:.2} s，欠载 {} 次（其中断供 {} 次；静音 {} 帧 ≈ {:.0} ms），超容量丢弃 {} 帧，停摆修剪 {} 帧",
         summary.duration_s,
         summary.underruns,
+        summary.underruns_underfed,
         summary.silent_frames,
         summary.silent_frames as f64 * 1000.0 / AUDIO_SAMPLE_RATE as f64,
         summary.frames_dropped,
@@ -750,19 +986,46 @@ fn print_summary(summary: &SessionSummary) {
             summary.glitch_events, summary.glitch_muted_ms
         );
     }
+    // **延迟用实测存量，不用目标值**（A4）。目标值只是用户意图，
+    // 修剪守卫会把稳态存量留在"目标 + 余量"附近，拿目标当延迟会系统性低估。
+    match (summary.buffer_p50_ms, summary.buffer_p95_ms) {
+        (Some(p50), Some(p95)) => println!(
+            "缓冲: 实测存量 p50 {p50:.0} ms / p95 {p95:.0} ms（用户基准 {} → {} ms，自适应最多 +{} ms）",
+            summary.target_start_ms, summary.target_end_ms, summary.target_boost_max_ms
+        ),
+        _ => println!(
+            "缓冲: 无实测存量（没开声卡或会话太短）；用户基准 {} → {} ms，自适应最多 +{} ms",
+            summary.target_start_ms, summary.target_end_ms, summary.target_boost_max_ms
+        ),
+    }
     println!(
-        "缓冲: 目标 {} → {} ms，回调抢锁失败 {} 次，通道满丢块 {}",
-        summary.target_start_ms, summary.target_end_ms, summary.lock_misses, summary.overflow_drops
+        "      目标 {} ms / 回调抢锁失败 {} 次 / 通道满丢块 {}",
+        summary.target_end_ms, summary.lock_misses, summary.overflow_drops
     );
     if summary.underruns > 0 {
-        // 目标已经是上限时再让人"往上调"就是废话——实测 10 min 长测在这条分支上出现过，
-        // 目标本来就在 80 ms，提示却叫人调到 80 ms。
-        if summary.target_end_ms < 80 {
-            println!("提示: 有欠载说明缓冲不够或链路抖动；把 --target-ms 往上调（上限 80）再看。");
-        } else {
+        let consumed_side = summary.underruns.saturating_sub(summary.underruns_underfed);
+        // **按归因给建议**（A5）。以前无论哪种欠载都提示"把缓冲调大"，
+        // 而链路断供型欠载调缓冲是无效的 —— 那会把真因掩盖成"调大了就好一点"。
+        if consumed_side > 0 {
+            if summary.target_end_ms < apm_sink::TARGET_MAX_MS {
+                println!(
+                    "提示: {consumed_side} 次欠载是**消费端**造成的（缓冲被读空而数据刚到）——\
+                     把 --target-ms 往上调（上限 {}）再看。",
+                    apm_sink::TARGET_MAX_MS
+                );
+            } else {
+                println!(
+                    "提示: {consumed_side} 次欠载是消费端造成，但目标已在上限 {} ms，没有余量了。",
+                    apm_sink::TARGET_MAX_MS
+                );
+            }
+        }
+        if summary.underruns_underfed > 0 {
             println!(
-                "提示: 目标缓冲已是上限 80 ms，调参数没有余量了。\
-                 欠载的来源只能是链路抖动或声卡回调被系统停摆（KI-006）。"
+                "提示: {} 次欠载是**上游断供**（距上次推入 > {} ms）——调缓冲目标无效，\
+                 要查链路到达（见下方到达间隔统计）与 PC 端自身停顿。",
+                summary.underruns_underfed,
+                apm_sink::UNDERFED_MS
             );
         }
     }
@@ -920,9 +1183,7 @@ fn sink_tone(out: &mut apm_sink::Sink, seconds: u64, verify: bool) -> Result<()>
         println!("欠载时刻(ms，相对首次回调): {times}");
     }
     if max_gap > Duration::from_millis(out.target_ms() as u64) {
-        println!(
-            "结论: 有 {late_pushes} 次喂入间隔超过缓冲目标 —— 欠载由**喂入端**造成，不是声卡"
-        );
+        println!("结论: 有 {late_pushes} 次喂入间隔超过缓冲目标 —— 欠载由**喂入端**造成，不是声卡");
     } else if st.underruns > 0 {
         // 关键判据：欠载都发生在喂入结束之后，就是 `clear()` 收尾造成的，
         // 不是运行期的真欠载。2026-11-07 的 `--tone` 全靠这一条才没被误读。
@@ -931,8 +1192,7 @@ fn sink_tone(out: &mut apm_sink::Sink, seconds: u64, verify: bool) -> Result<()>
             println!(
                 "结论: {} 次欠载全部发生在**喂入结束后的收尾阶段**（{:.0} ms 之后），\
                  属于 clear() 造成的测量伪影，不记为运行期欠载",
-                st.underruns,
-                st.underrun_at_ms[0]
+                st.underruns, st.underrun_at_ms[0]
             );
         } else {
             println!(
@@ -1102,7 +1362,10 @@ pub async fn ping(
         one_way
     );
     if n < count as usize {
-        println!("注意: 有 {} 次没回包，延迟统计只覆盖回包的那几次", count as usize - n);
+        println!(
+            "注意: 有 {} 次没回包，延迟统计只覆盖回包的那几次",
+            count as usize - n
+        );
     }
     Ok(())
 }
@@ -1161,6 +1424,20 @@ impl PingStats {
             jitter,
             one_way_estimate: median / 2.0,
         })
+    }
+}
+
+/// 交付模式的说明文案。
+///
+/// 单独抽出来是因为 `SessionSummary` 只带字符串（跨 IPC 友好），
+/// 而解释要引用 `apm_app` 里的枚举判词，避免两处措辞漂移。
+fn delivery_explain(pattern: &str) -> &'static str {
+    use apm_app::pipeline::DeliveryKind;
+    match pattern {
+        "even" => DeliveryKind::Even.explain(),
+        "clumped" => DeliveryKind::Clumped.explain(),
+        "unclear" => DeliveryKind::Unclear.explain(),
+        _ => DeliveryKind::Insufficient.explain(),
     }
 }
 
