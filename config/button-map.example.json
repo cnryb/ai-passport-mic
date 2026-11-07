@@ -1,8 +1,12 @@
 {
-  "schema": "ai-passport-mic-keymap-3",
+  "schema": "ai-passport-mic-keymap-4",
   "bindings": {
     "up": { "modifiers": ["ctrl"], "key": "enter" },
     "down": { "modifiers": [], "key": "esc", "repeat": 2 },
     "ok": { "modifiers": [], "key": "ptt-toggle" }
+  },
+  "hooks": {
+    "capture.start": { "modifiers": [], "key": "f5" },
+    "capture.stop": { "modifiers": [], "key": "f6" }
   }
 }
