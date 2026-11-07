@@ -157,7 +157,7 @@ function doImport() {
     <p v-if="view?.error" class="err">{{ view.error }}</p>
 
     <div v-if="showImport" class="import">
-      <textarea v-model="importText" rows="6" placeholder="粘贴 keymap JSON（schema: ai-passport-mic-keymap-3；旧版 -2 / -1 也能导入，会按下优先迁移成一键一动作）" />
+      <textarea v-model="importText" rows="6" placeholder="粘贴 keymap JSON（schema: ai-passport-mic-keymap-4；v3 也能导入，会补上空 hooks 升到 v4）" />
       <button :disabled="!importText.trim()" @click="doImport">导入并校验</button>
     </div>
 
