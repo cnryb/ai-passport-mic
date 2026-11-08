@@ -1,0 +1,320 @@
+# macOS 打包 + 门禁
+#
+# 为什么分成三个 job，而不是一个 macOS job 全做完：
+#   GitHub 托管的 macOS runner **没有 Docker**，所以固件（要 ESP-IDF 5.5.3）只能在
+#   ubuntu 上用官方容器编；而 .app 只能在 macOS 上打。两侧靠 artifact 交接
+#   device/build/ai-passport-mic-merged.bin —— 这个路径正好是 scripts/build-gui.sh
+#   要找的位置，所以打包脚本**不需要为 CI 改一行**。
+#
+# 触发口径：
+#   pull_request  -> 只跑 gate（verify.sh + clippy + 前端）
+#   v* tag 推送   -> gate + 固件 + 双架构打包 + 发 Release
+#   手动触发      -> gate + 固件 + 双架构打包（不发 Release）
+#
+# 这个 workflow 只产出 **ad-hoc 签名** 的 .app（G6 未做：没有 Developer ID、
+# 没有公证）。产物在别的机器上会被 Gatekeeper 拦：首次打开右键「打开」，
+# 或执行 xattr -dr com.apple.quarantine "/Applications/AI Passport Mic.app"。
+
+name: macOS build
+
+on:
+  pull_request:
+    branches: [master]
+  push:
+    tags: ["v*"]
+  workflow_dispatch:
+
+# 同一个 ref 只留最新一次：改一版推一版时，旧的那次继续跑没有意义。
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  # ---------------------------------------------------------------- 门禁
+  gate:
+    name: 门禁（固件单测 / 向量 / cargo test / clippy / 前端）
+    # 用 macOS 而不是 ubuntu：本仓库的全部桌面端结论都是在 macOS 上得出的
+    # （docs/ENVIRONMENT.md 明确写着宿主机 macOS 已实测、Windows 未验证），
+    # Linux 上 btleplug/cpal 还要额外装 dbus/alsa/udev，等于引入一条没人验过的路径。
+    # 仓库是 public，macOS runner 的分钟数不额外计费。
+    runs-on: macos-15
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: 钉住 Rust 工具链（以 desktop/rust-toolchain.toml 为准）
+        run: |
+          set -euo pipefail
+          want=$(sed -nE 's/^[[:space:]]*channel[[:space:]]*=[[:space:]]*"([^"]+)".*/\1/p' desktop/rust-toolchain.toml)
+          if [[ -z "$want" ]]; then
+            echo "FAIL 没能从 desktop/rust-toolchain.toml 里读到 channel"
+            exit 1
+          fi
+          echo "期望工具链: $want"
+          # 显式装一遍，而不是靠 rustup 在第一次 cargo 时懒加载：
+          # components 不在文件里单独装的话，clippy 可能不在这个 toolchain 上。
+          rustup toolchain install "$want" --profile minimal \
+            --component clippy --component rustfmt --no-self-update
+          cd desktop
+          got=$(rustc --version)
+          echo "实际: $got"
+          [[ "$got" == *"$want"* ]] || { echo "FAIL 工具链与 rust-toolchain.toml 不一致"; exit 1; }
+
+      - uses: actions/cache@v6
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            desktop/target
+          key: cargo-gate-${{ runner.arch }}-${{ hashFiles('desktop/Cargo.lock') }}
+          restore-keys: |
+            cargo-gate-${{ runner.arch }}-
+
+      # 直接跑仓库既有的单一入口，不在这里另写一套编排（同 docs/GUI.md 决定 D1）。
+      # 它覆盖：目录结构、文档内链、脚本可执行位、固件主机侧单测（协议 44 + 省电 65）、
+      # 跨端向量新鲜度、cargo test。
+      #
+      # 它的「环境快照」段在这里必然 FAIL —— runner 上没装 ESP-IDF，而 ESP-IDF 只在
+      # 下面的 firmware job 的容器里。verify.sh 非 --strict 时不因此退出非零，
+      # 所以这里不加 --strict；固件能否编译由 firmware job 证明。
+      - name: 基线自检（verify.sh）
+        run: ./scripts/verify.sh
+
+      # GUI 不在 default-members 里（400+ 依赖），clippy 也只覆盖默认成员。
+      - name: clippy（零警告是仓库既有口径）
+        working-directory: desktop
+        run: cargo clippy --locked --all-targets -- -D warnings
+
+      - uses: actions/setup-node@v7
+        with:
+          node-version: "22"
+          cache: npm
+          cache-dependency-path: desktop/crates/gui/frontend/package-lock.json
+
+      - name: 前端依赖
+        working-directory: desktop/crates/gui/frontend
+        run: npm ci
+
+      - name: 前端类型检查
+        working-directory: desktop/crates/gui/frontend
+        run: npm run typecheck
+
+      - name: 前端构建
+        working-directory: desktop/crates/gui/frontend
+        run: npm run build
+
+  # ---------------------------------------------------------------- 固件
+  firmware:
+    name: 固件镜像（ESP-IDF 5.5.3 容器）
+    if: github.event_name != 'pull_request'
+    runs-on: ubuntu-latest
+    timeout-minutes: 40
+    container:
+      image: espressif/idf:v5.5.3
+    env:
+      # sdkconfig.defaults 里也有 CONFIG_IDF_TARGET，这里显式给一份，
+      # 免得依赖 IDF 的推断顺序（__target_guess）。
+      IDF_TARGET: esp32c3
+      # 容器里的 checkout 目录与宿主 UID 不同，不加这条 idf.py 内部的 git 调用会报
+      # "dubious ownership"。PROJECT_VER 已固定，不依赖 git describe，这里只为消错。
+      IDF_GIT_SAFE_DIR: "*"
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: 构建 + 合并镜像
+        working-directory: device
+        run: |
+          set -euo pipefail
+          # 必须显式激活：GitHub 对 job container 会把 ENTRYPOINT 覆盖成
+          # `tail -f /dev/null`，镜像自带的那条 `source export.sh` 不会执行，
+          # 所以 idf.py、交叉工具链、venv 的 PATH 都不在环境里。
+          . "$IDF_PATH/export.sh"
+          idf.py --version
+          idf.py build
+          # -o 相对 build/ 解析，必须给绝对路径，否则 esptool 会去 build/ 里找 build/*.bin。
+          idf.py merge-bin -o "$PWD/build/ai-passport-mic-merged.bin"
+          ls -l build/ai-passport-mic-merged.bin
+          # 容器里没有 shasum（那是 perl 脚本，镜像没装），用 coreutils 的 sha256sum。
+          # 本机 scripts/build-firmware.sh 用的是 shasum，两者结果等价。
+          sha256sum build/ai-passport-mic-merged.bin | tee build/SHA256SUMS
+
+      - uses: actions/upload-artifact@v7
+        with:
+          name: firmware
+          if-no-files-found: error
+          retention-days: 7
+          path: |
+            device/build/ai-passport-mic-merged.bin
+            device/build/SHA256SUMS
+
+  # ---------------------------------------------------------------- 打包
+  package:
+    name: 打包 macOS（${{ matrix.arch }}）
+    if: github.event_name != 'pull_request'
+    needs: firmware
+    strategy:
+      # 一个架构挂了不要连坐另一个，否则重跑时两个都得重来。
+      fail-fast: false
+      matrix:
+        include:
+          # macOS 14（Intel）镜像已于 2026-11-02 从 GitHub Actions 退役，
+          # Intel 现在只剩 macos-15-intel / macos-26-intel。
+          - arch: arm64
+            runner: macos-15
+          - arch: x86_64
+            runner: macos-15-intel
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v7
+
+      # 落到 device/build/ 正好是 scripts/build-gui.sh 读固件的位置，
+      # 所以打包脚本原样调用，不需要 CI 专用分支。
+      - uses: actions/download-artifact@v8
+        with:
+          name: firmware
+          path: device/build
+
+      - name: 钉住 Rust 工具链（以 desktop/rust-toolchain.toml 为准）
+        run: |
+          set -euo pipefail
+          want=$(sed -nE 's/^[[:space:]]*channel[[:space:]]*=[[:space:]]*"([^"]+)".*/\1/p' desktop/rust-toolchain.toml)
+          if [[ -z "$want" ]]; then
+            echo "FAIL 没能从 desktop/rust-toolchain.toml 里读到 channel"
+            exit 1
+          fi
+          rustup toolchain install "$want" --profile minimal --no-self-update
+          cd desktop
+          got=$(rustc --version)
+          echo "实际: $got"
+          [[ "$got" == *"$want"* ]] || { echo "FAIL 工具链与 rust-toolchain.toml 不一致"; exit 1; }
+
+      - uses: actions/cache@v6
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            desktop/target
+          # 与 gate 分开存：两个 job 都写 desktop/target，共用 key 会互相覆盖存档。
+          key: cargo-package-${{ runner.arch }}-${{ hashFiles('desktop/Cargo.lock') }}
+          restore-keys: |
+            cargo-package-${{ runner.arch }}-
+            cargo-gate-${{ runner.arch }}-
+
+      - uses: actions/setup-node@v7
+        with:
+          node-version: "22"
+          cache: npm
+          cache-dependency-path: desktop/crates/gui/frontend/package-lock.json
+
+      - name: 前端依赖
+        working-directory: desktop/crates/gui/frontend
+        run: npm ci
+
+      # 这一步会做完打包的全部校验：Info.plist 的蓝牙/麦克风用途声明、bundle id
+      # 必须是 com.cnryb.ai-passport-mic、以及固件是否真的进了 .app。
+      # 任何一项不过脚本直接非零退出，这里不需要再重复检查一遍。
+      - name: 打包 .app
+        run: ./scripts/build-gui.sh --release
+
+      - name: 校验产物架构与签名
+        run: |
+          set -euo pipefail
+          app="desktop/target/release/bundle/macos/AI Passport Mic.app"
+          got=$(lipo -archs "$app/Contents/MacOS/apm-gui")
+          echo "期望架构: ${{ matrix.arch }} / 实际: $got"
+          [[ "$got" == "${{ matrix.arch }}" ]] || { echo "FAIL 架构不符"; exit 1; }
+
+          codesign --verify --deep --strict --verbose=2 "$app"
+          # 如实标注：只做到 ad-hoc。G6（Developer ID + 公证）没做，
+          # 所以产物在别的机器上会被 Gatekeeper 拦，这不是 bug。
+          if codesign -dv "$app" 2>&1 | grep -q "Signature=adhoc"; then
+            echo "签名: ad-hoc（未公证，G6 未做）"
+          else
+            echo "FAIL 签名不是 ad-hoc，与 tauri.conf.json 的 signingIdentity 不一致"
+            exit 1
+          fi
+
+      - name: 压缩并记录摘要
+        id: zip
+        run: |
+          set -euo pipefail
+          ver=$(python3 -c "import json;print(json.load(open('desktop/crates/gui/tauri.conf.json'))['version'])")
+          app="desktop/target/release/bundle/macos/AI Passport Mic.app"
+          # ditto 保留符号链接与签名封存的资源分叉，不能用 zip。
+          name="AI-Passport-Mic-${ver}-macos-${{ matrix.arch }}.zip"
+          ditto -c -k --keepParent "$app" "$name"
+          shasum -a 256 "$name" | tee "$name.sha256"
+          echo "name=$name" >> "$GITHUB_OUTPUT"
+          echo "ver=$ver" >> "$GITHUB_OUTPUT"
+          du -h "$name"
+
+      - uses: actions/upload-artifact@v7
+        with:
+          name: macos-${{ matrix.arch }}
+          if-no-files-found: error
+          retention-days: 14
+          path: |
+            ${{ steps.zip.outputs.name }}
+            ${{ steps.zip.outputs.name }}.sha256
+
+  # ---------------------------------------------------------------- 发布
+  # 只有推 v* tag 才发 Release。tag 与 tauri.conf.json 的 version 必须一致，
+  # 否则会发出一个"文件名写着 0.1.0、包里 Info.plist 也是 0.1.0、但 tag 是 v0.2.0"的包。
+  release:
+    name: 发布 Release
+    if: startsWith(github.ref, 'refs/tags/v')
+    needs: package
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: actions/download-artifact@v8
+        with:
+          path: dist
+          merge-multiple: true
+
+      - name: 校验 tag 与版本号一致
+        run: |
+          set -euo pipefail
+          ver=$(python3 -c "import json;print(json.load(open('desktop/crates/gui/tauri.conf.json'))['version'])")
+          tag="${GITHUB_REF_NAME#v}"
+          echo "tag=$tag / tauri.conf.json version=$ver"
+          if [[ "$tag" != "$ver" ]]; then
+            echo "FAIL tag 与 desktop/crates/gui/tauri.conf.json 的 version 不一致。"
+            echo "     要么改 tag，要么先改 tauri.conf.json 再打 tag。"
+            exit 1
+          fi
+
+      - name: 汇总校验和
+        working-directory: dist
+        run: |
+          set -euo pipefail
+          ls -l
+          # 覆盖固件那份单独的 SHA256SUMS，出一份涵盖全部发布物的清单。
+          # 在 dist 里执行，写出的文件名不带 ./ 前缀，便于直接核对。
+          sha256sum ./*.zip ./*.bin | sed 's|  \./|  |' > SHA256SUMS.txt
+          cat SHA256SUMS.txt
+
+      - name: 创建或补全 Release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          tag="$GITHUB_REF_NAME"
+          assets=(dist/*.zip dist/*.bin dist/SHA256SUMS.txt)
+          if gh release view "$tag" >/dev/null 2>&1; then
+            # 重跑：补传/覆盖资产，不重复建 Release。
+            gh release upload "$tag" "${assets[@]}" --clobber
+          else
+            gh release create "$tag" "${assets[@]}" \
+              --title "AI Passport Mic $tag" \
+              --generate-notes \
+              --notes "ad-hoc 签名、未公证（G6 未做）。首次打开请右键「打开」，或执行：xattr -dr com.apple.quarantine \"/Applications/AI Passport Mic.app\"。"
+          fi

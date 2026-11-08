@@ -211,7 +211,7 @@ bundle 身份做回环验收（见 [`GUI.md`](GUI.md)）。
 | 判据 | 结果 |
 | --- | --- |
 | 1. `./scripts/test-sink.sh` 升级前后各跑一次，结果一致 | **PASS**（升级前 PASS、升级后 PASS，都是"声卡打开/写入/收尾都通了"） |
-| 2. `cargo test` 全绿 | **PASS**：130 passed / 0 failed / 2 ignored（升级当时；2026-11-07 复核同为 **130 passed / 2 ignored**，见 `desktop/README.md`） |
+| 2. `cargo test` 全绿 | **PASS**：130 passed / 0 failed / 2 ignored（升级当时；2026-11-08 复核已到 **162 passed / 2 ignored**，见 `desktop/README.md`） |
 | 3. 真机复测 | **PASS**，见下表 |
 
 #### 改了什么

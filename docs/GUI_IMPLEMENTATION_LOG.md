@@ -63,7 +63,7 @@
 | 检查 | 命令 | 结果 |
 | --- | --- | --- |
 | 基线自检 | `./scripts/verify.sh` | **PASS**（Structure / Docs links / Scripts / Protocol 44 passed / Vectors / Desktop / Env 全绿） |
-| 桌面端单测 | `cd desktop && cargo test` | **PASS**（本节为 2026-11-05 快照：93 passed / 1 ignored）。**2026-11-07 复核（删诊断仪表盘之后）**：**143 passed / 0 failed / 2 ignored**——`apm-app` 82（+2 ignored）、`apm-protocol` 37、`c-vectors` 5、`glitch_repro` 3、`apm-link` 5、`apm-sink` 7、`apmctl` 4。以 `desktop/README.md` 的验证状态表为准 |
+| 桌面端单测 | `cd desktop && cargo test` | **PASS**（本节为 2026-11-05 快照：93 passed / 1 ignored）。**2026-11-08 复核**：**162 passed / 0 failed / 2 ignored**——`apm-app` 93（+2 ignored）、`apm-protocol` 47、`apm-link` 6、`apm-sink` 12、`apmctl` 4。以 `desktop/README.md` 的验证状态表为准 |
 | 静态检查 | `cargo clippy --all-targets` | **PASS**，**0 警告**（顺手清掉了 `protocol/src/glitch.rs` 与 `sink/src/playout.rs` 里两条既存的 `collapsible_if`） |
 | 前端类型 | `npx vue-tsc --noEmit` | **PASS** |
 | 前端构建 | `npm run build` | **PASS** |
