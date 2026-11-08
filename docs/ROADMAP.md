@@ -10,7 +10,7 @@
 
 > M0 的定义是「仓库能交给下一个人接手」，不是「软件能用」。
 
-## M1：固件最小链路（真机链路已通过，三键判定待核对）
+## M1：固件最小链路（真机链路与按键判定均已通过）
 
 - [x] ESP-IDF 工程骨架 + 8 MB 分区表 + USB-Serial-JTAG 控制台。
 - [x] ES8311 采集：16 kHz / 16-bit / mono（**真机通过**：15 s 连续录音 748 块、0 丢块）。
@@ -21,11 +21,13 @@
 - [ ] ~~本地 HID 键盘路径~~ → **第一版不做**，理由见下面的说明。
 - [x] 烧录、MTU 与通知、块丢失统计：MTU 247（需求 ≥168），音频/状态/事件三路订阅均建立。
 - [x] PTT 启停：`apmctl record` 走 CTRL START/STOP 强制采集，不依赖 OK 键。
-- [ ] **三键判定核对**：UP / DOWN / OK 各按一次，`apmctl status` 能打出对应的
-      `按键: <键>.press`；换板要改 `main/board.h` 后重新标定 150 / 447 / 1900 mV 三个窗口。
-      现有旁证只有 OK（`GUI_IMPLEMENTATION_LOG.md` §14.14），UP / DOWN 没有任何真机证据。
-- [ ] **15 个手势码对拍（低优先）**：3 键 × press / click / double / long / release。
+- [x] **三键判定核对（2026-11-06 真机 PASS）**：UP / DOWN / OK 各按一次，`apmctl status`
+      打出对应的 `按键: <键>.press`，计数 4/1/4，见 `GUI_IMPLEMENTATION_LOG.md` §14.16。
+      **换板**要改 `main/board.h` 后重新标定 150 / 447 / 1900 mV 三个窗口；
+      三个窗口的实际电压**尚未用万用表复核**（只验了分类结果），见 `TODO.md` 的 P0。
+- [x] **15 个手势码对拍（2026-11-06 15/15 PASS）**：3 键 × press / click / double / long / release。
       这是协议层证据，不是产品验收——PC 从 `keymap-3` 起只消费 `PRESS`，另外四码只记日志。
+      见 `GUI_IMPLEMENTATION_LOG.md` §14.17。
 - [x] **延迟测量手段（链路）**：控制帧 `0x04 PING` / `0x83 PONG` 两端落地，
       `apmctl ping` 输出 RTT 的 min / 中位 / p95 / max 与抖动，支持 `--json`。
       口径是**链路往返**，不能当端到端延迟用。**真机已测（2026-11-05）：中位 38.2 ms /
@@ -87,11 +89,13 @@ Tauri 2 + Vue 3，分期 G0–G6，各期单独验收。完整方案见 [`GUI.md
 `./scripts/build-gui.sh` 通过（`.app` 30.29 MiB）。明细见 `GUI_IMPLEMENTATION_LOG.md` §14.2；
 它证明的是"能编译、单测过、打得出来"，**不等于** G1–G5 已验收。
 
-**2026-11-07 复核**：`./scripts/verify.sh` 七项全 PASS（协议 C 44 passed）；
-`cargo test` 实为 **130 passed / 0 failed / 2 ignored**（7 个有测试的目标，含 `apm-app` 自身的
-两个 `#[ignore]`：真声卡冒烟与真机按键注入）。上一行的 93 是 11-05 的旧快照、
-11-06 记的 117 也已过时（新增 KI-007/008/009、M6 与 cpal 0.18 的测试后未回填），
-这里按实测更正。门禁明细以 `desktop/README.md` 的验证状态表为准。
+**2026-11-08 复核**：`./scripts/verify.sh` 七项全 PASS（固件主机侧单测 109 passed：
+协议 44 + 省电逻辑 65）；
+`cargo test`（workspace `default-members`，**不含** `crates/gui`）实为
+**162 passed / 0 failed / 2 ignored**（7 个有测试的目标，含 `apm-app` 自身的
+两个 `#[ignore]`：真声卡冒烟与真机按键注入；GUI 要单跑 `cargo test -p apm-gui`）。
+更早记的 93（11-05）/ 117 / 130 / 143 / 161 都是过时快照——**这类数字没有自动回填机制，
+本身就是 `TODO.md` P4 的一条债**。门禁明细以 `desktop/README.md` 的验证状态表为准。
 
 - [~] **前置：把 `record` / `sink` 的编排迁进 `apm-app`。** 采集、解码、丢块统计、
       声卡写入、指标聚合现在只有一份实现（`crates/app/src/{session,pipeline}.rs`），
@@ -112,7 +116,9 @@ Tauri 2 + Vue 3，分期 G0–G6，各期单独验收。完整方案见 [`GUI.md
       **口径同日由「2 s 内」调整为「≤ 8 s」**（项目负责人确认），因为轮询判活最快就是
       5 s 静默 + 2 s 探活。事件驱动（`CentralEvent::DeviceDisconnected`，可压到 <1 s）
       另开一轮；
-      「关蓝牙 → `bt_unavailable`」仍未测。
+      「关蓝牙 → `no_adapter`」**2026-11-07 已补测 PASS**（第一次落 `idle` 属 FAIL，
+      挖出 `probe_adapter` 判不出蓝牙关闭 + 断链路径没调探测两个真 bug），
+      见 `GUI_IMPLEMENTATION_LOG.md` §14.20。
 - [x] G2 实时电平 + 推流 + 指标条（代码）：`streaming` 状态不再是占位，5 Hz `telemetry`
       + canvas 电平表 + 缓冲滑块（运行中改目标，取下一批回调生效）。
       **2026-11-05 真机 15.6 min**：46949 块 / 939 s = 50.00 块/秒、丢块 0、设备侧丢弃 0、
@@ -121,17 +127,21 @@ Tauri 2 + Vue 3，分期 G0–G6，各期单独验收。完整方案见 [`GUI.md
       [`GUI_IMPLEMENTATION_LOG.md`](GUI_IMPLEMENTATION_LOG.md) §14.10。
       **2026-11-07 更新**：KI-006 根因查明为 macOS CoreBluetooth 攒批交付，
       欠载判据改为阈值型（≤5 次/分、单次 ≤50 ms、占比 ≤1%）。按新口径，
-      CLI 侧 600 s 真机已 PASS（1.0 次/分）；**GUI 侧未按新口径重跑**，
-      CPU/内存/前端 fps 三项仍超。
+      CLI 侧 600 s 真机已 PASS（1.0 次/分）；**GUI 侧未按新口径重跑**。
+      2026-11-07 release 包实测（90 s）：CPU 14.2% 与内存 208 MB **仍超口径**，
+      前端 **59.8 fps 已 PASS**，三项明细见 `TODO.md` 的 P0「G2 性能项」。
 - [x] G3 声卡选择 + 会话 WAV（代码）：枚举带采样率范围，不支持 16 kHz 的设备提前拒绝；
       WAV 增量写、收尾回填头；GUI 与 CLI 共用同一份会话统计。
-      **GUI 与 `apmctl record` 的同时录对拍没做**。
+      **GUI 与 `apmctl record` 的统计口径对拍 2026-11-07 PASS**：两边块率都是 50.000 /s
+      （差 0.000%）、丢块 0，判据为「块率差 ≤ 0.5%」，见 `GUI_IMPLEMENTATION_LOG.md` §14.21。
 - [ ] G3b 用 GUI 自身身份恢复回环自动验收。**未实现**（`--verify` 仍在 CLI）。
 - [x] G4 音质报告视图（代码）：报告构造只有一份（`apm_app::report`），
       GUI 的表格与「复制 JSON」都出自它，未测字段是 null。
-- [x] G5 按键映射（代码）：**3 个事件**（一个键一个动作）+ 2 个采集钩子（`keymap-4`；
-      2026-11-05 两步归并 15 → 6 → 3，随后加钩子升到 4，v1–v3 都能迁移）的编辑、导入、
-      导出、恢复默认、落盘；`ok` 强制为 `ptt-toggle`。
+- [x] G5 按键映射（代码）：界面**按角色分三块**（麦克风 / 快捷键映射 / 采集时注入），
+      schema 是 `keymap-4`（一个键一个动作 + 2 个采集钩子；2026-11-05 两步归并 15 → 6 → 3，
+      随后加钩子升到 4，v1–v3 都能迁移）的编辑、导入、导出、恢复默认、落盘。
+      **开麦键恰好一个**（绑 `ptt-toggle`，默认 `ok`，2026-11-07 起可换 `up`/`down`；
+      缺了兜底回 `ok`，重复整份拒绝）。
       **注入层（M3）已实现**（见下面的 M3），"改了映射不会敲键盘"这句已作废；
       缺的是**真机端到端验收**（要人工授辅助功能权限）。
 - [ ] G6 签名打包公证。**未做**，需要 Apple 开发者证书，当前只有 ad-hoc 签名。
@@ -143,9 +153,10 @@ Tauri 2 + Vue 3，分期 G0–G6，各期单独验收。完整方案见 [`GUI.md
       2026-11-05 两次归并：15（手势）→ 6（按下/抬起）→ 3（每键一动作）。
       固件仍上报 5 种手势码，PC 端只消费 PRESS；协议与跨端向量都不动。
       **OK 变成开关式后少了"松手自动停"**，M3 注入层必须补超时兜底。
+      2026-11-07：界面按角色分三块，**开麦键可在这三个键之间移动**（恰好一个绑 `ptt-toggle`）。
 - [x] 配置持久化、恢复默认、导入/导出（schema 见 `config/README.md`）。
-- [x] 保证 OK 的 PTT 停止路径不会被配置破坏（`ok` 被强制回填 `ptt-toggle`，
-      见 `keymap_store::save_bindings_at` 的兜底逻辑）。
+- [x] 保证开麦键不会因为配置而消失（**恰好一个**事件绑 `ptt-toggle`：缺了兜底回 `ok`、
+      重复由 `KeyMap::parse` 整份拒绝，见 `keymap_store::save_bindings_at`）。
 - [x] **注入层（macOS 点按）已实现（2026-11-05）**：`apm-app::inject` 用 CGEvent
       把映射动作发到当前前台应用。
 - [x] **采集钩子**：开麦 → `capture.start`、关麦 → `capture.stop`（含断链导致的自动收尾），
@@ -157,13 +168,16 @@ Tauri 2 + Vue 3，分期 G0–G6，各期单独验收。完整方案见 [`GUI.md
 - [x] **按键事件直连（2026-11-05，`GUI_IMPLEMENTATION_LOG.md` §14.14）**：设备 PRESS → 动作。
       `ok` 走 `toggle_ptt`（开关采集，与界面按钮同一条 `start_stream` / `stop_stream`）；
       `up` / `down` 走 `inject_in_background` 点按注入。切换窗口内防抖（`ptt_switching`）。
-- [ ] **真机端到端验收**：辅助功能授权后，设备 UP / DOWN 真的落到前台应用、OK 真的开关采集。
-      代码齐、单测齐（含 `real_tap_ralt_to_frontmost_app`），但**没人按过**。
-- [ ] **超时兜底**：toggle 语义下忘记关麦是真实风险。**10 分钟是定稿口径，不是建议**
-      （`PRODUCT.md` / `config/README.md` 都写成必做）。落点在 PC 侧 `apm_app`，且必须走
-      `stop_stream()` —— 它负责触发 `capture.stop` 钩子并收尾 WAV；只发 CTRL STOP 会漏掉这两件事。
-      注意固件侧 `s_ptt_held` 在 OK 抬手时就清零了，管不到 CTRL START 驱动的会话，
-      所以这个兜底**不能**做进固件。
+- [x] **真机端到端验收（2026-11-06 PASS）**：辅助功能授权后，设备 UP / DOWN 真的落到前台应用
+      （注入 `a` / `b` 成功），OK 真的开关采集；未授权时明确报错、不静默丢弃。
+      见 `GUI_IMPLEMENTATION_LOG.md` §14.16。
+- [x] **超时兜底（2026-11-06 代码 + 真机两轮 PASS）**：toggle 语义下忘记关麦是真实风险，
+      **10 分钟是定稿口径，不是建议**（`PRODUCT.md` / `config/README.md` 都写成必做）。
+      落点在 PC 侧 `apm_app`，走 `stop_stream()` —— 它负责触发 `capture.stop` 钩子并收尾 WAV；
+      只发 CTRL STOP 会漏掉这两件事。注意固件侧 `s_ptt_held` 在 OK 抬手时就清零了，
+      管不到 CTRL START 驱动的会话，所以这个兜底**不能**做进固件。默认 10 min、可调 1–1440、
+      所有推流生效。**验的是 1 min 触发（机制正确）**；10 min 默认口径与界面上改时长
+      两个缺口见 `TODO.md` 的 P0，明细见 `GUI_IMPLEMENTATION_LOG.md` §14.19。
 - [ ] **"按住不放"模式**：微信/钉钉"按住说话"类应用需要 hold。
       **固件侧已经具备条件**：PRESS / RELEASE 两路事件都在上报，`s_ptt_held` 也是按下置位、
       抬起清零（`app_main.c`）。缺的是 PC 端消费 `RELEASE`（现在 `core.rs` 只认 `EVENT_PRESS`）
