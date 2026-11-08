@@ -218,18 +218,25 @@ else
 
   # 3) 禁用词：芯片、外设、总线、SDK 一类。命中即 FAIL ——
   #    这条是平台明文规则（见 docs/PUBLISHING.md §1），不是我们自己的偏好。
-  #    注意 `flashing` / `flashes` 不是 `flash`，用词边界避免误报。
-  banned='ESP32|Espressif|乐鑫|ES8311|I2C|I2S|SPI|UART|GPIO|LVGL|OLED|LCD|NimBLE|ADPCM|CJK|sdkconfig|ESP-IDF'
-  if rg -q -i "\b($banned)\b" "$pub_dir"/*.txt 2>/dev/null; then
+  #
+  #    用 BSD/GNU 都支持的 `[[:<:]]`/`[[:>:]]` 词边界，**不用 `rg`**：
+  #    GitHub 的 macOS runner 上没装 ripgrep（2026-11-08 CI 就是栽在这里，
+  #    `rg: command not found` 让整段判定静默退化成 FAIL）。verify.sh 只能依赖
+  #    基础工具，否则本地绿、CI 红，而且红的原因跟内容无关。
+  #    词边界是必要的：`flashing`/`flashes` 不是 `flash`，不能用子串匹配。
+  banned='ESP32|Espressif|乐鑫|ES8311|I2C|I2S|SPI|UART|GPIO|LVGL|OLED|LCD|NimBLE|ADPCM|sdkconfig|ESP-IDF'
+  if grep -Eni "[[:<:]]($banned)[[:>:]]" "$pub_dir"/*.txt 2>/dev/null | head -1 | grep -q .; then
     echo "FAIL 发布文案里出现工程词（平台要求 play-first）:"
-    rg -n -i "\b($banned)\b" "$pub_dir"/*.txt | head -5 | sed 's/^/      /'
+    grep -Eni "[[:<:]]($banned)[[:>:]]" "$pub_dir"/*.txt 2>/dev/null | head -5 \
+      | sed "s|^$pub_dir/|      |"
     pub_problems=1
   fi
 
   # 4) 纯文本字段里不该有 Markdown（`**粗体**` 会原样显示成星号）
-  if rg -q '\*\*|^#{1,6} ' "$pub_dir"/*.txt 2>/dev/null; then
+  if grep -En '\*\*|^#{1,6} ' "$pub_dir"/*.txt 2>/dev/null | head -1 | grep -q .; then
     echo "FAIL 发布文案里有 Markdown 标记（这些字段是纯文本）"
-    rg -n '\*\*|^#{1,6} ' "$pub_dir"/*.txt | head -5 | sed 's/^/      /'
+    grep -En '\*\*|^#{1,6} ' "$pub_dir"/*.txt 2>/dev/null | head -5 \
+      | sed "s|^$pub_dir/|      |"
     pub_problems=1
   fi
 
@@ -251,7 +258,7 @@ else
   if [[ ! -s "$pub_dir/release-notes.md" ]]; then
     echo "FAIL 缺 docs/publish/release-notes.md（Release 页的用户说明）"
     pub_problems=1
-  elif ! rg -q 'xattr -dr com\.apple\.quarantine' "$pub_dir/release-notes.md"; then
+  elif ! grep -q 'xattr -dr com\.apple\.quarantine' "$pub_dir/release-notes.md"; then
     echo "FAIL release-notes.md 里没有 xattr 去隔离指引"
     echo "     当前是 ad-hoc 签名，用户首次打开一定会被 Gatekeeper 拦。"
     pub_problems=1

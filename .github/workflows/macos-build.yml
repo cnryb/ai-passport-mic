@@ -128,6 +128,11 @@ jobs:
 
       - name: 构建 + 合并镜像
         working-directory: device
+        # 容器里的默认 shell 是 `sh`（dash）：`set -o pipefail` 在它下面会直接报
+        # `Illegal option -o pipefail` 并整步失败 —— 2026-11-08 第一次真正跑到这个
+        # job 时就是栽在这里（之前 v* tag 从未推过，这条路径一直没被执行）。
+        # IDF 镜像里自带 bash，显式指定即可。
+        shell: bash
         run: |
           set -euo pipefail
           # 必须显式激活：GitHub 对 job container 会把 ENTRYPOINT 覆盖成
