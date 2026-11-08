@@ -39,24 +39,26 @@
 
 | 项 | 证据 |
 | --- | --- |
-| 合并镜像合法、3 段、≤ 8 MiB | `publisher.py validate` 通过（730,736 B / 3 segments） |
+| 合并镜像合法、3 段、≤ 8 MiB | `publisher.py validate` 通过（CI 产物 779,168 B / 3 segments，sha256 `25e8472b…`） |
 | 镜像布局可整片写 | bootloader@0x0、分区表@0x8000、app@0x10000 |
 | 应用描述符版本干净 | `version=0.1.0`、`project_name=ai-passport-mic`（无 `-dirty`） |
 | 浏览器能识别设备 | 控制台走 USB-Serial-JTAG（`USB JTAG/serial debug unit`） |
 | 代码仓库公开 | `github.com/cnryb/ai-passport-mic` |
 | 分区表与既有社区作品一致 | 与已上线的 VibeMic 固件同为 `nvs/phy_init/factory(0x7f0000)` |
 | 虚拟声卡一键验证可用 | 真机实测 写入 -20.00 dBFS / 回读 -20.24 dBFS / 0 欠载 |
+| **安装包已可下载** | `v0.1.0` Release：`AI-Passport-Mic-0.1.0-macos-{arm64,x86_64}.zip` + 合并镜像 + `SHA256SUMS.txt`（`shasum -c` 全 OK） |
+| **下载到的包能启动** | 解压后 `open` 成功，日志 `应用内核启动 v0.1.0`，声卡自动选中 `BlackHole 2ch` |
+| **对外文案与封面** | 中英简介/使用方法/更新日志，封面 864×1152（严格 3:4）；`publisher.py` 预览通过 |
+| **CI 全链路绿** | gate / firmware / package(arm64) / package(x86_64) / release 五个 job 全 success |
 
 仍缺（按阻塞程度）：
 
 | # | 缺口 | 现状 |
 | --- | --- | --- |
-| 1 | **对外文案** | 无中英标题/简介/使用方法；仓库内文档全是技术向 |
-| 2 | **3:4 封面** | 仓库内唯一视觉资产是 512×512 正方形图标 |
-| 3 | **可下载的安装包** | 由 `.github/workflows/macos-build.yml` 在打 `v*` tag 时产出 |
-| 4 | **签名与公证** | **不做**（见 §3），产物是 ad-hoc 签名 |
-| 5 | **Windows 版** | 只有 macOS arm64 + x86_64；注入层 Windows 未实现 |
-| 6 | 公开仓库落后本地提交 | 发布前先 push |
+| 1 | **提交审核** | 文案、封面、固件都齐了，只差在创作者中心拿一次性授权码提交。这一步要人登录 |
+| 2 | **装完能否恢复出厂未实测** | 见 §5，**这条不过就不要发** |
+| 3 | **Windows 版** | 只有 macOS arm64 + x86_64；注入层 Windows 未实现，文案已写明"只支持 macOS" |
+| 4 | 签名与公证 | **不做**（见 §3），产物是 ad-hoc |
 
 ## 3. 无签名证书时的分发口径
 
@@ -134,10 +136,37 @@ git tag v0.1.0        # 必须与 crates/gui/tauri.conf.json 的 version 一致
 git push origin v0.1.0
 ```
 
+**注意：上传到社区的那份固件应当是 Release 里下载下来的**，而不是本地
+`device/build/` 那份。两处构建产物的 sha256 不同（容器与本地编译器/时间戳差异），
+但校验方式一致。真机刷过的、`publisher.py validate` 过的必须是同一份：
+
+```bash
+gh release download v0.1.0 --repo cnryb/ai-passport-mic -p ai-passport-mic-merged.bin
+publisher.py validate --firmware ./ai-passport-mic-merged.bin --cover docs/publish/cover.jpg
+```
+
 ### 4.3 提交
 
 在创作者中心（`/account/`，手机号或邮箱登录）「发布新玩法」复制一次性授权码，
 或走 AI 发布助手的 `submit --auto`。
+
+本地已备好完整素材，命令可直接照抄（把 `<固件>` 换成 §4.2 下载的那份）：
+
+```bash
+python3 /tmp/folotoy-ai-passport-publisher/scripts/publisher.py submit \
+  --title-zh "AI Passport Mic · 随身无线麦克风" \
+  --title-en "AI Passport Mic · Pocket Wireless Microphone" \
+  --description-zh "$(cat docs/publish/description-zh.txt)" \
+  --description-en "$(cat docs/publish/description-en.txt)" \
+  --instructions-zh-file docs/publish/instructions-zh.txt \
+  --instructions-en-file docs/publish/instructions-en.txt \
+  --changelog-zh-file docs/publish/changelog-zh.txt \
+  --changelog-en-file docs/publish/changelog-en.txt \
+  --source-url https://github.com/cnryb/ai-passport-mic \
+  --cover docs/publish/cover.jpg \
+  --firmware <固件>
+# 先看预览，确认无误后加 --auto（需要一次性授权码）才会真正上传
+```
 
 注意：
 
