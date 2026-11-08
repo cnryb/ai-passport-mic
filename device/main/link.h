@@ -3,6 +3,7 @@
 #pragma once
 
 #include "esp_err.h"
+#include "power_policy.h"
 #include "protocol.h"
 #include <stdbool.h>
 #include <stddef.h>
@@ -38,11 +39,26 @@ int apm_link_notify_audio(const uint8_t *block, size_t len);
 
 // 当前实际连接间隔（ms）；未连接或还没读到返回 0。
 uint16_t apm_link_conn_itvl_ms(void);
-// 连接间隔超过 APM_CONN_ITVL_OK_MS 时重新请求快速参数（内部有节流，可 1 Hz 调用）。
-void apm_link_ensure_fast_conn(void);
 
-// 判据：> 40 ms 撑不住 165 B × 50 块/秒（干净会话实测落在 30 ms）。
-#define APM_CONN_ITVL_OK_MS 40
+// 告诉链路"现在在不在采集"，据此在快速档 / 省电档之间切换连接参数。
+//
+// 采集中：15–30 ms（撑住 50 块/秒）；空闲：80 ms（射频唤醒降到 1/3）。
+// 幂等，可从任意任务调用（内部只在档位真的变化时才发请求）。
+// **必须在 START/STOP/PTT 与断链清态这三处都调**，否则档位会停在上一场的状态。
+void apm_link_set_capturing(bool capturing);
+
+// 每次心跳调用：检查实际间隔是否符合当前档位，不合格就重新请求（内部有节流）。
+// 采集态判据 40 ms（并置 LINK_SLOW），空闲态 120 ms（不置位，只纠偏）。
+void apm_link_ensure_conn_params(void);
+
+// 每次心跳调一次：校对连接参数 + 按 RSSI 评估发射功率。取代原来的 ensure_fast_conn。
+void apm_link_housekeeping(void);
+
+// 档位数值与判据**只在 power_policy.h 定义一次**（纯函数，有主机侧单测）。
+// 这里不再重复 15/30/80/40 这些数——一份数值两处实现，改一处漏一处是这类改动的典型翻车点。
+
+// 当前是否处于采集中（供 STATUS 的 LINK_SLOW 判定使用）。
+bool apm_link_capturing(void);
 int apm_link_notify_event(apm_btn_t btn, apm_btn_ev_t ev, uint8_t flags);
 // PONG 与 EVENT 共用特征值；seq/len 为 PING 的载荷（必须 4 字节）。
 int apm_link_notify_pong(const uint8_t *seq, size_t len);

@@ -154,7 +154,11 @@ static esp_err_t codec_init(void)
     s_codec = es8311_codec_new(&(es8311_codec_cfg_t){
         .ctrl_if     = s_ctrl,
         .gpio_if     = s_gpio,
-        .codec_mode  = ESP_CODEC_DEV_WORK_MODE_BOTH,
+        // **只开 ADC**：本项目只采集、不播放（`APM_I2S_PA_GPIO = -1`，功放根本没接 MCU）。
+        // 写成 BOTH 会让 es8311_start() 把 DAC 接口与 SYSTEM_REG12 的输出级一起上电，
+        // 一直给用不到的那半边模拟电路供电 —— 白白耗电。
+        // 改成 ADC 后 es8311_start() 不再碰 DAC 的接口使能，也不走 PA/静音路径。
+        .codec_mode  = ESP_CODEC_DEV_WORK_MODE_ADC,
         .pa_pin      = APM_I2S_PA_GPIO,
         .pa_reverted = false,
         .master_mode = false,
@@ -168,7 +172,14 @@ static esp_err_t codec_init(void)
     }
 
     s_dev = esp_codec_dev_new(&(esp_codec_dev_cfg_t){
-        .dev_type = ESP_CODEC_DEV_TYPE_IN_OUT,
+        // **只声明输入能力**：esp_codec_dev_open() 按 dev_caps 逐个验通道，
+        // 声明 IN_OUT 等于要求驱动把输出侧也一起打开。本项目只采集，输出是空转。
+        //
+        // 注意（别误会收益来源）：I2S 是 duplex、MCLK/BCLK/WS 共享，
+        // `_i2s_data_enable()` 里"RX 在跑就不许关 TX"（`out_disable_pending`），
+        // 所以**这里省掉的是 ES8311 的 DAC/输出级模拟供电，不是 I2S TX 通道**。
+        // 要连 TX 一起省必须改成只建 RX 通道，那是另一轮的事（需真机验证 MCLK 仍正常）。
+        .dev_type = ESP_CODEC_DEV_TYPE_IN,
         .codec_if = s_codec,
         .data_if  = s_data,
     });

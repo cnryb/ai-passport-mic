@@ -109,16 +109,20 @@ else
 fi
 
 echo
-echo "== 协议单测 =="
-# 这是固件侧唯一能真正跑起来的检查：编译通过不等于 CRC / 帧 / ADPCM 正确。
+echo "== 固件主机侧单测 =="
+# 这是固件侧唯一能真正跑起来的检查：编译通过不等于 CRC / 帧 / ADPCM / 省电逻辑正确。
+# 覆盖 protocol（协议）与 power_policy（两档连接参数、LINK_SLOW 判据、采集态状态机、
+# 发射功率滞回）两个纯逻辑模块。
 proto_log="${TMPDIR:-/tmp}/ai-passport-mic-verify-proto.log"
 if "$root/scripts/test-protocol.sh" >"$proto_log" 2>&1; then
   status_proto=PASS
-  echo "OK   $(tail -1 "$proto_log")"
+  # 两个目标各一行 "N passed, M failed"，加起来报总数，别只报最后一行的数。
+  total=$(awk '/^[0-9]+ passed, / {s+=$1} END {print s+0}' "$proto_log")
+  echo "OK   协议 44 项 + 省电逻辑（合计 $total passed）"
 else
   status_proto=FAIL
   failed=1
-  echo "FAIL 协议单测未通过，明细:"
+  echo "FAIL 固件主机侧单测未通过，明细:"
   sed 's/^/      /' "$proto_log"
 fi
 rm -f "$proto_log"

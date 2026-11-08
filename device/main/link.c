@@ -7,7 +7,9 @@
 
 #include "audio.h"
 #include "board.h"
+#include "power_policy.h"
 
+#include "esp_bt.h"      // esp_ble_tx_power_set / esp_power_level_t（自适应发射功率）
 #include "esp_log.h"
 #include "esp_timer.h"
 #include "host/ble_hs.h"
@@ -31,8 +33,10 @@ static const char *TAG = "apm_link";
 // 失败，PC 侧看到的就是"设备几乎不发"（实测 1.5–2 块/秒）。
 //
 // 所以这里做三件事：广播里带上从机首选参数、连上后延时请求、失败退避重试。
-#define APM_CONN_ITVL_MIN_MS     15
-#define APM_CONN_ITVL_MAX_MS     30
+//
+// **档位数值与判定全部在 power_policy.c**（纯函数，有主机侧单测）。这里只负责
+// 把"该请求什么"翻译成 NimBLE 调用，不重复定义 15/30/80/40 这些数——
+// 一份数值两处实现，改一处漏一处是这类改动最常见的翻车方式。
 #define APM_CONN_UPD_FIRST_MS    600   // 连上立刻请求常被主机拒绝，先等一拍
 #define APM_CONN_UPD_RETRY_MS    1000
 #define APM_CONN_UPD_MAX_TRIES   6
@@ -79,6 +83,14 @@ static uint16_t s_itvl_125us;
 static uint32_t s_upd_req_ms;
 static uint8_t  s_upd_tries;
 static esp_timer_handle_t s_upd_timer;
+// 当前是否在采集（决定请求哪一档间隔）。由 apm_link_set_capturing 维护，
+// 断链时清回 false —— 下一条连接按空闲档起，等 START/PTT 再拉快。
+static volatile bool s_capturing;
+// 自适应发射功率：状态（当前档位 + 滞回计数）与上次评估时刻。
+// 档位初值在 apm_link_start() 里用 apm_tx_init() 设成 sdkconfig 的开机默认
+// （+9 dBm），与 `CONFIG_BT_CTRL_DFT_TX_POWER_LEVEL_P9` 保持一致。
+static apm_tx_state_t s_tx;
+static uint32_t s_tx_eval_ms;
 
 static uint32_t now_ms(void) { return (uint32_t)(esp_timer_get_time() / 1000); }
 
@@ -297,22 +309,38 @@ static void refresh_itvl(void)
     if (ble_gap_conn_find(s_conn, &desc) == 0) s_itvl_125us = desc.conn_itvl;
 }
 
+// 前向声明：schedule_update 在定时器不可用时要退化成直接请求（见其注释）。
+static void request_conn_params(void);
+
 static void schedule_update(uint32_t delay_ms)
 {
-    if (!s_upd_timer) return;
+    // 定时器创建失败时（RAM 紧张）退化成就地请求：宁可失去"延迟一拍"的保护，
+    // 也不能让切档指令被静默丢掉 —— 丢了就是空闲仍在 30 ms，或采集时停在 80 ms 掉块。
+    if (!s_upd_timer) {
+        request_conn_params();
+        return;
+    }
     esp_timer_stop(s_upd_timer);
     if (esp_timer_start_once(s_upd_timer, (uint64_t)delay_ms * 1000) != ESP_OK) {
         ESP_LOGW(TAG, "连接参数重试定时器启动失败");
     }
 }
 
-static void request_fast_conn(void)
+/// 按当前档位发一次参数更新请求。
+///
+/// 两档的目标值不同，但**参数相同**（latency=0、超时 4 s）：空闲档不用 peripheral
+/// latency 换电，是因为 latency 会让设备在 N 个连接事件里完全不响应主机，
+/// 一旦 PTT 按下需要立刻拉回快速档，主机的参数更新指令自己就会被 latency 拖住 ——
+/// 那正是我们最不能慢的时刻。
+static void request_conn_params(void)
 {
     if (s_conn == BLE_HS_CONN_HANDLE_NONE) return;
 
+    apm_conn_itvl_t want = apm_conn_itvl_for(s_capturing);
+
     struct ble_gap_upd_params up = {
-        .itvl_min = BLE_GAP_CONN_ITVL_MS(APM_CONN_ITVL_MIN_MS),
-        .itvl_max = BLE_GAP_CONN_ITVL_MS(APM_CONN_ITVL_MAX_MS),
+        .itvl_min = BLE_GAP_CONN_ITVL_MS(want.itvl_min_ms),
+        .itvl_max = BLE_GAP_CONN_ITVL_MS(want.itvl_max_ms),
         .latency  = 0,
         .supervision_timeout = 400,  // 4 s
     };
@@ -321,19 +349,25 @@ static void request_fast_conn(void)
 
     int rc = ble_gap_update_params(s_conn, &up);
     if (rc == 0) {
-        ESP_LOGI(TAG, "请求连接参数 %d-%d ms（第 %u 次）",
-                 APM_CONN_ITVL_MIN_MS, APM_CONN_ITVL_MAX_MS, s_upd_tries);
+        ESP_LOGI(TAG, "请求连接参数 %u-%u ms（%s，第 %u 次）",
+                 want.itvl_min_ms, want.itvl_max_ms,
+                 s_capturing ? "采集中" : "空闲", s_upd_tries);
     } else {
         ESP_LOGW(TAG, "连接参数请求失败: %d（第 %u 次）", rc, s_upd_tries);
         // 主机拒绝/忙的时候不能一次就放弃：KI-005 的坏会话就是"没重试"躺了一整场。
-        if (s_upd_tries < APM_CONN_UPD_MAX_TRIES) schedule_update(APM_CONN_UPD_RETRY_MS);
+        //
+        // **必须判 s_upd_timer 非空**：schedule_update 在没有定时器时会退化成直接调
+        // request_conn_params，不加这个判断就成了无限递归（栈溢出而不是重试）。
+        if (s_upd_timer && s_upd_tries < APM_CONN_UPD_MAX_TRIES) {
+            schedule_update(APM_CONN_UPD_RETRY_MS);
+        }
     }
 }
 
 static void on_update_timer(void *arg)
 {
     (void)arg;
-    request_fast_conn();
+    request_conn_params();
 }
 
 // ---------------------------------------------------------------------------
@@ -354,7 +388,7 @@ static int gap_event(struct ble_gap_event *event, void *arg)
             if (s_conn_cb) s_conn_cb(true);
 
             // 建连瞬间就请求参数更新，macOS 大概率拒（见 docs/GUI.md 实测），
-            // 先等 APM_CONN_UPD_FIRST_MS 再发，失败由 request_fast_conn 退避重试。
+            // 先等 APM_CONN_UPD_FIRST_MS 再发，失败由 request_conn_params 退避重试。
             schedule_update(APM_CONN_UPD_FIRST_MS);
         } else {
             ESP_LOGW(TAG, "连接失败 status=%d，重新广播", event->connect.status);
@@ -368,6 +402,8 @@ static int gap_event(struct ble_gap_event *event, void *arg)
         s_mtu = 0;
         s_itvl_125us = 0;
         s_upd_tries = 0;
+        // 档位跟着会话一起清：下一条连进来时按"空闲"起，等 START/PTT 再拉快。
+        s_capturing = false;
         if (s_upd_timer) esp_timer_stop(s_upd_timer);
         s_sub_audio = s_sub_status = s_sub_event = false;
         // 先告诉应用层"会话没了"，再重新广播：应用层要在这里清掉 START/PTT。
@@ -548,6 +584,10 @@ esp_err_t apm_link_start(const char *device_name)
 {
     if (device_name) s_name = device_name;
 
+    // 发射功率状态复位到 sdkconfig 的开机默认档（+9 dBm）。放在这里而不是静态初值，
+    // 是为了让它和 apm_tx_init 里的常量保持单一来源。
+    apm_tx_init(&s_tx);
+
     // 连接参数重试用的单次定时器（任务上下文，允许在回调里再启动自己）。
     if (!s_upd_timer) {
         const esp_timer_create_args_t args = {
@@ -590,6 +630,34 @@ esp_err_t apm_link_start(const char *device_name)
     if (rc != 0) return ESP_FAIL;
 
     nimble_port_freertos_init(host_task);
+
+    // 把省电的实际状态打出来，**别拿 BLE_INIT 的 "Using main XTAL as clock source" 当证据**：
+    // 那条日志在没开 modem sleep 时也会打印（`lpclk_sel` 的默认值就是 MAIN_XTAL），
+    // 所以它证明不了 modem sleep 生效。这里查的是运行期真状态：
+    //   - esp_bt_get_lpclk_src() 返回当前低功耗时钟源；
+    //   - esp_bt_sleep_enable() 只有 sleep_mode == MODE_1 才返回 OK，
+    //     用它探测"控制器到底有没有被配成 modem sleep"。
+    // 探测本身是幂等的（已启用时再 enable 一次无害），但**不改配置**，只读。
+    {
+        esp_bt_sleep_clock_t clk = esp_bt_get_lpclk_src();
+        const char *clk_name = "unknown";
+        switch (clk) {
+        case ESP_BT_SLEEP_CLOCK_MAIN_XTAL:  clk_name = "main XTAL"; break;
+        case ESP_BT_SLEEP_CLOCK_EXT_32K_XTAL: clk_name = "ext 32k XTAL"; break;
+        case ESP_BT_SLEEP_CLOCK_RTC_SLOW:   clk_name = "internal RC"; break;
+        default: break;
+        }
+        // 用返回值判断"是不是 MODE_1"，而不是相信 sdkconfig。
+        esp_err_t se = esp_bt_sleep_enable();
+        ESP_LOGI(TAG, "省电状态：低功耗时钟=%s，modem sleep=%s（%s）",
+                 clk_name,
+                 se == ESP_OK ? "已启用" : "未启用",
+                 esp_err_to_name(se));
+        if (se != ESP_OK) {
+            ESP_LOGW(TAG, "modem sleep 未生效！检查 CONFIG_BT_CTRL_MODEM_SLEEP / _MODE_1");
+        }
+    }
+
     ESP_LOGI(TAG, "NimBLE 已启动");
     return ESP_OK;
 }
@@ -605,20 +673,112 @@ uint16_t apm_link_conn_itvl_ms(void)
     return (uint16_t)((s_itvl_125us * 5u + 2u) / 4u);
 }
 
-void apm_link_ensure_fast_conn(void)
+bool apm_link_capturing(void) { return s_capturing; }
+
+/// 切换档位。**只记录意图并立刻请求**，不假设主机会照办 —— 实际是否生效由
+/// BLE_GAP_EVENT_CONN_UPDATE 与下一次心跳校对。
+void apm_link_set_capturing(bool capturing)
+{
+    if (s_capturing == capturing) return;  // 幂等：START 与 PTT 可能同时置位
+    s_capturing = capturing;
+
+    if (s_conn == BLE_HS_CONN_HANDLE_NONE) return;
+
+    // 切档是"这一刻就要生效"的动作，不能等心跳，也不能等退避定时器：
+    // PTT 按下到首块音频只有 250 ms 预算，慢了就是开场卡顿。
+    //
+    // 但仍然走定时器而不是就地调用 `ble_gap_update_params`：这个函数可能从事件任务
+    // 或按键回调里被调到，而本文件其余的参数请求全部在 esp_timer 任务上下文里发，
+    // 保持单一签发点，避免"NimBLE host 正忙时从别的任务直接操作 GAP"这类偶发问题。
+    s_upd_tries = 0;
+    ESP_LOGI(TAG, "切到%s档连接参数", capturing ? "采集" : "空闲");
+    schedule_update(1);
+}
+
+void apm_link_ensure_conn_params(void)
 {
     if (s_conn == BLE_HS_CONN_HANDLE_NONE) return;
     refresh_itvl();
 
     uint16_t ms = apm_link_conn_itvl_ms();
-    if (ms == 0 || ms <= APM_CONN_ITVL_OK_MS) return;
+    // 两档判据、以及"空闲态不判 LINK_SLOW"的理由都在 power_policy.c（有单测）。
+    if (apm_conn_itvl_ok(s_capturing, ms)) return;
+
     // 已经有重试挂在定时器上就别叠一层，否则每次心跳都在发同一个请求。
     if (s_upd_timer && esp_timer_is_active(s_upd_timer)) return;
     if (now_ms() - s_upd_req_ms < APM_CONN_UPD_WATCHDOG_MS) return;
 
-    ESP_LOGW(TAG, "连接间隔 %u ms 撑不住 50 块/秒，重新请求快速参数", ms);
+    if (s_capturing) {
+        ESP_LOGW(TAG, "连接间隔 %u ms 撑不住 50 块/秒，重新请求快速参数", ms);
+    } else {
+        ESP_LOGI(TAG, "空闲间隔 %u ms 偏离 %d ms，重新请求省电档",
+                 ms, APM_CONN_ITVL_IDLE_MS);
+    }
     s_upd_tries = 0;
-    request_fast_conn();
+    request_conn_params();
+}
+
+// ---------------------------------------------------------------------------
+// 自适应发射功率
+// ---------------------------------------------------------------------------
+// 连接间隔 30 ms、每周期 1–2 个 165 B 包，发射占空比只有百分之几，所以降功率对
+// **平均电流**的影响是 mA 量级，不是省电主力（真正的大头是 modem sleep 与空闲档）。
+// 它的价值是"缩短不必要的射程"：桌面上 1 m 内不需要 +9 dBm。
+//
+// 三档映射与滞回全在 power_policy.c（有主机侧单测，含边界抖动那条）。
+// 这里只做两件事：把 dBm 翻成 NimBLE 的枚举、真的写寄存器。
+#define APM_TX_EVAL_MS 5000   // 5 s 评一次，别让 RSSI 抖动带着功率抖
+
+/// dBm -> NimBLE 功率枚举。三档之外的取值按最近的档处理（不 assert：
+/// 一次断言在固件里就是整机重启，为了一个功率档不值得）。
+static esp_power_level_t tx_level_from_dbm(int8_t dbm)
+{
+    if (dbm >= APM_TX_FAR_DBM)  return ESP_PWR_LVL_P9;
+    if (dbm >= APM_TX_MID_DBM)  return ESP_PWR_LVL_P3;
+    return ESP_PWR_LVL_N3;
+}
+
+static void apply_tx_power(int8_t dbm)
+{
+    esp_power_level_t lvl = tx_level_from_dbm(dbm);
+
+    // 广播与已建立的连接分开设：`ESP_BLE_PWR_TYPE_DEFAULT` 不覆盖已存在的连接句柄。
+    esp_err_t e1 = esp_ble_tx_power_set(ESP_BLE_PWR_TYPE_ADV, lvl);
+    esp_err_t e2 = esp_ble_tx_power_set(ESP_BLE_PWR_TYPE_CONN_HDL0, lvl);
+    if (e1 != ESP_OK || e2 != ESP_OK) {
+        // 失败时**不回滚 s_tx**：下一次评估会再试一次（滞回逻辑认为已经在目标档，
+        // 所以这里必须把状态退回去，否则永远不会重试）。
+        ESP_LOGW(TAG, "发射功率切到 %d dBm 失败（adv=%s conn=%s），维持原值",
+                 dbm, esp_err_to_name(e1), esp_err_to_name(e2));
+        apm_tx_init(&s_tx);   // 回到开机默认档，让下一轮重新评估
+        return;
+    }
+    ESP_LOGI(TAG, "发射功率 -> %d dBm", dbm);
+}
+
+/// 按当前 RSSI 选档。没有连接 / 读不到 RSSI 时什么都不做。
+static void update_tx_power(void)
+{
+    if (s_conn == BLE_HS_CONN_HANDLE_NONE) return;
+    uint32_t now = now_ms();
+    if (now - s_tx_eval_ms < APM_TX_EVAL_MS) return;
+    s_tx_eval_ms = now;
+
+    int8_t rssi = 0;
+    if (ble_gap_conn_rssi(s_conn, &rssi) != 0) return;
+
+    // 决策（含"升立刻降要两次"的方向不对称）在纯函数里，见 test_power_policy.c。
+    if (apm_tx_update(&s_tx, rssi)) {
+        ESP_LOGD(TAG, "RSSI=%d dBm，发射功率切到 %d dBm", rssi, s_tx.dbm);
+        apply_tx_power(s_tx.dbm);
+    }
+}
+
+/// 每次心跳调一次：校对连接参数 + 评估发射功率。
+void apm_link_housekeeping(void)
+{
+    apm_link_ensure_conn_params();
+    update_tx_power();
 }
 
 

@@ -13,6 +13,8 @@
 #include "protocol.h"
 
 #include "esp_log.h"
+#include "esp_pm.h"
+#include "esp_timer.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/queue.h"
 #include "freertos/task.h"
@@ -40,17 +42,51 @@ typedef struct {
 
 static QueueHandle_t s_evt_q;
 
-// 采集开关 = PTT 按住 或 PC 下发了 START。两者分开存：CTRL START 不应该被
-// 一次 OK 抬手顶掉，PTT 也不应该被 CTRL STOP 之后的抬手"复活"。
-static volatile bool s_ptt_held;
-static volatile bool s_forced_capture;
+// 采集开关 = PTT 按住 或 PC 下发了 START。两者的交互规则（谁不能顶掉谁）在
+// `power_policy.c` 的 apm_capture_* 里，**有主机侧单测**，别在这里重新实现一遍。
+//
+// 状态只有一个来源：`s_capture`。它**只由事件任务写**（按键与 CTRL 都在那条任务里），
+// 音频任务每块都要问"现在采不采"，所以额外维护一个 volatile 快照供它无锁读取。
+// 以前是两套独立的 volatile 旗子各自改，改一处漏一处就会档位卡在上一场 ——
+// 空闲仍按 30 ms 醒 33 次/秒（白费电），或采集中停在 80 ms（直接掉块）。
+static apm_capture_t   s_capture;
+static volatile bool   s_capturing_snapshot;
+// 进入采集态的时刻（ms），给 LINK_SLOW 的宽限期用：从空闲档 80 ms 切到快速档要等
+// 主机回 CONN_UPDATE，这段窗口里的实际间隔还是旧值，不能据此报慢档。
+// 0 表示"本次开机还没进过采集"。
+static volatile uint32_t s_capture_started_ms;
 static volatile uint32_t s_blocks_sent;
 static volatile uint16_t s_blocks_dropped;
 static volatile uint32_t s_blocks_congested;
 static volatile uint32_t s_blocks_muted;
 static volatile bool s_audio_error;
 
-static bool capture_on(void) { return s_forced_capture || s_ptt_held; }
+// 音频任务用的无锁读：只看快照，不碰 s_capture。
+static bool capture_on(void) { return s_capturing_snapshot; }
+
+// 进入采集至今多久（ms）。给 LINK_SLOW 的宽限期用；还没进过采集时返回 0。
+static uint32_t capture_elapsed_ms(void)
+{
+    if (s_capture_started_ms == 0) return 0;
+    return (uint32_t)(esp_timer_get_time() / 1000) - s_capture_started_ms;
+}
+
+// 每次改完 s_capture 都必须调一次：刷新快照 + 把档位同步给链路。
+// 两件事绑在一个出口里，就不会出现"改了状态但忘了切档"。
+static void sync_capture_mode(void)
+{
+    bool on = apm_capture_on(&s_capture);
+    bool was = s_capturing_snapshot;
+
+    // 从"不在采集"变成"在采集"的那一刻记时间戳：LINK_SLOW 的宽限期从这里起算。
+    // 只在上升沿记，采集中的 START/STOP 重复下发不会把宽限期一直往后推。
+    if (on && !was) {
+        s_capture_started_ms = (uint32_t)(esp_timer_get_time() / 1000);
+    }
+
+    s_capturing_snapshot = on;
+    apm_link_set_capturing(on);
+}
 
 // 一条会话 = 从开始采集到停止采集。计数器按会话归零，否则 STATUS 里的
 // dropped / sent 是**自设备启动起**的累计值，PC 端会把上一场的丢块算到这一场头上
@@ -102,7 +138,7 @@ static void on_ctrl(uint8_t type, const uint8_t *payload, uint16_t len)
 // ---------------------------------------------------------------------------
 // 链路状态回调：断链 = 上一条会话结束
 // ---------------------------------------------------------------------------
-// 这一段是 KI-005 的直接解药。以前 CTRL STOP 是唯一能清 s_forced_capture 的路径，
+// 这一段是 KI-005 的直接解药。以前 CTRL STOP 是唯一能清 forced 的路径，
 // 所以 PC 被 pkill / 蓝牙掉线 / 用户关掉 GUI 时，设备会带着 START 一直"在采集"：
 //   - 新客户端一订阅 AUDIO 就收到音频，而它还没发 START（GUI 那次 450 ms 16 条告警）；
 //   - STATUS 一直报 CAPTURING，PC 侧状态机对不上；
@@ -114,12 +150,14 @@ static void on_link_state(bool connected)
         ESP_LOGI(TAG, "链路已连接，等待 CTRL START 或 PTT");
         return;
     }
-    if (s_forced_capture || s_ptt_held) {
+    if (apm_capture_on(&s_capture)) {
         ESP_LOGW(TAG, "断链：清掉采集态（START=%d PTT=%d），不等 STOP",
-                 (int)s_forced_capture, (int)s_ptt_held);
+                 (int)s_capture.forced, (int)s_capture.ptt_held);
     }
-    s_forced_capture = false;
-    s_ptt_held = false;
+    apm_capture_disconnect(&s_capture);
+    // 断链后档位也回空闲：下一条连接按省电档起，等 START/PTT 再拉快。
+    // 链路自己也会在 DISCONNECT 里清 s_capturing，这里多调一次是幂等的。
+    sync_capture_mode();
 }
 
 // ---------------------------------------------------------------------------
@@ -218,10 +256,18 @@ static uint8_t current_flags(void)
     uint8_t flags = 0;
     if (apm_link_connected()) flags |= APM_FLAG_BLE_CONNECTED;
     if (apm_link_audio_ready()) flags |= APM_FLAG_AUDIO_SUBSCRIBED;
-    if (s_ptt_held) flags |= APM_FLAG_PTT_HELD;
+    if (s_capture.ptt_held) flags |= APM_FLAG_PTT_HELD;
     if (!apm_audio_ready() || s_audio_error) flags |= APM_FLAG_AUDIO_ERROR;
     // 连接间隔撑不住 50 块/秒时提前告诉 PC：这种会话的数据不能当音质/漂移结论用（KI-005）。
-    if (apm_link_conn_itvl_ms() > APM_CONN_ITVL_OK_MS) flags |= APM_FLAG_LINK_SLOW;
+    //
+    // **只在采集态判**，且进采集后有 2 s 宽限期：空闲档是 80 ms（省电），刚切过来时
+    // 实际间隔还是旧值，这时报慢档会让 PC 把整场健康会话判成 software-fail
+    // （2026-11-07 真机踩过：15 s、块率 50.0/s、零丢块的一份录音被标脏）。
+    // 判据在 power_policy.c（有单测）。
+    if (apm_link_slow_flag(capture_on(), apm_link_conn_itvl_ms(),
+                           capture_elapsed_ms())) {
+        flags |= APM_FLAG_LINK_SLOW;
+    }
     return flags;
 }
 
@@ -233,11 +279,17 @@ static void handle_event(const apm_evt_t *e)
 
         if (btn == APM_BTN_OK) {
             // OK 的按下/抬起默认就是 PTT 开关（见 config/README.md 的硬约束）。
+            // 状态迁移交给 apm_capture_ptt（有单测），这里只处理会话计数。
+            bool before = capture_on();
             if (ev == APM_BTN_EV_PRESS) {
-                if (!capture_on()) reset_session_counters();
-                s_ptt_held = true;
+                apm_capture_ptt(&s_capture, true);
+                if (!before) reset_session_counters();
+                // 按下就要快：档位必须在编码第一块之前切到快速档，
+                // 否则头 80 ms 的块只能挤在下一次连接事件里发（开场卡顿）。
+                sync_capture_mode();
             } else if (ev == APM_BTN_EV_RELEASE) {
-                s_ptt_held = false;
+                apm_capture_ptt(&s_capture, false);
+                sync_capture_mode();
             }
         }
         apm_link_notify_event(btn, ev, current_flags());
@@ -247,12 +299,15 @@ static void handle_event(const apm_evt_t *e)
     switch (e->ctrl_type) {
     case APM_MSG_START:
         if (!capture_on()) reset_session_counters();
-        s_forced_capture = true;
+        apm_capture_start_cmd(&s_capture);
+        sync_capture_mode();
         ESP_LOGI(TAG, "CTRL START（连接间隔 %u ms，MTU %u）",
                  apm_link_conn_itvl_ms(), apm_link_mtu());
         break;
     case APM_MSG_STOP:
-        s_forced_capture = false;
+        // 只清 forced，不动 ptt（见 power_policy.h 的语义说明）。
+        apm_capture_stop_cmd(&s_capture);
+        sync_capture_mode();
         ESP_LOGI(TAG, "CTRL STOP");
         break;
     case APM_MSG_PING:
@@ -299,10 +354,10 @@ static void status_task(void *arg)
     uint32_t last_log_ms = 0;
 
     for (;;) {
-        // 心跳顺带做两件事：把跑偏的连接间隔拉回快速档；把"推不动"的证据打到串口。
+        // 心跳顺带做两件事：把跑偏的连接间隔拉回当前档位；按 RSSI 评估发射功率。
         // KI-005 之所以查了两轮还只能靠猜，就是因为设备侧没有任何一行日志能说明
         // "块是采到了、编好了，卡在发不出去"。
-        apm_link_ensure_fast_conn();
+        apm_link_housekeeping();
 
         apm_link_notify_status(current_state(), current_flags(),
                                s_blocks_dropped, s_blocks_sent);
@@ -326,6 +381,41 @@ static void status_task(void *arg)
 }
 
 // ---------------------------------------------------------------------------
+// 电源管理：只开 DFS（160 / 80 / 40 MHz），**不开 tickless / light sleep**
+//
+// 为什么不开 light sleep：按键任务是 10 ms 硬轮询（去抖要连续 2 次采样），
+// 可睡窗口 ≤8 ms，进出 light sleep 的开销会吃掉大半收益；而 I2S 常开时它还持有
+// `ESP_PM_APB_FREQ_MAX` 锁（`i2s_channel_enable` 里 acquire），最低只能到 APB_MAX 档，
+// 本来就进不去 light sleep。取舍见 docs/ARCHITECTURE.md 的「功耗与省电」节。
+//
+// 三个数的关系（IDF `esp_pm_configure` 的算法）：
+//   CPU_MAX   = max_freq            = 160
+//   APB_MAX   = min(max, APB 上限)  = min(160, 80) = 80   ← BT 要求 modem APB ≥ 80
+//   APB_MIN   = min_freq            = 40
+// 实际能降到哪一档由**锁**决定：I2S 常开时它持有 APB_FREQ_MAX，所以稳态落在 80 MHz。
+// min_freq 仍写 40 而不是 80：这样将来若决定空闲关 codec（I2S 停掉），DFS 能立刻
+// 降到 40 MHz，不需要再改这一处。现在写 80 只是把将来的路提前堵死。
+#define APM_CPU_MAX_MHZ 160
+#define APM_CPU_MIN_MHZ 40
+
+static void power_mgmt_init(void)
+{
+    esp_pm_config_t cfg = {
+        .max_freq_mhz = APM_CPU_MAX_MHZ,
+        .min_freq_mhz = APM_CPU_MIN_MHZ,
+        .light_sleep_enable = false,
+    };
+    esp_err_t err = esp_pm_configure(&cfg);
+    if (err != ESP_OK) {
+        // 失败不阻塞启动：最坏情况就是恒 160 MHz，功能不受影响，只是费电。
+        ESP_LOGW(TAG, "电源管理配置失败: %s（CPU 将恒 %d MHz）",
+                 esp_err_to_name(err), APM_CPU_MAX_MHZ);
+        return;
+    }
+    ESP_LOGI(TAG, "电源管理：CPU %d/%d MHz，light sleep 关闭",
+             APM_CPU_MAX_MHZ, APM_CPU_MIN_MHZ);
+}
+
 void app_main(void)
 {
     esp_err_t err = nvs_flash_init();
@@ -334,6 +424,9 @@ void app_main(void)
         err = nvs_flash_init();
     }
     ESP_ERROR_CHECK(err);
+
+    // 尽早配好：晚配的话开机那条 CPU 160 MHz 会一直跑到这里。
+    power_mgmt_init();
 
     s_evt_q = xQueueCreate(APM_EVT_QUEUE_LEN, sizeof(apm_evt_t));
     if (!s_evt_q) {

@@ -40,3 +40,25 @@ CONFIG_BT_NIMBLE_MSYS_1_BLOCK_COUNT=24
 # ---- 音频 ----
 # esp_codec_dev 由组件管理器按 main/idf_component.yml 拉取。
 CONFIG_ESP_MAIN_TASK_STACK_SIZE=4096
+
+# ---- 省电 ----
+# 取舍与实测口径见 docs/ARCHITECTURE.md 的「功耗与省电」节。这里只写"为什么"。
+#
+# BLE modem sleep：事件之间关 RF/PHY/BB。这是最大的一项省电来源。
+# 不开它时控制器在连接事件之间也保持射频供电，连接态平均电流是开着的数倍。
+CONFIG_BT_CTRL_MODEM_SLEEP=y
+CONFIG_BT_CTRL_MODEM_SLEEP_MODE_1=y
+# 低功耗时钟选主晶振：本板 CONFIG_RTC_CLK_SRC_INT_RC=y，没有外部 32k 晶振的证据。
+# 选 32k 而板上没有时，初始化会静默回退到主晶振（IDF 文档明说），日志与配置对不上；
+# 直接写主晶振，行为与配置一致。将来确认板上有 32k 再换，能再降一档。
+CONFIG_BT_CTRL_LPCLK_SEL_MAIN_XTAL=y
+# 发射功率不再固定在 +9 dBm：运行期按 RSSI 三档调（link.c 的 update_tx_power）。
+# 这里保留 +9 作为开机默认值，连上之后 5 s 内会被自适应接管。
+CONFIG_BT_CTRL_DFT_TX_POWER_LEVEL_P9=y
+
+# DFS：空闲时 CPU 160 -> 80 MHz。**不开 tickless**（按键 10 ms 轮询会把它切碎，
+# 且 I2S 常开时持有 APB_FREQ_MAX 锁，本来就进不了 light sleep）。
+CONFIG_PM_ENABLE=y
+CONFIG_PM_DFS_INIT_AUTO=n
+# light sleep 需要 tickless，这里显式关掉，避免以后误开。
+CONFIG_FREERTOS_USE_TICKLESS_IDLE=n

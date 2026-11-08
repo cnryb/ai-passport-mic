@@ -32,6 +32,7 @@
 
 #include "driver/ledc.h"
 #include "esp_log.h"
+#include "esp_timer.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
 
@@ -94,6 +95,10 @@ static uint8_t  s_soc;      // 最近一次成功读数
 static bool     s_have_soc; // 是否读到过至少一次
 static bool     s_low;
 static uint8_t  s_last_raw[2];  // 最近一次读到的 0x04/0x05 原始字节，只给日志看
+// 电量任务句柄：按键回调要靠它把"该闪了"这件事立刻叫醒任务。
+// 平时任务睡 1 s，只有闪烁那 600 ms 才 50 ms 一步 —— 按键不通知的话，
+// 用户按下到看见闪烁最多要等 1 s，观感像"没反应"。
+static TaskHandle_t s_batt_task;
 
 bool apm_battery_ready(void) { return s_have_soc; }
 uint8_t apm_battery_soc(void) { return s_soc; }
@@ -476,6 +481,8 @@ void apm_battery_on_button(void)
     // 低电量 + 背光可用才闪；其他情况按键不点亮背光（平时零功耗）。
     if (s_low && s_have_soc) {
         s_flash_steps = 12;
+        // 立刻叫醒电量任务：平时它睡 1 s，不通知的话用户按下到看见闪烁最多等 1 s。
+        if (s_batt_task) xTaskNotifyGive(s_batt_task);
     }
 }
 
@@ -483,11 +490,32 @@ static void battery_task(void *arg)
 {
     (void)arg;
     uint8_t last_notified = 0xFF;  // 0xFF 不可能来自合法读数，保证首读必通知
-    uint32_t tick = 0;
     bool first = true;
+    // 时间基准用毫秒，不用"循环次数"：轮询周期在 1 s（平时）与 50 ms（闪烁时）之间切换，
+    // 拿 tick 计数算节流会让阈值跟着周期漂。
+    uint64_t boot_us = esp_timer_get_time();
+    uint64_t last_read_us = 0;
+    uint64_t last_warn_us = 0;
+    bool warned = false;
+
+    // 平时 1 s 醒一次就够（芯片内部也是 1 s 刷新）；只有闪烁那 600 ms 才需要 50 ms。
+    // 按键会主动通知唤醒，所以"按下要等最多 1 s 才闪"这个体验问题不存在。
+    const uint32_t APM_GUARD_MS = 5000;    // 开机宽限 5 s（FastCali 首次估算要 2–3 s）
+    const uint32_t APM_WARN_MS  = 60000;   // "电量不可用"每 60 s 一条
+    const uint32_t APM_READ_MS  = 1000;    // SOC 采样周期
 
     for (;;) {
-        if (tick % 20 == 0) {  // 20 步 * 50 ms = 1 s
+        // 有闪烁请求时按 50 ms 步进，否则睡到下一次采样；按键事件可提前唤醒。
+        bool flashing = (s_flash_steps > 0 && s_low);
+        uint32_t wait_ms = flashing ? APM_BL_STEP_MS : APM_READ_MS;
+        xTaskNotifyWait(0, 0, NULL, pdMS_TO_TICKS(wait_ms));
+
+        uint64_t now_us = esp_timer_get_time();
+        uint32_t since_boot_ms = (uint32_t)((now_us - boot_us) / 1000);
+        uint32_t since_read_ms = (uint32_t)((now_us - last_read_us) / 1000);
+
+        if (since_read_ms >= APM_READ_MS) {
+            last_read_us = now_us;
             uint8_t soc = 0;
             esp_err_t err = apm_battery_read(&soc);
             if (err == ESP_OK) {
@@ -535,12 +563,16 @@ static void battery_task(void *arg)
                 // 保持上一次的值，不把"读不到"当"没电"上报。
                 // 每 60 s 一条：既能看到"一直没恢复"，又不会把串口刷满。
                 // 只打一次是不行的——那会让"后来 I2C 全挂了"看起来像"一直静默正常"。
-                static uint32_t last_warn;
+                //
                 // 开机宽限 5 s：FastCali 的首次估算要 2–3 s（实测写入 profile 后
                 // 2.6 s 才出 77%）。这段时间报"从未读到过有效电量"是误报，
                 // 会被当成故障写进排查记录——KI-007 就是这么绕远的。
-                if (tick >= 100 && (last_warn == 0 || tick - last_warn >= 1200)) {
-                    last_warn = tick ? tick : 1;
+                uint32_t since_warn_ms = warned
+                    ? (uint32_t)((now_us - last_warn_us) / 1000)
+                    : since_boot_ms;
+                if (since_boot_ms >= APM_GUARD_MS && since_warn_ms >= APM_WARN_MS) {
+                    warned = true;
+                    last_warn_us = now_us;
                     uint32_t raw = 0;
                     bool vcell_ok = vcell_raw(&raw);
                     uint32_t mv = vcell_ok ? raw * APM_CW2017_VCELL_UV_PER_LSB / 10000 : 0;
@@ -570,9 +602,6 @@ static void battery_task(void *arg)
             bl_duty(0);
             s_flash_steps = 0;
         }
-
-        tick++;
-        vTaskDelay(pdMS_TO_TICKS(APM_BL_STEP_MS));
     }
 }
 
@@ -583,7 +612,7 @@ esp_err_t apm_battery_start(void)
 
     bl_init();
 
-    if (xTaskCreate(battery_task, "apm_batt", 3072, NULL, 4, NULL) != pdPASS) {
+    if (xTaskCreate(battery_task, "apm_batt", 3072, NULL, 4, &s_batt_task) != pdPASS) {
         ESP_LOGE(TAG, "电量任务创建失败");
         return ESP_FAIL;
     }
