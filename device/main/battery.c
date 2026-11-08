@@ -27,10 +27,11 @@
 #include "battery.h"
 
 #include "audio.h"
+#include "battery.h"
 #include "board.h"
 #include "link.h"
+#include "screen.h"
 
-#include "driver/ledc.h"
 #include "esp_log.h"
 #include "esp_timer.h"
 #include "freertos/FreeRTOS.h"
@@ -85,20 +86,12 @@ static const uint8_t s_profile[APM_CW2017_PROFILE_LEN] = {
     0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x5C,
 };
 
-// 峰值占空比取满量程的 APM_BL_BREATH_PEAK_PCT%（约 4%）——夜里可辨、白天观感待
-// 真机核对。短闪节奏见 battery_task 注释。
-#define APM_BL_STEP_MS        50
-
 static i2c_master_dev_handle_t s_cw;
 static bool     s_ready;
 static uint8_t  s_soc;      // 最近一次成功读数
 static bool     s_have_soc; // 是否读到过至少一次
 static bool     s_low;
 static uint8_t  s_last_raw[2];  // 最近一次读到的 0x04/0x05 原始字节，只给日志看
-// 电量任务句柄：按键回调要靠它把"该闪了"这件事立刻叫醒任务。
-// 平时任务睡 1 s，只有闪烁那 600 ms 才 50 ms 一步 —— 按键不通知的话，
-// 用户按下到看见闪烁最多要等 1 s，观感像"没反应"。
-static TaskHandle_t s_batt_task;
 
 bool apm_battery_ready(void) { return s_have_soc; }
 uint8_t apm_battery_soc(void) { return s_soc; }
@@ -406,57 +399,26 @@ esp_err_t apm_battery_read(uint8_t *soc)
 }
 
 // ---------------------------------------------------------------------------
-// 背光：LEDC PWM。不用时占空比恒 0（等效熄灭，不破坏省电初衷）。
+// 背光：**所有权已经交给 screen.c**（它要同时管屏幕亮灭与低电量提示）。
+// 这里只保留"低电量时按任意键申请一次短闪"的入口。
 // ---------------------------------------------------------------------------
-static void bl_init(void)
+void apm_battery_on_button(void)
 {
-    ledc_timer_config_t timer = {
-        .speed_mode      = LEDC_LOW_SPEED_MODE,
-        .timer_num       = (ledc_timer_t)APM_BL_LEDC_TIMER,
-        .duty_resolution = (ledc_timer_bit_t)APM_BL_LEDC_RESOLUTION,
-        .freq_hz         = APM_BL_LEDC_FREQ_HZ,
-        .clk_cfg         = LEDC_AUTO_CLK,
-    };
-    esp_err_t err = ledc_timer_config(&timer);
-    if (err != ESP_OK) {
-        ESP_LOGE(TAG, "背光 LEDC timer 配置失败: %s（指示灯不可用）", esp_err_to_name(err));
-        return;
+    // 低电量 + 有读数才闪。屏幕层会自己判断"亮屏时不闪"（亮屏时屏幕上就写着电量，
+    // 再闪背光是多余的）。
+    if (s_low && s_have_soc) {
+        apm_screen_blink_low_battery();
     }
-
-    ledc_channel_config_t chan = {
-        .gpio_num   = APM_BL_GPIO,
-        .speed_mode = LEDC_LOW_SPEED_MODE,
-        .channel    = (ledc_channel_t)APM_BL_LEDC_CHANNEL,
-        .timer_sel  = (ledc_timer_t)APM_BL_LEDC_TIMER,
-        .duty       = 0,
-        .hpoint     = 0,
-    };
-    err = ledc_channel_config(&chan);
-    if (err != ESP_OK) {
-        ESP_LOGE(TAG, "背光 LEDC channel 配置失败: %s", esp_err_to_name(err));
-    }
-}
-
-static void bl_duty(uint32_t duty)
-{
-    uint32_t max = (1u << APM_BL_LEDC_RESOLUTION) - 1;
-    if (duty > max) duty = max;
-    ledc_set_duty(LEDC_LOW_SPEED_MODE, (ledc_channel_t)APM_BL_LEDC_CHANNEL, duty);
-    ledc_update_duty(LEDC_LOW_SPEED_MODE, (ledc_channel_t)APM_BL_LEDC_CHANNEL);
 }
 
 // ---------------------------------------------------------------------------
 // 电量任务：1 s 采样 SOC（芯片内部也是 1 s 刷新），变化时 BLE 上报。
 //
-// 背光是**被动查询式**指示，不是常驻呼吸：平时占空比恒 0，零功耗；
-// 只有低电量时用户按任意键，才短闪 3 次（每次亮 50 ms、间隔 150 ms，约 600 ms），
-// 总耗电可忽略。理由：屏幕背光持续点亮会加速耗电，"没电了还更费电"不可接受；
-// 按键查询只在用户主动想知道电量的时刻花一点电。峰值占空比取满量程的
-// APM_BL_BREATH_PEAK_PCT%（约 4%），真机观感待验收。
+// **背光不在这里管了**：屏幕模块接管背光之后，"低电量提示"变成屏幕内容的一部分
+// （亮屏时直接写着电量，灭屏时按任意键让背光短闪一次）。
+// 这里只负责"读得到、读不到怎么办"与"变化时上报"。
 // I2C 偶发失败按"维持上次状态"处理，不抖动。
 // ---------------------------------------------------------------------------
-static volatile uint32_t s_flash_steps;  // 剩余闪烁步数（50 ms 一步），0 = 不闪
-
 /// 读一次电芯电压原始值（14 位）。失败返回 false。
 static bool vcell_raw(uint32_t *raw14)
 {
@@ -466,49 +428,26 @@ static bool vcell_raw(uint32_t *raw14)
     return true;
 }
 
-static uint32_t bl_flash_duty(uint32_t step_remaining)
-{
-    // 一步 50 ms：亮 1 步、灭 3 步为一组，共 3 组（12 步 ≈ 600 ms）。
-    // 步计数从高往低走：remaining % 4 == 0 的那一步正好落在每个"亮"位上。
-    if (step_remaining == 0) return 0;
-    uint32_t phase = (step_remaining - 1) % 4;
-    if (phase != 0) return 0;
-    return (uint32_t)APM_BL_BREATH_PEAK_PCT * ((1u << APM_BL_LEDC_RESOLUTION) - 1) / 100;
-}
-
-void apm_battery_on_button(void)
-{
-    // 低电量 + 背光可用才闪；其他情况按键不点亮背光（平时零功耗）。
-    if (s_low && s_have_soc) {
-        s_flash_steps = 12;
-        // 立刻叫醒电量任务：平时它睡 1 s，不通知的话用户按下到看见闪烁最多等 1 s。
-        if (s_batt_task) xTaskNotifyGive(s_batt_task);
-    }
-}
-
 static void battery_task(void *arg)
 {
     (void)arg;
     uint8_t last_notified = 0xFF;  // 0xFF 不可能来自合法读数，保证首读必通知
     bool first = true;
-    // 时间基准用毫秒，不用"循环次数"：轮询周期在 1 s（平时）与 50 ms（闪烁时）之间切换，
-    // 拿 tick 计数算节流会让阈值跟着周期漂。
+    // 时间基准用毫秒，不用"循环次数"：拿 tick 计数算节流会让阈值跟着周期漂。
     uint64_t boot_us = esp_timer_get_time();
     uint64_t last_read_us = 0;
     uint64_t last_warn_us = 0;
     bool warned = false;
 
-    // 平时 1 s 醒一次就够（芯片内部也是 1 s 刷新）；只有闪烁那 600 ms 才需要 50 ms。
-    // 按键会主动通知唤醒，所以"按下要等最多 1 s 才闪"这个体验问题不存在。
+    // 1 s 醒一次就够（芯片内部也是 1 s 刷新）。
     const uint32_t APM_GUARD_MS = 5000;    // 开机宽限 5 s（FastCali 首次估算要 2–3 s）
     const uint32_t APM_WARN_MS  = 60000;   // "电量不可用"每 60 s 一条
     const uint32_t APM_READ_MS  = 1000;    // SOC 采样周期
 
     for (;;) {
-        // 有闪烁请求时按 50 ms 步进，否则睡到下一次采样；按键事件可提前唤醒。
-        bool flashing = (s_flash_steps > 0 && s_low);
-        uint32_t wait_ms = flashing ? APM_BL_STEP_MS : APM_READ_MS;
-        xTaskNotifyWait(0, 0, NULL, pdMS_TO_TICKS(wait_ms));
+        // 采样周期恒 1 s。按键唤醒用不上了（背光归屏幕层），但保留 notify 位以待
+        // 将来"立刻重读一次"这类需求，代价只有一次空唤醒。
+        xTaskNotifyWait(0, 0, NULL, pdMS_TO_TICKS(APM_READ_MS));
 
         uint64_t now_us = esp_timer_get_time();
         uint32_t since_boot_ms = (uint32_t)((now_us - boot_us) / 1000);
@@ -525,7 +464,7 @@ static void battery_task(void *arg)
                 if (low != s_low) {
                     s_low = low;
                     ESP_LOGI(TAG, "电量 %u%%%s", soc,
-                             low ? "（低电量：按任意键背光短闪提示）" : "");
+                             low ? "（低电量：屏幕上会高亮显示）" : "");
                 }
                 if (first) {
                     // 首读打一条 INFO：现场判断"到底读到了什么"时，这是唯一能带回来的证据。
@@ -592,16 +531,6 @@ static void battery_task(void *arg)
                 }
             }
         }
-
-        // 闪烁请求由按键回调置位，这里按步消费；走完或非低电都回到 0。
-        uint32_t remaining = s_flash_steps;
-        if (remaining > 0 && s_low) {
-            bl_duty(bl_flash_duty(remaining));
-            s_flash_steps = remaining - 1;
-        } else {
-            bl_duty(0);
-            s_flash_steps = 0;
-        }
     }
 }
 
@@ -610,9 +539,7 @@ esp_err_t apm_battery_start(void)
     esp_err_t err = apm_battery_init();
     if (err != ESP_OK) return err;
 
-    bl_init();
-
-    if (xTaskCreate(battery_task, "apm_batt", 3072, NULL, 4, &s_batt_task) != pdPASS) {
+    if (xTaskCreate(battery_task, "apm_batt", 3072, NULL, 4, NULL) != pdPASS) {
         ESP_LOGE(TAG, "电量任务创建失败");
         return ESP_FAIL;
     }

@@ -34,3 +34,15 @@ echo "== power_policy =="
     "$root/device/test/test_power_policy.c" \
     -o "$out_dir/test_power_policy"
 "$out_dir/test_power_policy"
+
+echo
+echo "== screen =="
+# 屏幕渲染与亮灭状态机（2026-11-08 落地）：UTF-8 解码、缺字形兜底、越界裁剪、
+# 逐带渲染与整屏渲染等价、长按切屏、采集中不许熄屏、标签截断落在字符边界上。
+# 这些原先属于"只能上真机按一下看看"的类别。
+"$cc_bin" "${cflags[@]}" \
+    "$root/device/main/screen_render.c" \
+    "$root/device/main/screen_state.c" \
+    "$root/device/test/test_screen_render.c" \
+    -lm -o "$out_dir/test_screen_render"
+"$out_dir/test_screen_render"

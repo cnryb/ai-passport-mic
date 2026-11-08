@@ -18,6 +18,7 @@ status_structure=SKIP
 status_links=SKIP
 status_scripts=SKIP
 status_proto=SKIP
+status_font=SKIP
 status_vectors=SKIP
 status_desktop=SKIP
 status_env=SKIP
@@ -110,15 +111,17 @@ fi
 
 echo
 echo "== 固件主机侧单测 =="
-# 这是固件侧唯一能真正跑起来的检查：编译通过不等于 CRC / 帧 / ADPCM / 省电逻辑正确。
-# 覆盖 protocol（协议）与 power_policy（两档连接参数、LINK_SLOW 判据、采集态状态机、
-# 发射功率滞回）两个纯逻辑模块。
+# 这是固件侧唯一能真正跑起来的检查：编译通过不等于 CRC / 帧 / ADPCM / 省电逻辑 /
+# 屏幕渲染正确。覆盖三个纯逻辑模块：
+#   protocol      协议（CRC / 帧 / ADPCM / 毛刺 / PING-PONG / SET_KEY_LABELS）
+#   power_policy  两档连接参数、LINK_SLOW 判据、采集态状态机、发射功率滞回
+#   screen        渲染（UTF-8 / 缺字形 / 越界 / 逐带等价）与亮灭状态机
 proto_log="${TMPDIR:-/tmp}/ai-passport-mic-verify-proto.log"
 if "$root/scripts/test-protocol.sh" >"$proto_log" 2>&1; then
   status_proto=PASS
-  # 两个目标各一行 "N passed, M failed"，加起来报总数，别只报最后一行的数。
+  # 三个目标各一行 "N passed, M failed"，加起来报总数，别只报最后一行的数。
   total=$(awk '/^[0-9]+ passed, / {s+=$1} END {print s+0}' "$proto_log")
-  echo "OK   协议 44 项 + 省电逻辑（合计 $total passed）"
+  echo "OK   固件纯逻辑单测（合计 $total passed）"
 else
   status_proto=FAIL
   failed=1
@@ -128,8 +131,24 @@ fi
 rm -f "$proto_log"
 
 echo
-echo "== 跨端向量 =="
-# 向量是固件 C 实现导出的。C 改了没重生成，Rust 对拍就会拿旧数据当"通过"。
+echo "== 屏幕点阵字库 =="
+# 字库必须与 screen_texts.h 的文案一一对应。加了新文案却忘了重新生成字库，
+# 屏幕上就是一个方框 —— 那种缺陷只有上真机才看得见，所以在这里拦。
+status_font=SKIP
+font_log="${TMPDIR:-/tmp}/ai-passport-mic-verify-font.log"
+if python3 "$root/scripts/gen-font-subset.py" --check >"$font_log" 2>&1; then
+  status_font=PASS
+  sed 's/^OK   /     /' "$font_log"
+else
+  status_font=FAIL
+  failed=1
+  echo "FAIL 字库与文案不一致:"
+  sed 's/^/      /' "$font_log" | head -10
+fi
+rm -f "$font_log"
+
+echo
+echo "== 跨端向量 =="# 向量是固件 C 实现导出的。C 改了没重生成，Rust 对拍就会拿旧数据当"通过"。
 vec_log="${TMPDIR:-/tmp}/ai-passport-mic-verify-vectors.log"
 if "$root/scripts/gen-protocol-vectors.sh" --check >"$vec_log" 2>&1; then
   status_vectors=PASS
@@ -186,12 +205,13 @@ printf 'Structure : %s\n' "$status_structure"
 printf 'Docs links: %s\n' "$status_links"
 printf 'Scripts   : %s\n' "$status_scripts"
 printf 'Protocol  : %s\n' "$status_proto"
+printf 'Font      : %s\n' "$status_font"
 printf 'Vectors   : %s\n' "$status_vectors"
 printf 'Desktop   : %s\n' "$status_desktop"
 printf 'Env       : %s\n' "$status_env"
 printf 'Firmware  : SKIP（idf.py build 不在本脚本内，改固件后跑 ./scripts/build-firmware.sh）\n'
 printf 'GUI build : SKIP（tauri 依赖重，单独跑 ./scripts/build-gui.sh）\n'
-printf 'Unverified: 关麦兜底只验了 1 min 触发（机制正确），10 min 默认口径未跑、UI 上改时长未点过、KI-005 两条护栏只验了"不误伤正常会话"（"拦得住脏会话"仍只到单测，本机造不出慢档）、按键电压窗口未用万用表复核（分类结果已验）、端到端声学延迟、G2 的 CPU/内存两项（2026-11-07 release 包实测 CPU 14.2%%、内存 208 MB，均超口径；前端 59.8 fps 已 PASS；欠载口径已改为阈值型，600 s 实测 1.0 次/分 → PASS；用 ./scripts/test-gui-perf.sh 复现）、GUI 真机验收（G4 场景矩阵）、M6 空片首烧与中断恢复；GUI 扫描的自动路径见 docs/GUI_IMPLEMENTATION_LOG.md §14.5\n'
+printf 'Unverified: 设备屏幕的**观感与手势**（初始化/自动熄屏/标签下发已于 2026-11-08 真机 PASS；未验：面板画面对不对（反色/镜像/观感）、长按切屏与灭屏唤醒的手感、ST7789 是否真进 Sleep In、背光电流收益——都要人眼看+手按+量电流）、关麦兜底只验了 1 min 触发（机制正确），10 min 默认口径未跑、UI 上改时长未点过、KI-005 两条护栏只验了"不误伤正常会话"（"拦得住脏会话"仍只到单测，本机造不出慢档）、按键电压窗口未用万用表复核（分类结果已验）、端到端声学延迟、G2 的 CPU/内存两项（2026-11-07 release 包实测 CPU 14.2%%、内存 208 MB，均超口径；前端 59.8 fps 已 PASS；欠载口径已改为阈值型，600 s 实测 1.0 次/分 → PASS；用 ./scripts/test-gui-perf.sh 复现）、GUI 真机验收（G4 场景矩阵）、M6 空片首烧与中断恢复；GUI 扫描的自动路径见 docs/GUI_IMPLEMENTATION_LOG.md §14.5\n'
 printf 'Known issues: docs/KNOWN_ISSUES.md（KI-001 毛刺根因未定位，不要写成已解决）\n'
 
 if (( failed )); then

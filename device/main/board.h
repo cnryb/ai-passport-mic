@@ -20,10 +20,46 @@
 // ---------------------------------------------------------------------------
 
 // ---------------------------------------------------------------------------
-// 显示（第一版不驱动屏幕，仅保留事实，避免与 GPIO 复用冲突）
-// 注意：GPIO21 是屏幕背光，所以控制台必须走 USB-Serial-JTAG，不能用 UART0。
+// 显示：ST7789P3 240x320，4 线 SPI（SPI2_HOST）
+//
+// 引脚与"为什么要用 mode 0 / 为什么 RST 是 -1"来自上游 FoloToy BSP
+// （components/bsp/include/bsp_pins.h，MIT）。
 // ---------------------------------------------------------------------------
-#define APM_LCD_BL_GPIO 21
+#define APM_LCD_SPI_HOST    SPI2_HOST
+#define APM_LCD_MOSI_GPIO   9
+#define APM_LCD_SCLK_GPIO   8
+#define APM_LCD_CS_GPIO     1
+#define APM_LCD_DC_GPIO     20
+#define APM_LCD_RST_GPIO    (-1)      // -1 = 未接 MCU，走 SWRESET
+#define APM_LCD_PCLK_HZ     (80 * 1000 * 1000)
+#define APM_LCD_SPI_MODE    0         // ST7789 SCK 空闲低、上升沿采样
+#define APM_LCD_INVERT      1         // 本板屏幕出厂需 INVON；换屏呈负片时改 0
+#define APM_LCD_W           240
+#define APM_LCD_H           320
+// 刷屏行缓冲高度：每次推 16 行（240 × 16 × 2 = 7.5 KB）。
+// 不存整帧——240×320×2 = 150 KB，C3 的 RAM 放不下。
+#define APM_LCD_BAND_ROWS   16
+//
+// 注意：**GPIO21 是背光**，所以控制台必须走 USB-Serial-JTAG，不能用 UART0
+// （见 sdkconfig.defaults）。**RST 未接 MCU**（硬接 3.3V），复位只能靠
+// esp_lcd_panel_reset() 走 SWRESET 软复位。本板的屏出厂即需反色
+// （参考例程 TFT_init() 末尾无条件发 0x21 INVON），故 APM_LCD_INVERT = 1。
+
+// ---------------------------------------------------------------------------
+// 背光：GPIO21，LEDC PWM（参数来自上游 BSP）。**所有权归 screen.c**。
+// battery.c 原来的低电量短闪改成向 screen 申请（apm_screen_blink_low_battery）。
+// 充电口旁的充电指示灯是充电 IC 硬件直驱，MCU 不可控。
+// ---------------------------------------------------------------------------
+#define APM_BL_GPIO            21
+#define APM_BL_LEDC_TIMER      0          // LEDC_TIMER_0
+#define APM_BL_LEDC_CHANNEL    0          // LEDC_CHANNEL_0
+#define APM_BL_LEDC_RESOLUTION 10         // bit，最大占空比 1023
+#define APM_BL_LEDC_FREQ_HZ    5000
+// 亮屏时的背光占空比（满量程的百分比）。80% 而不是 100%：
+// 这块屏在 100% 下近看偏刺眼，80% 足够看清且省一点背光电。
+#define APM_BL_ON_PCT          80
+// 低电量短闪的峰值占空比（灭屏时的被动提示，只要"看得见"）。
+#define APM_BL_FLASH_PCT       20
 
 // ---------------------------------------------------------------------------
 // I2C：ES8311 音频 codec 与 CW2017 电量计共用一条总线

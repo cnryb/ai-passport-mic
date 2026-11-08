@@ -446,9 +446,12 @@ static int gap_event(struct ble_gap_event *event, void *arg)
                          desc.conn_itvl * 1.25, desc.conn_latency,
                          (unsigned)desc.supervision_timeout * 10);
             }
-            if (apm_link_conn_itvl_ms() > APM_CONN_ITVL_OK_MS) {
-                ESP_LOGW(TAG, "连接间隔 %u ms 仍然超过 %d ms，50 块/秒会推不动",
-                         apm_link_conn_itvl_ms(), APM_CONN_ITVL_OK_MS);
+            // 判据必须按**当前档位**取（power_policy.c 的 apm_conn_itvl_ok）。
+            // 以前这里写死 40 ms，空闲档（80 ms）每次连上都会误报
+            // "50 块/秒会推不动" —— 而那一刻根本没在采集，80 ms 正是期望值。
+            if (!apm_conn_itvl_ok(s_capturing, apm_link_conn_itvl_ms())) {
+                ESP_LOGW(TAG, "连接间隔 %u ms 超出%s档判据，50 块/秒会推不动",
+                         apm_link_conn_itvl_ms(), s_capturing ? "采集" : "空闲");
             }
         } else {
             refresh_itvl();

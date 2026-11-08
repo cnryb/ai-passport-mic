@@ -418,6 +418,17 @@ impl Link {
         self.send_ctrl(msg::SET_GAIN, &[db as u8]).await
     }
 
+    /// 把按键标签推到设备屏幕（`SET_KEY_LABELS`）。
+    ///
+    /// 设备不认识动作语义，只显示这里给的文本 —— 键名翻译在 PC 侧
+    /// （`apm_protocol::device_labels::labels_from_keymap`）。
+    ///
+    /// **失败不该影响连接**：屏幕标签是锦上添花，旧固件（没有 `0x05`）会直接忽略这帧。
+    pub async fn send_key_labels(&self, labels: &apm_protocol::device_labels::KeyLabels) -> Result<()> {
+        let payload = labels.encode().map_err(|e| anyhow!("组标签载荷失败: {e}"))?;
+        self.send_ctrl(msg::SET_KEY_LABELS, &payload).await
+    }
+
     /// 读一次 STATUS 特征值（也可能从通知里来）。
     pub async fn read_status(&self) -> Result<Status> {
         let value = self

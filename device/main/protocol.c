@@ -275,3 +275,73 @@ size_t apm_build_pong(uint8_t *payload, size_t cap, const uint8_t *ping_payload,
     memcpy(payload, ping_payload, 4);
     return 4;
 }
+
+// ---------------------------------------------------------------------------
+// SET_KEY_LABELS
+// ---------------------------------------------------------------------------
+bool apm_key_labels_decode(const uint8_t *payload, size_t len, apm_key_labels_t *out)
+{
+    if (!payload || !out || len < 3) return false;
+
+    memset(out, 0, sizeof *out);
+    out->pc_pid      = payload[0];
+    out->capture_btn = payload[1];
+    out->count       = payload[2];
+
+    // count 超过 3 说明对端实现有误。**整帧拒绝**而不是"取前 3 条"：
+    // 取前 3 条会让一份错帧看起来像成功了，问题被藏起来。
+    if (out->count > APM_KEY_LABEL_MAX_ITEMS) return false;
+
+    size_t pos = 3;
+    for (uint8_t i = 0; i < out->count; i++) {
+        if (pos + 2 > len) return false;
+        uint8_t btn = payload[pos];
+        uint8_t tlen = payload[pos + 1];
+        pos += 2;
+
+        if (pos + tlen > len) return false;
+        if (btn > APM_BTN_OK) return false;
+        // 同一帧里同一个键出现两次：后一条该覆盖前一条还是报错？**报错**。
+        // 一份自相矛盾的帧不该猜对端的意图。
+        for (uint8_t j = 0; j < i; j++) {
+            if (out->items[j].btn == btn) return false;
+        }
+        if (tlen > APM_KEY_LABEL_MAX_BYTES) return false;
+
+        out->items[i].btn = btn;
+        out->items[i].len = tlen;
+        if (tlen) memcpy(out->items[i].text, &payload[pos], tlen);
+        pos += tlen;
+    }
+
+    // 尾部有多余字节：长度声明与实际内容不符，同样拒绝。
+    if (pos != len) return false;
+    return true;
+}
+
+size_t apm_key_labels_encode(const apm_key_labels_t *in, uint8_t *out, size_t out_cap)
+{
+    if (!in || !out || in->count > APM_KEY_LABEL_MAX_ITEMS) return 0;
+
+    size_t need = 3;
+    for (uint8_t i = 0; i < in->count; i++) {
+        if (in->items[i].btn > APM_BTN_OK) return 0;
+        if (in->items[i].len > APM_KEY_LABEL_MAX_BYTES) return 0;
+        need += 2u + in->items[i].len;
+    }
+    if (need > out_cap || need > APM_FRAME_MAX_PAYLOAD) return 0;
+
+    out[0] = in->pc_pid;
+    out[1] = in->capture_btn;
+    out[2] = in->count;
+    size_t pos = 3;
+    for (uint8_t i = 0; i < in->count; i++) {
+        out[pos++] = in->items[i].btn;
+        out[pos++] = in->items[i].len;
+        if (in->items[i].len) {
+            memcpy(&out[pos], in->items[i].text, in->items[i].len);
+            pos += in->items[i].len;
+        }
+    }
+    return pos;
+}

@@ -153,3 +153,46 @@ fn block_header_exposes_seq_and_state() {
     );
     assert_eq!(state.index, case["state_before"]["index"].as_i64().unwrap() as i8);
 }
+
+/// `SET_KEY_LABELS`：C 侧编出的载荷与整帧，Rust 侧必须逐字节复现，
+/// 且能从 C 的字节里解析回同一份内容。
+#[test]
+fn key_labels_match_c_byte_for_byte() {
+    use apm_protocol::device_labels::{KeyLabel, KeyLabels, ScreenKey};
+
+    let v = vectors();
+    let case = v["frames"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|c| c["name"] == "key_labels")
+        .expect("向量里必须有 key_labels 这一项（跑 ./scripts/gen-protocol-vectors.sh）");
+
+    let expected_payload = hex_decode(case["payload_hex"].as_str().unwrap());
+    let expected_frame = hex_decode(case["frame_hex"].as_str().unwrap());
+
+    // 用与 C 生成器完全相同的输入构造，编码结果必须一致。
+    let labels = KeyLabels {
+        pc_pid: 0x5A,
+        capture_key: Some(ScreenKey::Ok),
+        items: vec![
+            KeyLabel { key: ScreenKey::Up, text: "ctrl+ent".into() },
+            KeyLabel { key: ScreenKey::Down, text: "esc*2".into() },
+        ],
+    };
+    let payload = labels.encode().expect("encode");
+    assert_eq!(
+        hex_encode(&payload),
+        hex_encode(&expected_payload),
+        "SET_KEY_LABELS 载荷与 C 不一致"
+    );
+    assert_eq!(
+        hex_encode(&labels.encode_frame().expect("encode_frame")),
+        hex_encode(&expected_frame),
+        "SET_KEY_LABELS 整帧与 C 不一致"
+    );
+
+    // 反向：从 C 的字节解析回来必须等价。
+    let decoded = KeyLabels::decode(&expected_payload).expect("decode");
+    assert_eq!(decoded, labels, "从 C 的载荷解析出的内容与 Rust 侧不一致");
+}

@@ -21,6 +21,9 @@ pub mod msg {
     pub const SET_GAIN: u8 = 0x03;
     /// 载荷 `seq u32-LE`；设备原样回 [`PONG`]。
     pub const PING: u8 = 0x04;
+    /// 载荷 `[pc_pid][capture_btn][count][(btn,len,text)*]`，设备屏幕的按键标签。
+    /// 契约见 `docs/ARCHITECTURE.md` 的 `SET_KEY_LABELS` 节。
+    pub const SET_KEY_LABELS: u8 = 0x05;
     pub const STATUS: u8 = 0x81;
     pub const EVENT: u8 = 0x82;
     /// EVENT 载荷里的手势码：按下。PC 端映射只消费这一种（`docs/ARCHITECTURE.md`）。
@@ -33,6 +36,7 @@ pub mod msg {
             STOP => "STOP",
             SET_GAIN => "SET_GAIN",
             PING => "PING",
+            SET_KEY_LABELS => "SET_KEY_LABELS",
             STATUS => "STATUS",
             EVENT => "EVENT",
             PONG => "PONG",

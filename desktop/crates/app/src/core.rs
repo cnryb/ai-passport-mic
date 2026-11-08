@@ -198,6 +198,14 @@ pub struct AppCore {
     version: &'static str,
 }
 
+/// 下发给设备的 `pc_pid`：进程号低 8 位。
+///
+/// 用途是让设备日志能区分"换了台 PC / 重启了 App"，不是标识符。
+/// 取不到进程号时用 0（设备侧只把它当字节存，不做判断）。
+fn pc_pid() -> u8 {
+    std::process::id() as u8
+}
+
 /// 把动作描述成 `ctrl+enter`、`esc ×2` 这种形式，只用于日志与控制台输出。
 fn describe_binding(binding: &apm_protocol::keymap::Binding) -> String {
     let mut out = String::new();
@@ -674,6 +682,11 @@ impl AppCore {
             ),
         );
         self.spawn_monitor(stop_rx);
+
+        // 把按键映射推到设备屏幕。**放在 spawn_monitor 之后**（链路已完全就绪），
+        // 且 await 到结束——这样"连接成功"返回时屏幕上的标签已经是最新的。
+        // 失败只记 debug：旧固件忽略这一帧是预期行为，不该让连接报错。
+        self.push_screen_labels().await;
         Ok(())
     }
 
@@ -1163,6 +1176,45 @@ impl AppCore {
                 ),
             });
         });
+    }
+
+    /// 把当前按键映射推到设备屏幕（`SET_KEY_LABELS`）。
+    ///
+    /// 三条口径：
+    ///
+    /// 1. **失败只记日志、绝不冒泡**。屏幕标签是显示层的锦上添花；旧固件没有 `0x05`
+    ///    会直接忽略这一帧，不该因此让"已连接"变成"连接失败"。
+    /// 2. **没有链路时静默返回**。用户还没连设备就改了映射，属于常态；
+    ///    等连上时 `connect_inner` 会再推一次。
+    /// 3. **每次现读映射表**。用户刚在界面上改完就该立刻生效，不缓存。
+    pub async fn push_screen_labels(self: &Arc<Self>) {
+        let (map, load_err) = crate::keymap_store::load();
+        if let Some(err) = load_err {
+            self.record(LogLevel::Warn, "screen", err);
+        }
+        let labels = apm_protocol::device_labels::labels_from_keymap(&map, pc_pid());
+        let link_guard = self.link.lock().await;
+        let Some(link) = link_guard.as_ref() else {
+            return; // 没连设备：什么都不用做，连上时会推
+        };
+        match link.send_key_labels(&labels).await {
+            Ok(()) => self.record(
+                LogLevel::Info,
+                "screen",
+                format!(
+                    "已下发按键标签（开麦键 {}）",
+                    labels
+                        .capture_key
+                        .map(|k| k.label())
+                        .unwrap_or("未知")
+                ),
+            ),
+            Err(err) => self.record(
+                LogLevel::Debug,
+                "screen",
+                format!("下发按键标签失败（旧固件会忽略该帧）：{err:#}"),
+            ),
+        }
     }
 
     /// 触发采集状态钩子（`capture.start` / `capture.stop`）：点按注入一个快捷键。

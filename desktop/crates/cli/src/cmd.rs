@@ -717,6 +717,82 @@ pub async fn battery(device: Option<&str>) -> Result<()> {
     link.disconnect().await.ok();
     Ok(())
 }
+
+/// 把按键映射推到设备屏幕，用于验收 `SET_KEY_LABELS`（`0x05`）这条链路。
+///
+/// 存在的理由：`apm-app` 的 `push_screen_labels` 只在 GUI 的连接流程里跑，
+/// 而"屏幕上到底显示了什么"必须有一条**不点界面**也能走的验证路径。
+/// 这里用的是同一份 `labels_from_keymap`（键名翻译只有一处），所以验的就是产品路径。
+///
+/// `--text` 可以逐条覆盖，用来测长文本截断与缺字形兜底。
+pub async fn screen_labels(
+    device: Option<&str>,
+    keymap: Option<&std::path::Path>,
+    text: &[String],
+    hold: u64,
+) -> Result<()> {
+    // 映射来源：显式给的文件 > 用户实际配置 > 内置默认。
+    let (map, source) = match keymap {
+        Some(p) => {
+            let raw = std::fs::read_to_string(p)
+                .map_err(|e| anyhow!("读 {} 失败: {e}", p.display()))?;
+            let map = apm_protocol::keymap::KeyMap::parse(&raw)
+                .map_err(|e| anyhow!("{} 不是合法的按键映射: {e}", p.display()))?;
+            (map, p.display().to_string())
+        }
+        None => {
+            let (map, err) = apm_app::keymap_store::load();
+            if let Some(err) = err {
+                println!("（读用户映射失败，用默认：{err}）");
+            }
+            (map, "用户配置 / 内置默认".to_string())
+        }
+    };
+
+    let mut labels = apm_protocol::device_labels::labels_from_keymap(&map, std::process::id() as u8);
+
+    // --text 按 UP / DOWN / OK 顺序覆盖，可以只给前几条。
+    for (i, t) in text.iter().take(3).enumerate() {
+        let key = apm_protocol::device_labels::ScreenKey::from_index(i as u8).unwrap();
+        if let Some(item) = labels.items.iter_mut().find(|it| it.key == key) {
+            item.text = apm_protocol::device_labels::truncate_chars(
+                t,
+                apm_protocol::device_labels::MAX_LABEL_BYTES,
+            );
+        }
+    }
+
+    println!("映射来源: {source}");
+    for it in &labels.items {
+        println!("  {} -> {:?}（{} 字节）", it.key.label(), it.text, it.text.len());
+    }
+    println!(
+        "  开麦键: {}",
+        labels.capture_key.map(|k| k.label()).unwrap_or("未知")
+    );
+
+    let payload = labels.encode()?;
+    let frame = apm_protocol::frame::encode(
+        apm_protocol::frame::msg::SET_KEY_LABELS,
+        &payload,
+    )?;
+    println!("载荷 {} 字节，帧 {} 字节", payload.len(), frame.len());
+
+    let link = apm_link::connect(device, Duration::from_secs(15))
+        .await
+        .map_err(|e| anyhow!("{e}\n提示: {}", apm_link::device::hint_for_error(&e)))?;
+
+    link.send_key_labels(&labels).await?;
+    println!("已下发。屏幕上应显示上面那三行（开麦键带 * 标记）。");
+
+    if hold > 0 {
+        println!("保持连接 {hold} s（用于观察屏幕自动熄屏 / 长按切屏）……");
+        tokio::time::sleep(Duration::from_secs(hold)).await;
+    }
+
+    link.disconnect().await.ok();
+    Ok(())
+}
 ///
 /// 原因见 `docs/KNOWN_ISSUES.md` **KI-005 的第二种触发方式**：设备在上一条会话异常结束、
 /// 或者"连上之后迟迟没人发 START"时会停在半死态，此时直接 START 只恢复一部分

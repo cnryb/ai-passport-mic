@@ -21,7 +21,7 @@
 | 功能键 | 右侧 上 / 下 / OK 三键，共用一个 ADC 分压（GPIO0） | `board.h` 的 `APM_BTN_*`；上游 BSP 为 `BSP_BTN_COUNT 3` |
 | 充电指示灯 | 绿色，由充电 IC 硬件直驱：充电常亮、充满熄灭 | 不可控、不可查，只能靠人眼看 |
 | 电池 | 500 mAh（上游 BSP 标定用的是优特利 UTL 520 mAh），USB-C 充电 | CW2017 走标准 Battery Service；固件已写入上游 UTL 520 mAh 的 80 字节 profile（`device/main/battery.c`），SOC 真机实测有效（2026-11-06：3.96 V → 77–79%） |
-| 屏幕 | ST7789P3 240×320 | 第一版不驱动，背光仅作低电量短闪 |
+| 屏幕 | ST7789P3 240×320，4 线 SPI（MOSI=9 / SCLK=8 / CS=1 / DC=20，**RST 未接 MCU**），背光 GPIO21 | 固件已驱动（`device/main/screen.c`）：显示电量与三键功能，长按非开麦键切屏，亮屏 30 s 无操作自动熄。**真机未验** |
 
 来源：FoloToy 官方上手文档 <https://ai-passport.folotoy.cn/guides/getting-started/>
 （`board.h` 顶部也记了同一条，改硬件时两处一起改）。

@@ -8,6 +8,7 @@
 
 pub mod adpcm;
 pub mod crc;
+pub mod device_labels;
 pub mod frame;
 pub mod glitch;
 pub mod keymap;

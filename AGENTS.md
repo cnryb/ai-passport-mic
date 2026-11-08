@@ -16,19 +16,32 @@
   左右 Alt `lalt` / `ralt`，**设备按键直连**——OK 键开关采集、up/down 注入映射键、
   切换窗口防抖，映射页内置辅助功能权限引导横幅；**真机端到端 2026-11-06 已验 PASS**）。
   未做的只有 **hold（按住不放）**：固件侧 PRESS/RELEASE 齐，缺 PC 端消费 RELEASE。
+- **有**：设备屏幕（ST7789P3 240×320）——显示电量与三键功能。**2026-11-08 真机验过**：
+  面板/背光/LEDC 初始化、30 s 自动熄屏（实测 30.2 s）、PC 下发按键标签（`SET_KEY_LABELS`）。
+  亮灭手势：**只有长按 UP/DOWN 切屏**，单击不响应，开麦键的任何手势都不切屏；
+  **屏幕与采集状态完全解耦**（开麦不点亮、采集中照常熄屏，因为"省电更重要"）。
+  屏幕画面对不对（反色/镜像/观感）与 ST7789 是否真进 Sleep In 仍需人眼/量电流。
+  详见 [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md) 的「设备屏幕」节。
+- **电源键不接 MCU**（硬件锁存：按住 0.5 s 开机、长按 2 s 关机），固件看不见它——
+  **"按电源键亮屏"在这块板上做不到**，已用长按 UP/DOWN 替代。
 - **没有**：G3b 回环自动验收（`--verify` 仍在
   `apmctl`）、G6 签名公证（只有 ad-hoc）、GUI 的 `run_selftest`、Windows 注入（SendInput）。
 - **编排只有一份**：`detect_adapter` / `scan` / `connect` / `start_stream` / `stop_stream`
   / 采集解码写声卡全在 `apm-app`（`core` / `session` / `pipeline`）。`cli` 与 `gui` 都只调它，
   「录 WAV 并分析」用 `apmctl` 或界面都行，走的是同一条管线与同一份报告。
 - 门禁现状（不要假设更多）：
-  - `./scripts/verify.sh` —— 结构 / 文档内链 / 脚本权限 / **固件主机侧单测** / 向量新鲜度 /
-    `cargo test` / 环境快照。
+  - `./scripts/verify.sh` —— 结构 / 文档内链 / 脚本权限 / **固件主机侧单测** /
+    **屏幕点阵字库新鲜度** / 向量新鲜度 / `cargo test` / 环境快照。
   - `./scripts/test-protocol.sh` —— 固件**纯逻辑模块**的主机侧单测，不需要 ESP-IDF：
-    `protocol.c`（CRC / 帧 / ADPCM / 毛刺判据 / PING-PONG，44 项）+ `power_policy.c`
-    （连接参数两档 / `LINK_SLOW` 判据 / 采集态状态机 / 发射功率滞回，65 项）。
+    `protocol.c`（CRC / 帧 / ADPCM / 毛刺判据 / PING-PONG / `SET_KEY_LABELS`，71 项）+
+    `power_policy.c`（连接参数两档 / `LINK_SLOW` 判据 / 采集态状态机 / 发射功率滞回，65 项）+
+    `screen_render.c` + `screen_state.c`（渲染 / 亮灭状态机，71 项）。
     **新写的固件判定逻辑应当尽量放进这类不依赖 ESP-IDF 的模块**，否则它只能在真机上"看一眼"。
   - `./scripts/gen-protocol-vectors.sh [--check]` —— 从 C 实现导出跨端向量。
+  - `./scripts/gen-font-subset.py [--check]` —— 从 `device/main/screen_texts.h` 提取字符集，
+    生成 16×16 点阵字库 `device/main/font16_data.h`（源字体 GNU Unifont，双许可 GPLv2+/OFL 1.1，
+    只嵌渲染位图）。**改了屏幕文案必须重跑**，否则 `verify.sh` 会 FAIL ——
+    漏了的后果是屏幕上一个方框，只有上真机才看得见。**在** verify 里。
   - `./scripts/build-firmware.sh` —— `idf.py build` + 合并镜像。**不在** verify 里（耗时），
     改固件后自己跑一次并在交付里如实报告。
   - `./scripts/build-gui.sh` —— 前端构建 + `tauri build --bundles app` + 校验 Info.plist
@@ -45,8 +58,8 @@
     **不在** verify 里（要硬件 + 30 分钟）。
   - `cargo test` 用 workspace 的 `default-members`，**不含** `crates/gui`；GUI 要单跑
     `cargo test -p apm-gui` 或 `./scripts/build-gui.sh`。
-  - 最近一次全绿（2026-11-08 复核）：`verify.sh` 七项全 PASS（固件主机侧单测 109 passed：
-    协议 44 + 省电逻辑 65）、
+  - 最近一次全绿（2026-11-08 复核）：`verify.sh` 八项全 PASS（固件主机侧单测 207 passed：
+    协议 71 + 省电 65 + 屏幕 71；字库新鲜度 PASS）、
     `cargo test` **162 passed / 0 failed / 2 ignored**（7 个有测试的目标）、
     `clippy --all-targets` **0 警告**、`vue-tsc` 与 `npm run build` 通过、
     `build-gui.sh` 出包且 Info.plist 校验通过、
@@ -107,19 +120,29 @@ source ./scripts/activate-idf.sh # 当前 shell 激活 ESP-IDF
 cd desktop && cargo test         # 桌面端测试，含与 C 实现的逐字节对拍
 ```
 
+CI 只有一条：`.github/workflows/macos-build.yml`。它**不新增任何判定逻辑**——
+门禁直接调 `verify.sh`（外加 `clippy -D warnings` 与前端 typecheck/build），
+打包直接调 `build-gui.sh --release`。所以本地能过 ≠ CI 能过的地方只有两处：
+① ESP-IDF 在容器里（ubuntu + `espressif/idf:v5.5.3`），
+② macOS 侧是干净 checkout（无 `sdkconfig`/`build/`）。
+PR 只跑门禁；固件与双架构打包只在 **v* tag** 或手动触发时跑。
+产物是 **ad-hoc 签名、未公证**（G6 未做），别把它当可分发包。
+
 交付时按下面格式报状态，不要合并成一句话：
 
 ```text
 Structure: PASS / FAIL
 Docs links: PASS / FAIL
 Protocol (C): PASS / FAIL（几项通过）
+Font subset: PASS / FAIL（字库是否与 screen_texts.h 的文案一致）
 Vectors: PASS / FAIL（是否与 C 实现一致）
 Desktop (cargo test): PASS / FAIL / SKIP
 GUI build (.app + Info.plist): PASS / FAIL / SKIP
 GUI (G0-G6): PASS / FAIL / SKIP（写当前真实到哪一期，不要写"GUI 好了"）
 Firmware build: PASS / FAIL / SKIP（IDF 不可用时写 SKIP，不要写成 PASS）
 Env: PASS / FAIL（缺失项列出）
-Unverified: 尚未验证的能力（三键电压窗口万用表复核、hold 按住不放、端到端声学延迟、
+Unverified: 尚未验证的能力（**屏幕画面观感（反色/镜像）、ST7789 是否真的进了 Sleep In、
+  背光电流收益**、三键电压窗口万用表复核、hold 按住不放、端到端声学延迟、
             G2 的 CPU/内存两项（实测 14.2%/208MB，均超口径；前端 59.8fps 已 PASS。
             **电平表的每帧成本已于 2026-11-07 优化**：静态层/动态层拆两张 canvas，
             CDP 实测主线程 ScriptDuration −42%、TaskDuration −12%，逐像素等价；

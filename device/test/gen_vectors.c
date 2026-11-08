@@ -10,6 +10,7 @@
 
 #include <math.h>
 #include <stdio.h>
+#include <string.h>
 
 static void fill_sine(int16_t *pcm, size_t n, double freq, double amp, size_t offset)
 {
@@ -105,6 +106,28 @@ int main(void)
     printf("    {\"name\": \"status_idle\", \"msg\": %u, \"payload_hex\": \"",
            (unsigned)APM_MSG_STATUS);
     print_hex(payload, plen);
+    printf("\", \"frame_hex\": \"");
+    print_hex(frame, n);
+    printf("\"},\n");
+
+    // SET_KEY_LABELS：PC 下发按键标签。两端必须编出同一串字节。
+    uint8_t label_payload[APM_FRAME_MAX_PAYLOAD];
+    apm_key_labels_t labels = {
+        .pc_pid      = 0x5A,
+        .capture_btn = APM_BTN_OK,
+        .count       = 2,
+    };
+    labels.items[0].btn = APM_BTN_UP;
+    labels.items[0].len = 8;
+    memcpy(labels.items[0].text, "ctrl+ent", 8);
+    labels.items[1].btn = APM_BTN_DOWN;
+    labels.items[1].len = 5;
+    memcpy(labels.items[1].text, "esc*2", 5);
+    plen = apm_key_labels_encode(&labels, label_payload, sizeof label_payload);
+    n = apm_frame_encode(APM_MSG_SET_KEY_LABELS, label_payload, plen, frame, sizeof frame);
+    printf("    {\"name\": \"key_labels\", \"msg\": %u, \"payload_hex\": \"",
+           (unsigned)APM_MSG_SET_KEY_LABELS);
+    print_hex(label_payload, plen);
     printf("\", \"frame_hex\": \"");
     print_hex(frame, n);
     printf("\"}\n");

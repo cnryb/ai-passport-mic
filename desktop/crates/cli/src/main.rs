@@ -43,6 +43,20 @@ enum Command {
         #[arg(long)]
         device: Option<String>,
     },
+    /// 把按键映射推到设备屏幕（SET_KEY_LABELS），用于验收屏幕显示
+    ScreenLabels {
+        #[arg(long)]
+        device: Option<String>,
+        /// 指定按键映射 JSON；不填则用用户配置 / 内置默认
+        #[arg(long)]
+        keymap: Option<PathBuf>,
+        /// 逐条覆盖标签文本（按 UP / DOWN / OK 顺序，最多 3 条），用于测截断与缺字形
+        #[arg(long = "text")]
+        text: Vec<String>,
+        /// 下发后保持连接多少秒（观察屏幕自动熄屏 / 长按切屏）
+        #[arg(long, default_value_t = 0)]
+        hold: u64,
+    },
     /// 录音到 WAV（16 kHz / 16-bit / mono）
     Record {
         /// 输出文件
@@ -189,6 +203,10 @@ fn main() -> anyhow::Result<()> {
                         cmd::status(device.as_deref(), timeout).await
                     }
                     Command::Battery { device } => cmd::battery(device.as_deref()).await,
+                    Command::ScreenLabels { device, keymap, text, hold } => {
+                        cmd::screen_labels(device.as_deref(), keymap.as_deref(), &text, hold)
+                            .await
+                    }
                     Command::Record { file, seconds, device } => {
                         cmd::record(&file, seconds, device.as_deref()).await
                     }

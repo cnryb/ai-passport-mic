@@ -144,18 +144,32 @@ pub fn keymap_view() -> KeymapView {
 }
 
 #[tauri::command]
-pub fn keymap_save(bindings: Vec<BindingInput>) -> Result<KeymapView, AppError> {
-    keymap_store::save_bindings(&bindings).map_err(AppError::keymap_invalid)
+pub async fn keymap_save(
+    state: State<'_, GuiState>,
+    bindings: Vec<BindingInput>,
+) -> Result<KeymapView, AppError> {
+    let view = keymap_store::save_bindings(&bindings).map_err(AppError::keymap_invalid)?;
+    // 映射改了，设备屏幕上的按键说明要跟着变。异步命令里 await 它，
+    // 保证命令返回时屏幕已经是最新的（失败也只记日志，见 push_screen_labels）。
+    state.core.push_screen_labels().await;
+    Ok(view)
 }
 
 #[tauri::command]
-pub fn keymap_import(text: String) -> Result<KeymapView, AppError> {
-    keymap_store::save_text(&text).map_err(AppError::keymap_invalid)
+pub async fn keymap_import(
+    state: State<'_, GuiState>,
+    text: String,
+) -> Result<KeymapView, AppError> {
+    let view = keymap_store::save_text(&text).map_err(AppError::keymap_invalid)?;
+    state.core.push_screen_labels().await;
+    Ok(view)
 }
 
 #[tauri::command]
-pub fn keymap_reset() -> Result<KeymapView, AppError> {
-    keymap_store::reset().map_err(AppError::keymap_invalid)
+pub async fn keymap_reset(state: State<'_, GuiState>) -> Result<KeymapView, AppError> {
+    let view = keymap_store::reset().map_err(AppError::keymap_invalid)?;
+    state.core.push_screen_labels().await;
+    Ok(view)
 }
 
 #[tauri::command]

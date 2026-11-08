@@ -287,6 +287,110 @@ static void test_ping_pong(void)
     CHECK(apm_build_pong(payload, sizeof payload, NULL, 4) == 0, "空载荷指针丢弃");
 }
 
+// SET_KEY_LABELS：PC 下发按键标签。格式见 docs/ARCHITECTURE.md。
+static void test_key_labels(void)
+{
+    printf("[set_key_labels]\n");
+
+    // 正常往返：三条都带文本。
+    apm_key_labels_t in = {
+        .pc_pid      = 0x5A,
+        .capture_btn = APM_BTN_OK,
+        .count       = 3,
+        .items = {
+            { APM_BTN_UP,   3, "F5 " },
+            { APM_BTN_DOWN, 6, "esc x2" },
+            { APM_BTN_OK,   0, "" },
+        },
+    };
+    // 上面 "F5 " 有尾随空格，改成精确长度：F5 = 2 字节
+    in.items[0].len = 2;
+    in.items[1].len = 6;
+
+    uint8_t payload[APM_FRAME_MAX_PAYLOAD];
+    size_t n = apm_key_labels_encode(&in, payload, sizeof payload);
+    CHECK(n == 3 + (2 + 2) + (2 + 6) + (2 + 0), "编码长度 = 3 + Σ(2+len)（实际 %zu）", n);
+
+    apm_key_labels_t out;
+    CHECK(apm_key_labels_decode(payload, n, &out), "解码成功");
+    CHECK(out.pc_pid == 0x5A, "pc_pid 往返一致");
+    CHECK(out.capture_btn == APM_BTN_OK, "capture_btn 往返一致");
+    CHECK(out.count == 3, "条目数往返一致");
+    CHECK(out.items[0].btn == APM_BTN_UP && out.items[0].len == 2 &&
+              memcmp(out.items[0].text, "F5", 2) == 0,
+          "UP 条目往返一致");
+    CHECK(out.items[1].btn == APM_BTN_DOWN && out.items[1].len == 6 &&
+              memcmp(out.items[1].text, "esc x2", 6) == 0,
+          "DOWN 条目往返一致");
+    CHECK(out.items[2].len == 0, "OK 条目空文本也能往返");
+
+    // count = 0：清空成默认文案，是合法帧。
+    apm_key_labels_t empty = { .pc_pid = 1, .capture_btn = APM_KEY_LABEL_NO_CAPTURE,
+                               .count = 0 };
+    n = apm_key_labels_encode(&empty, payload, sizeof payload);
+    CHECK(n == 3, "count=0 的载荷是 3 字节");
+    CHECK(apm_key_labels_decode(payload, n, &out) && out.count == 0,
+          "count=0 解码成功（清空标签）");
+    CHECK(out.capture_btn == APM_KEY_LABEL_NO_CAPTURE, "capture_btn=0xFF 表示未知");
+
+    // ---- 非法帧一律整帧拒绝，不做部分应用 ----
+    CHECK(!apm_key_labels_decode(payload, 2, &out), "长度 <3 拒绝");
+    CHECK(!apm_key_labels_decode(NULL, 3, &out), "空指针拒绝");
+    CHECK(!apm_key_labels_decode(payload, 3, NULL), "空输出指针拒绝");
+
+    uint8_t bad[APM_FRAME_MAX_PAYLOAD];
+    bad[0] = 0; bad[1] = 2; bad[2] = 4;   // count=4 > 3
+    CHECK(!apm_key_labels_decode(bad, 3, &out), "count 超过 3 拒绝");
+
+    bad[0] = 0; bad[1] = 2; bad[2] = 1; bad[3] = 9; bad[4] = 0;   // btn=9 非法
+    CHECK(!apm_key_labels_decode(bad, 5, &out), "非法键号拒绝");
+
+    bad[0] = 0; bad[1] = 2; bad[2] = 1; bad[3] = 0; bad[4] = 10;  // 声明 10 字节但没内容
+    CHECK(!apm_key_labels_decode(bad, 5, &out), "text_len 超出实际长度拒绝");
+
+    // 尾部多余字节：长度声明与实际内容不符。
+    bad[0] = 0; bad[1] = 2; bad[2] = 0; bad[3] = 0xFF;
+    CHECK(!apm_key_labels_decode(bad, 4, &out), "尾部多余字节拒绝");
+
+    // 同一个键出现两次：自相矛盾的帧，拒绝而不是猜意图。
+    bad[0] = 0; bad[1] = 2; bad[2] = 2;
+    bad[3] = APM_BTN_UP; bad[4] = 1; bad[5] = 'a';
+    bad[6] = APM_BTN_UP; bad[7] = 1; bad[8] = 'b';
+    CHECK(!apm_key_labels_decode(bad, 9, &out), "重复键号拒绝");
+
+    // 单条文本超上限：解码拒绝。
+    bad[0] = 0; bad[1] = 2; bad[2] = 1;
+    bad[3] = APM_BTN_UP; bad[4] = APM_KEY_LABEL_MAX_BYTES + 1;
+    memset(&bad[5], 'x', APM_KEY_LABEL_MAX_BYTES + 1);
+    CHECK(!apm_key_labels_decode(bad, 5 + APM_KEY_LABEL_MAX_BYTES + 1, &out),
+          "单条文本超过 %d 字节拒绝", APM_KEY_LABEL_MAX_BYTES);
+
+    // 恰好上限：允许。
+    bad[4] = APM_KEY_LABEL_MAX_BYTES;
+    CHECK(apm_key_labels_decode(bad, 5 + APM_KEY_LABEL_MAX_BYTES, &out),
+          "单条文本恰好 %d 字节允许", APM_KEY_LABEL_MAX_BYTES);
+
+    // 编码侧：容量不足 / 非法参数返回 0。
+    apm_key_labels_t big = in;
+    CHECK(apm_key_labels_encode(&in, payload, 3) == 0, "输出容量不足返回 0");
+    CHECK(apm_key_labels_encode(NULL, payload, sizeof payload) == 0, "空入参返回 0");
+    big.count = 4;
+    CHECK(apm_key_labels_encode(&big, payload, sizeof payload) == 0, "条目数超限返回 0");
+
+    // 帧层往返：能装进控制帧并原样解出。
+    apm_key_labels_t rt = { .pc_pid = 9, .capture_btn = APM_BTN_UP, .count = 1,
+                            .items = { { APM_BTN_UP, 6, "enter" } } };
+    n = apm_key_labels_encode(&rt, payload, sizeof payload);
+    uint8_t frame[APM_FRAME_MAX_LEN];
+    size_t flen = apm_frame_encode(APM_MSG_SET_KEY_LABELS, payload, n, frame, sizeof frame);
+    CHECK(flen > 0, "SET_KEY_LABELS 能装进控制帧（%zu 字节）", flen);
+    apm_frame_t f;
+    CHECK(apm_frame_decode(frame, flen, &f) == (int)flen && f.type == APM_MSG_SET_KEY_LABELS,
+          "帧类型可识别");
+    CHECK(apm_key_labels_decode(f.payload, f.payload_len, &out) && out.capture_btn == APM_BTN_UP,
+          "帧内载荷能解出 capture_btn");
+}
+
 int main(void)
 {
     printf("protocol host tests\n");
@@ -297,6 +401,7 @@ int main(void)
     test_adpcm_lost_block();
     test_pcm_corrupt();
     test_ping_pong();
+    test_key_labels();
     printf("\n%d passed, %d failed\n", g_pass, g_fail);
     return g_fail == 0 ? 0 : 1;
 }

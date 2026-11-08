@@ -11,6 +11,7 @@
 #include "buttons.h"
 #include "link.h"
 #include "protocol.h"
+#include "screen.h"
 
 #include "esp_log.h"
 #include "esp_pm.h"
@@ -86,6 +87,9 @@ static void sync_capture_mode(void)
 
     s_capturing_snapshot = on;
     apm_link_set_capturing(on);
+    // 屏幕只更新**内容**（状态行显示「采集中」），不因此点亮/保持点亮。
+    // 亮灭完全由用户手势决定，见 screen.c 的 apm_screen_set_capturing 注释。
+    apm_screen_set_capturing(on);
 }
 
 // 一条会话 = 从开始采集到停止采集。计数器按会话归零，否则 STATUS 里的
@@ -103,8 +107,13 @@ static void reset_session_counters(void)
 // ---------------------------------------------------------------------------
 static void on_button(apm_btn_t btn, apm_btn_ev_t ev)
 {
-    // 低电量被动提示：平时是空操作，只置一个计数，不影响按键路径。
+    // 低电量被动提示 + 屏幕亮灭（都在这里做，不进事件队列）。
+    //
+    // 为什么屏幕不进队列：灭屏时按下键要"立刻"亮起来，等事件任务调度完再亮，
+    // 用户会觉得"按了没反应"（事件任务可能正在做 BLE 通知，几十毫秒起步）。
+    // 屏幕层的实现只改状态 + 点背光，不分配内存、不做 IO 重活，可以在按键上下文里跑。
     apm_battery_on_button();
+    apm_screen_on_key((uint8_t)btn, ev == APM_BTN_EV_LONG);
 
     apm_evt_t e = { 0 };
     e.src = APM_EVT_SRC_BUTTON;
@@ -147,9 +156,14 @@ static void on_ctrl(uint8_t type, const uint8_t *payload, uint16_t len)
 static void on_link_state(bool connected)
 {
     if (connected) {
+        apm_screen_set_connected(true);
         ESP_LOGI(TAG, "链路已连接，等待 CTRL START 或 PTT");
         return;
     }
+    apm_screen_set_connected(false);
+    // PC 走了，屏幕上的按键标签回到内置默认文案：继续显示上一台 PC 的映射会误导
+    // （用户改了映射、PC 断了，屏幕还写着旧动作）。
+    apm_screen_clear_labels();
     if (apm_capture_on(&s_capture)) {
         ESP_LOGW(TAG, "断链：清掉采集态（START=%d PTT=%d），不等 STOP",
                  (int)s_capture.forced, (int)s_capture.ptt_held);
@@ -343,6 +357,41 @@ static void handle_event(const apm_evt_t *e)
             ESP_LOGI(TAG, "CTRL SET_GAIN %d dB -> %s", gain, esp_err_to_name(err));
         }
         break;
+    case APM_MSG_SET_KEY_LABELS: {
+        // PC 下发屏幕上的按键标签。设备不认识动作语义，只显示文本。
+        apm_key_labels_t labels;
+        if (!apm_key_labels_decode(e->ctrl_payload, e->ctrl_len, &labels)) {
+            ESP_LOGW(TAG, "CTRL SET_KEY_LABELS 格式非法（%u 字节），整帧丢弃",
+                     e->ctrl_len);
+            break;
+        }
+
+        // 未给出的键传 NULL = 保持上一次的值；count=0 时三条都是 NULL，
+        // 屏幕会退回内置默认文案。
+        const char *up = NULL, *down = NULL, *ok = NULL;
+        for (uint8_t i = 0; i < labels.count; i++) {
+            // 载荷里的文本不保证 '\0' 结尾（len 才是权威），这里拷到本地缓冲补上结束符。
+            static char buf[APM_KEY_LABEL_MAX_ITEMS][APM_KEY_LABEL_MAX_BYTES + 1];
+            memcpy(buf[i], labels.items[i].text, labels.items[i].len);
+            buf[i][labels.items[i].len] = '\0';
+            switch (labels.items[i].btn) {
+            case APM_BTN_UP:   up = buf[i]; break;
+            case APM_BTN_DOWN: down = buf[i]; break;
+            default:           ok = buf[i]; break;
+            }
+        }
+
+        bool clean = apm_screen_set_labels(labels.capture_btn, up, down, ok);
+        if (!clean) {
+            // 缺字形的字符已被屏幕层替换成 '?'。这里把原文打出来，
+            // 否则"屏幕上有个问号"在日志里查不到原因。
+            ESP_LOGW(TAG, "标签含字库未收录的字符（已显示为 '?'）：up=%s down=%s ok=%s",
+                     up ? up : "-", down ? down : "-", ok ? ok : "-");
+        }
+        ESP_LOGI(TAG, "CTRL SET_KEY_LABELS：开麦键=%s，%u 条标签",
+                 labels.capture_btn <= APM_BTN_OK ? "已设置" : "未知", labels.count);
+        break;
+    }
     default:
         ESP_LOGW(TAG, "未知 CTRL type=0x%02X", e->ctrl_type);
         break;
@@ -374,6 +423,17 @@ static void status_task(void *arg)
         // KI-005 之所以查了两轮还只能靠猜，就是因为设备侧没有任何一行日志能说明
         // "块是采到了、编好了，卡在发不出去"。
         apm_link_housekeeping();
+
+        // 屏幕：处理 30 s 自动熄屏（采集中不熄）。内容刷新由 screen 自己判断
+        // "有没有变"，这里每秒无脑调一次是幂等的。
+        apm_screen_tick();
+        // 电量结论同步给屏幕。读不到时传 -1，屏幕显示「电量不可用」而不是 0%。
+        if (apm_battery_ready()) {
+            apm_screen_set_battery((int)apm_battery_soc(),
+                                   apm_battery_soc() <= APM_BATTERY_LOW_SOC_PCT);
+        } else {
+            apm_screen_set_battery(-1, false);
+        }
 
         apm_link_notify_status(current_state(), current_flags(),
                                s_blocks_dropped, s_blocks_sent);
@@ -474,6 +534,14 @@ void app_main(void)
     err = apm_battery_start();
     if (err != ESP_OK) {
         ESP_LOGW(TAG, "电量计启动失败: %s（Battery Service 将保持 0%）",
+                 esp_err_to_name(err));
+    }
+
+    // 屏幕放在电量之后：开机第一帧就要显示电量，先启屏幕会先画一次"不可用"再跳变。
+    // 失败不阻塞启动——屏幕坏了设备仍然是可用的麦克风。
+    err = apm_screen_start();
+    if (err != ESP_OK) {
+        ESP_LOGW(TAG, "屏幕启动失败: %s（本次运行不显示内容，其余功能照常）",
                  esp_err_to_name(err));
     }
 

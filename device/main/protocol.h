@@ -41,6 +41,7 @@ typedef enum {
     APM_MSG_STOP     = 0x02,  // payload: 空。强制停止采集
     APM_MSG_SET_GAIN = 0x03,  // payload: int8 麦克风 PGA 增益(dB, 0..42)
     APM_MSG_PING     = 0x04,  // payload: seq u32-LE。必须原样回 PONG，长度不是 4 就丢弃
+    APM_MSG_SET_KEY_LABELS = 0x05,  // payload: 见 apm_key_labels_t（设备屏幕的按键标签）
 
     APM_MSG_STATUS   = 0x81,  // payload: state u8, flags u8, block_drops u16, blocks_sent u32
     APM_MSG_EVENT    = 0x82,  // payload: button u8, event u8, flags u8
@@ -141,3 +142,43 @@ size_t apm_build_event(uint8_t *payload, size_t cap, apm_btn_t btn, apm_btn_ev_t
 // PONG 载荷 = PING 载荷原样回显。ping_len 必须为 4，否则返回 0（设备不做任意长度透传）。
 size_t apm_build_pong(uint8_t *payload, size_t cap, const uint8_t *ping_payload,
                       size_t ping_len);
+
+// ---------------------------------------------------------------------------
+// SET_KEY_LABELS（0x05）：设备屏幕的按键标签
+//
+// 载荷（变长，最多 3 条，键的固定顺序 up / down / ok）：
+//   [0] pc_pid u8      发起方进程标识的低 8 位（仅用于日志与"换了个 PC"的判断）
+//   [1] capture_btn u8 本机开麦键：0=up 1=down 2=ok 0xFF=未知
+//   [2] count u8       条目数 0..3
+//   [3..] 每条： [btn u8][text_len u8][text: UTF-8，text_len 字节]
+//
+// 契约见 docs/ARCHITECTURE.md 的 SET_KEY_LABELS 节。要点：
+//   - **设备不解析动作语义，只显示文本**（PC 负责把 ctrl+enter 翻成一句人话）；
+//   - 文本长度上限 APM_KEY_LABEL_MAX_BYTES，超出部分丢弃；
+//   - 缺字形的字符由屏幕层替换成 '?'，协议层不做字符校验。
+// ---------------------------------------------------------------------------
+#define APM_KEY_LABEL_MAX_BYTES 24
+#define APM_KEY_LABEL_MAX_ITEMS 3
+
+typedef struct {
+    uint8_t pc_pid;
+    uint8_t capture_btn;                       // 0..2，或 APM_KEY_LABEL_NO_CAPTURE
+    uint8_t count;                             // 0..APM_KEY_LABEL_MAX_ITEMS
+    struct {
+        uint8_t btn;
+        uint8_t len;
+        char    text[APM_KEY_LABEL_MAX_BYTES];  // 不保证 '\0' 结尾；用 len
+    } items[APM_KEY_LABEL_MAX_ITEMS];
+} apm_key_labels_t;
+
+#define APM_KEY_LABEL_NO_CAPTURE 0xFF
+
+// 解析 SET_KEY_LABELS 载荷。
+// 返回 true 表示整帧合法并已写入 *out（会先清零）。
+// 返回 false 表示帧格式非法（长度不符 / count 越界 / 键号重复），**不做部分应用**：
+// 半份标签比没有标签更容易让人误判。
+bool apm_key_labels_decode(const uint8_t *payload, size_t len, apm_key_labels_t *out);
+
+// 组装 SET_KEY_LABELS 载荷（PC 侧参考实现 + 跨端向量用）。
+// 返回写入字节数；0 表示失败（容量不足 / 条目过多 / 单条文本超长）。
+size_t apm_key_labels_encode(const apm_key_labels_t *in, uint8_t *out, size_t out_cap);
