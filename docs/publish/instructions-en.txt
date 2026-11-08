@@ -1,0 +1,51 @@
+AI Passport Mic · Pocket Wireless Microphone
+Turn AI Passport into a pocket wireless microphone. In meetings, recordings or livestreams,
+the device itself is your mic — no headset cable, no leaning into the laptop.
+
+Before you start
+1. A Mac (macOS 11 or later; Intel and Apple silicon both work).
+2. One free virtual audio driver, which is what lets meeting apps pick the device up as a
+   microphone. Tap "How" in the app and it opens the download page: install the 2ch version,
+   then tap "Rescan".
+3. A USB-C cable that carries data (charge-only cables will not work).
+
+First run
+1. Hold the power button on the left edge for about half a second. The screen lights up.
+2. Connect the device to your Mac with the USB-C cable and open AI Passport Mic.
+   - The first launch may say Apple cannot check the app for malicious software. Right-click
+     the icon, choose Open, then Open again. After that a normal double-click works.
+3. Open the "Device flashing" tab. The device shows up as a serial port once it is plugged in;
+   tap "Check version" first, then "Write firmware". It takes about five seconds — do not
+   unplug during the write. The device restarts and starts advertising.
+4. Open the "Live" tab, tap "Scan for devices", pick AI Passport Mic and tap "Connect".
+5. Approve the Bluetooth prompt the first time. That is a system prompt; the app cannot do it
+   for you.
+6. Choose your audio driver in the bottom bar and tap "Verify audio driver". It plays a short
+   test tone into the driver and reads it back from the input side. PASS means the path works.
+7. In your meeting app (Zoom, Teams, Meet…), set the microphone to that virtual driver's
+   input. Picking the output instead of the input is the single most common mistake here.
+
+Everyday use
+- Tap OK once to start talking, tap again to stop. OK is the talk key by default.
+- The device screen shows battery, connection state and what each of the three buttons does.
+  Hold UP or DOWN to toggle the screen; it dims on its own after 30 seconds to save power.
+- UP and DOWN can be remapped to any shortcut (Enter, Esc, F5…) on the "Button mapping" tab —
+  handy for raising a hand or switching slides. That feature needs macOS Accessibility
+  permission; the tab walks you through granting it.
+- Below 20% battery, pressing a button flashes the backlight three times.
+
+Troubleshooting
+- Nobody hears you: tap "Verify audio driver" first. "Loopback almost silent" means the driver
+  is missing or not passing audio through. "No samples read" means microphone permission was
+  denied — open System Settings → Privacy & Security → Microphone and enable the app.
+- Device not found: make sure it is powered on (hold the power button for half a second;
+  plugging in the cable alone does not boot it) and that the WeChat mini program on your phone
+  is not holding the connection.
+- To go back to the factory play: scan the QR code on the back of the device, open the
+  device page in Chrome on your computer, and follow "Restore default firmware". This works
+  after installing any play.
+
+Notes
+This play needs the companion desktop app; the firmware only captures and transmits.
+Installing it replaces whatever is currently on the device, so make sure you no longer need
+the existing content.

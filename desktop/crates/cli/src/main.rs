@@ -131,13 +131,24 @@ enum Command {
         json: bool,
     },
     /// 只读一个输入设备的电平，用于排查权限与虚拟声卡直通
-    Probe {
-        /// 设备名子串，例如 "BlackHole" 或内置麦克风
+    Probe {        /// 设备名子串，例如 "BlackHole" 或内置麦克风
         #[arg(long)]
         device: String,
         /// 观察时长（秒）
         #[arg(long, default_value_t = 4)]
         seconds: u64,
+    },
+    /// 一键验证虚拟声卡：写入已知电平的正弦，再从输入端回读（不需要设备）
+    CheckSink {
+        /// 设备名子串，例如 "BlackHole"
+        #[arg(long, default_value = "BlackHole")]
+        device: String,
+        /// 测试音时长（秒，1–10）
+        #[arg(long, default_value_t = 2)]
+        seconds: u64,
+        /// 输出 JSON（schema: ai-passport-mic-sink-check-1）
+        #[arg(long)]
+        json: bool,
     },
     /// 用 C 实现导出的向量自检协议层（不需要硬件）
     Selftest {
@@ -183,6 +194,7 @@ fn main() -> anyhow::Result<()> {
         Command::Analyze { file, json } => cmd::analyze(&file, json),
         Command::Selftest { vectors } => cmd::selftest(vectors.as_deref()),
         Command::Probe { device, seconds } => cmd::probe(&device, seconds),
+        Command::CheckSink { device, seconds, json } => cmd::check_sink(&device, seconds, json),
         Command::Firmware(fw) => match fw {
             FirmwareCmd::Ports => cmd::firmware_ports(),
             FirmwareCmd::Probe { port, image } => {

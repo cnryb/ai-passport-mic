@@ -21,6 +21,7 @@ status_proto=SKIP
 status_font=SKIP
 status_vectors=SKIP
 status_desktop=SKIP
+status_publish=SKIP
 status_env=SKIP
 failed=0
 
@@ -186,6 +187,83 @@ else
 fi
 
 echo
+echo "== 发布文案 =="
+# 平台硬规则：play-first 文案里不能出现芯片/外设/SDK 这类工程词，
+# 封面必须是严格 3:4。这些以前只能靠人眼看，而"改了界面忘了改文案"
+# 是这类交付最常见的漏项 —— 文案里写着「检测设备」，界面上叫「检测版本」，
+# 用户照着点不到。所以这里把能自动查的都查掉。
+pub_dir="$root/docs/publish"
+pub_problems=0
+if [[ ! -d "$pub_dir" ]]; then
+  echo "SKIP 没有 docs/publish（还没准备发布物）"
+else
+  # 1) 必需文件
+  for f in description-zh.txt description-en.txt instructions-zh.txt instructions-en.txt cover.jpg; do
+    if [[ ! -f "$pub_dir/$f" ]]; then
+      echo "FAIL 缺 docs/publish/$f"
+      pub_problems=1
+    fi
+  done
+
+  # 2) 字符数上限（中文简介 4000 / 使用方法 8000 / 更新日志 4000；英文同理放宽后同阈值）
+  if [[ -f "$pub_dir/description-zh.txt" ]]; then
+    n=$(wc -m <"$pub_dir/description-zh.txt" | tr -d ' ')
+    (( n < 10 || n > 4000 )) && { echo "FAIL description-zh 长度 $n，要求 10–4000"; pub_problems=1; }
+  fi
+  for f in instructions-zh.txt instructions-en.txt; do
+    [[ -f "$pub_dir/$f" ]] || continue
+    n=$(wc -m <"$pub_dir/$f" | tr -d ' ')
+    (( n == 0 || n > 8000 )) && { echo "FAIL $f 长度 $n，要求 1–8000"; pub_problems=1; }
+  done
+
+  # 3) 禁用词：芯片、外设、总线、SDK 一类。命中即 FAIL ——
+  #    这条是平台明文规则（见 docs/PUBLISHING.md §1），不是我们自己的偏好。
+  #    注意 `flashing` / `flashes` 不是 `flash`，用词边界避免误报。
+  banned='ESP32|Espressif|乐鑫|ES8311|I2C|I2S|SPI|UART|GPIO|LVGL|OLED|LCD|NimBLE|ADPCM|CJK|sdkconfig|ESP-IDF'
+  if rg -q -i "\b($banned)\b" "$pub_dir"/*.txt 2>/dev/null; then
+    echo "FAIL 发布文案里出现工程词（平台要求 play-first）:"
+    rg -n -i "\b($banned)\b" "$pub_dir"/*.txt | head -5 | sed 's/^/      /'
+    pub_problems=1
+  fi
+
+  # 4) 纯文本字段里不该有 Markdown（`**粗体**` 会原样显示成星号）
+  if rg -q '\*\*|^#{1,6} ' "$pub_dir"/*.txt 2>/dev/null; then
+    echo "FAIL 发布文案里有 Markdown 标记（这些字段是纯文本）"
+    rg -n '\*\*|^#{1,6} ' "$pub_dir"/*.txt | head -5 | sed 's/^/      /'
+    pub_problems=1
+  fi
+
+  # 5) 封面严格 3:4
+  if [[ -f "$pub_dir/cover.jpg" ]]; then    dims=$(sips -g pixelWidth -g pixelHeight "$pub_dir/cover.jpg" 2>/dev/null \
+      | awk '/pixelWidth/{w=$2} /pixelHeight/{h=$2} END{print w" "h}')
+    read -r cw ch <<<"$dims"
+    if [[ -z "${cw:-}" || -z "${ch:-}" ]]; then
+      echo "FAIL 读不到封面尺寸（sips 失败）"
+      pub_problems=1
+    elif (( cw * 4 != ch * 3 )); then
+      echo "FAIL 封面必须是严格 3:4 竖版，当前 ${cw}×${ch}"
+      pub_problems=1
+    fi
+  fi
+
+  # 6) Release 说明：ad-hoc 分发时，这是用户唯一能看到"首次打开被拦怎么办"的地方。
+  #    文案里必须写出去隔离属性的办法，否则用户下载完就卡住了。
+  if [[ ! -s "$pub_dir/release-notes.md" ]]; then
+    echo "FAIL 缺 docs/publish/release-notes.md（Release 页的用户说明）"
+    pub_problems=1
+  elif ! rg -q 'xattr -dr com\.apple\.quarantine' "$pub_dir/release-notes.md"; then
+    echo "FAIL release-notes.md 里没有 xattr 去隔离指引"
+    echo "     当前是 ad-hoc 签名，用户首次打开一定会被 Gatekeeper 拦。"
+    pub_problems=1
+  fi
+
+  if (( pub_problems == 0 )); then
+    echo "OK   文案与封面满足平台硬规则（长度 / 禁用词 / 纯文本 / 3:4）"
+  fi
+fi
+(( pub_problems )) && { status_publish=FAIL; failed=1; } || status_publish=PASS
+
+echo
 echo "== 环境快照（不影响基线结论）=="
 env_log="${TMPDIR:-/tmp}/ai-passport-mic-verify-env.log"
 if "$root/scripts/check-env.sh" >"$env_log" 2>&1; then
@@ -208,6 +286,7 @@ printf 'Protocol  : %s\n' "$status_proto"
 printf 'Font      : %s\n' "$status_font"
 printf 'Vectors   : %s\n' "$status_vectors"
 printf 'Desktop   : %s\n' "$status_desktop"
+printf 'Publish   : %s\n' "$status_publish"
 printf 'Env       : %s\n' "$status_env"
 printf 'Firmware  : SKIP（idf.py build 不在本脚本内，改固件后跑 ./scripts/build-firmware.sh）\n'
 printf 'GUI build : SKIP（tauri 依赖重，单独跑 ./scripts/build-gui.sh）\n'

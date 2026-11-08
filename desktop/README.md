@@ -146,6 +146,7 @@ open "desktop/target/debug/bundle/macos/AI Passport Mic.app"   # 必须经 Launc
 ./scripts/apmctl-macos.sh sink --to "BlackHole 2ch" --seconds 30  # 实时推进虚拟声卡
 ./scripts/apmctl-macos.sh sink --to "BlackHole 2ch" --tone --verify # 推正弦并回读
 ./scripts/apmctl-macos.sh probe --device 麦克风 --seconds 4        # 只读输入电平
+./scripts/apmctl-macos.sh check-sink --device BlackHole            # 一键验证声卡（写正弦再回读）
 ```
 
 ⚠️ **`selftest` 不要走 `apmctl-macos.sh`**：包装层经 LaunchServices 启动，进程 cwd 变成 `/`，
@@ -198,7 +199,12 @@ min / 中位 / p95 / max 与抖动（`--json` 出 `ai-passport-mic-ping-report-1
   10 min 那轮的 10 次欠载不是漂移问题，已归到 KI-006（主机攒批），**别再把两者混在一起讲**。
   2026-11-08 又修掉一个放大因子：开场攒批被读成时钟漂移、按虚假 ppm 删真实音频，
   改 `arm_drift_base()` 把起算点推迟到推入速率稳定之后。
-- **GUI 缺 G3b/G6**：回环自动验收仍在 CLI（`apmctl sink --verify`），签名只有 ad-hoc。
+- **GUI 缺 G3b**：回环自动验收仍在 CLI（`apmctl sink --verify`）。
+  声卡直通的自检已进 GUI（底栏「验证声卡」，与 `apmctl check-sink` 同一条
+  `apm_sink::check` 路径），但那测的是**声卡这一段**，不是端到端声学延迟。
+- **签名只有 ad-hoc，且这是决定不是欠账**：没有 Developer ID 证书、也不采购，
+  用户首次打开需右键「打开」或 `xattr -dr com.apple.quarantine`。
+  口径见 [`../docs/PUBLISHING.md`](../docs/PUBLISHING.md) §3。
 - **`apm-app` 是唯一的内核，但 CLI 还没完全收口**：`detect_adapter` / `connect` /
   `start_stream` / `stop_stream` / 采集解码写声卡都在 `apm-app`（`core` / `session` /
   `pipeline`），GUI 只调它（见 `../docs/GUI.md` 决定 D1）。但 CLI 的 `scan` / `status` /

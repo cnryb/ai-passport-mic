@@ -180,6 +180,14 @@ pub struct AppSnapshot {
     pub log_dir: String,
     pub settings: SettingsView,
     pub last_session: Option<SessionRecord>,
+    /// 这台机器上有没有一块"能当麦克风用"的输出设备（原生支持 16 kHz）。
+    ///
+    /// `false` 就是用户还没装虚拟声卡。界面据此决定要不要把安装指引顶到最前面——
+    /// 这一条是用户装完软件后最可能卡住的地方，靠用户自己在下拉框里对着十几项
+    /// 猜是猜不出来的（macOS 自带扬声器通常只接受 44.1/48 kHz，选了也是错的）。
+    pub sink_available: bool,
+    /// 自动挑中的那块声卡名（没有候选时为 `None`）。
+    pub sink_suggested: Option<String>,
     /// 电量百分比（0..100）。`battery_known=false` 时无意义。
     pub battery_pct: Option<u8>,
     /// 是否已经拿到过电量结论（无论有没有数字）。
@@ -339,6 +347,13 @@ impl AppCore {
 
     pub fn snapshot(&self) -> AppSnapshot {
         let battery = self.lock_inner().battery;
+        // 每次取快照都现枚举一次声卡：用户可能刚装完 BlackHole 就切回本窗口，
+        // 缓存会让"装完了但界面还说没装"。
+        //
+        // 枚举失败（被独占、CoreAudio 抽风）当作"没有可用声卡"处理：
+        // 这条信息只用来决定要不要显示引导横幅，报错反而是噪音。
+        let sinks = apm_sink::list_sinks().unwrap_or_default();
+        let suggested = apm_sink::pick_usable_sink(&sinks).map(|s| s.name.clone());
         AppSnapshot {
             version: self.version.to_string(),
             state: self.state(),
@@ -348,6 +363,8 @@ impl AppCore {
             log_dir: self.log_dir(),
             settings: self.settings_view(),
             last_session: self.lock_inner().sessions.back().cloned(),
+            sink_available: suggested.is_some(),
+            sink_suggested: suggested,
             battery_pct: battery.flatten(),
             battery_known: battery.is_some(),
         }
@@ -800,6 +817,41 @@ impl AppCore {
         self.persist(snapshot, "sink");
         self.record(LogLevel::Info, "sink", format!("输出声卡改为 {name}"));
         Ok(())
+    }
+
+    /// 一键验证虚拟声卡：往它写一段已知电平的正弦，再从它的输入端回读。
+    ///
+    /// **阻塞调用**（真实等 `seconds` 秒），调用方负责放进 `spawn_blocking`。
+    /// 逻辑本身在 `apm_sink::check`：这段"写进去再读回来"的编排不该在 GUI 里再写一遍，
+    /// 否则界面和 `apmctl sink --tone --verify` 会各自演进、结论互相矛盾。
+    ///
+    /// 为什么必须在写声卡之前验：用户装完软件后最常见的一句是"开会时对方听不到"，
+    /// 而这三层（写入 → 声卡直通 → 回读）任何一层断了都是同一个症状。
+    /// 一次验证把三层分开量，才能给出"下一步改哪一层"。
+    pub fn check_sink(&self, name: String, seconds: u64) -> Result<apm_sink::SinkCheckReport, AppError> {        self.record(
+            LogLevel::Info,
+            "sink",
+            format!("开始验证声卡 \"{name}\"（{seconds} 秒测试音）"),
+        );
+        let report = apm_sink::check_sink(&name, seconds).map_err(|e| {
+            // 打不开设备是"用户没装/名字变了"，与"打开了但不通"是两件事：
+            // 前者给 sink_missing，后者由 report.verdict 表达。
+            let code = if format!("{e:#}").contains("没有名字包含") {
+                ErrorCode::SinkMissing
+            } else {
+                ErrorCode::SinkRateUnsupported
+            };
+            AppError::new(code, format!("{e:#}"))
+        })?;
+        self.record(
+            match report.verdict {
+                apm_sink::SinkCheckVerdict::Pass => LogLevel::Info,
+                _ => LogLevel::Warn,
+            },
+            "sink",
+            format!("声卡验证：{}", report.verdict_text()),
+        );
+        Ok(report)
     }
 
     /// 是否默认保存会话 WAV。默认关（`docs/GUI.md` §12 第 3 条）。

@@ -15,6 +15,7 @@ import type {
   ProbeResult,
   QualityReport,
   SessionSummary,
+  SinkCheckReport,
   SinkView,
 } from './types'
 
@@ -30,6 +31,11 @@ export const api = {
 
   listSinks: () => invoke<SinkView[]>('list_sinks'),
   setSink: (name: string) => invoke<void>('set_sink', { name }),
+  /** 一键验证虚拟声卡：写一段已知电平的正弦，再从输入端回读。阻塞约 `seconds` 秒。 */
+  checkSink: (name: string, seconds?: number) =>
+    invoke<SinkCheckReport>('check_sink', { name, seconds }),
+  openSoundSettings: () => invoke<void>('open_sound_settings'),
+  openVirtualAudioDownload: () => invoke<void>('open_virtual_audio_download'),
   setBufferTarget: (ms: number) => invoke<void>('set_buffer_target', { ms }),
   setAutoStopMin: (minutes: number) => invoke<void>('set_auto_stop_min', { minutes }),
   setSaveWav: (save: boolean) => invoke<void>('set_save_wav', { save }),

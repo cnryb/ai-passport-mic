@@ -1,0 +1,11 @@
+Turn AI Passport into a pocket wireless microphone. In meetings, recordings or livestreams the
+device is your mic: tap OK to start talking, tap again to stop, and your voice goes straight into
+your meeting app's microphone input. No headset cable, no leaning into the laptop. UP and DOWN
+can be remapped to any shortcut — raise a hand, switch slides, mute.
+
+Requires a Mac and a small companion desktop app (one right-click Open the first time).
+
+The device screen shows battery, connection state and what each button does; it dims after
+30 seconds of inactivity to save power.
+
+Good for remote meetings, online classes, quick podcast takes and livestream audio.

@@ -53,7 +53,7 @@ PC，由 PC 输出到系统虚拟声卡，会议软件选择该虚拟声卡作�
 | [`device/`](device/) | 固件（ESP-IDF 5.5.3 / ESP32-C3 / 8 MB Flash / 无 PSRAM），见 [`device/README.md`](device/README.md) |
 | [`desktop/`](desktop/) | Rust workspace：protocol / link / sink / app / cli / gui；GUI 为 Tauri 2 + Vue 3，见 [`desktop/README.md`](desktop/README.md) |
 | [`config/`](config/) | 按键映射样例 [`button-map.example.json`](config/button-map.example.json) 与字段说明 [`config/README.md`](config/README.md)、跨端协议向量 `protocol-vectors.json`（由 C 实现导出） |
-| [`docs/`](docs/) | [产品](docs/PRODUCT.md) · [架构](docs/ARCHITECTURE.md) · [环境](docs/ENVIRONMENT.md) · [音质](docs/SOUND_QUALITY.md) · [路线图](docs/ROADMAP.md) · [参考实现](docs/REFERENCES.md) · [GUI 方案](docs/GUI.md) · [GUI 实施记录](docs/GUI_IMPLEMENTATION_LOG.md) · [已知问题](docs/KNOWN_ISSUES.md) · [待办清单](docs/TODO.md) |
+| [`docs/`](docs/) | [索引](docs/README.md) · [产品](docs/PRODUCT.md) · [架构](docs/ARCHITECTURE.md) · [环境](docs/ENVIRONMENT.md) · [音质](docs/SOUND_QUALITY.md) · [路线图](docs/ROADMAP.md) · [参考实现](docs/REFERENCES.md) · [GUI 方案](docs/GUI.md) · [GUI 实施记录](docs/GUI_IMPLEMENTATION_LOG.md) · [已知问题](docs/KNOWN_ISSUES.md) · [待办清单](docs/TODO.md) · [发布](docs/PUBLISHING.md) |
 | [`scripts/`](scripts/) | 环境体检、IDF 激活、基线自检、协议单测与向量导出、固件构建、GUI 打包、性能与长测、macOS app-bundle 运行器 |
 | [`.github/workflows/`](.github/workflows/) | CI：PR 跑门禁（`verify.sh` + clippy + 前端），v* tag 或手动触发时在 ESP-IDF 容器里编固件、双架构打 macOS 包并发 Release |
 | [`AGENTS.md`](AGENTS.md) | 仓库规则与交付口径（AI 协作入口） |

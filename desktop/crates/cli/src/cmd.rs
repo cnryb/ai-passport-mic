@@ -1544,8 +1544,60 @@ fn sink_tone(out: &mut apm_sink::Sink, seconds: u64, verify: bool) -> Result<()>
 ///
 /// 排查用：同样一份代码去读内置麦克风，如果内置有正常电平、虚拟声卡没有，
 /// 说明权限没问题，问题在虚拟声卡的直通；两边都静音则说明是权限被拒。
-pub fn probe(name: &str, seconds: u64) -> Result<()> {
-    let p = apm_sink::Probe::open(name, AUDIO_SAMPLE_RATE).context("打开输入设备失败")?;
+/// 一键验证虚拟声卡（与 GUI 的「验证声卡」走同一条路径）。
+///
+/// 三层分别量：写进去的电平、声卡有没有被喂空、从输入端回读到的电平。
+/// 只在最后一层上做判定 —— 前两层是为了在失败时能说清"是哪一层断的"。
+pub fn check_sink(name: &str, seconds: u64, as_json: bool) -> Result<()> {
+    let report = apm_sink::check_sink(name, seconds).context("声卡自检失败")?;
+    if as_json {
+        // 报告结构自带 schema 版本字段的语义由外层保证；这里直接序列化。
+        let text = serde_json::to_string_pretty(&report).context("序列化报告失败")?;
+        println!("{text}");
+        return Ok(());
+    }
+    println!("设备: {}", report.device_name);
+    println!("时长: {} 秒，请求电平 {:.1} dBFS RMS", report.seconds, report.requested_dbfs);
+    println!(
+        "写入: {} 帧，RMS {}",
+        report.pushed_frames,
+        report
+            .written_rms_dbfs
+            .map(|v| format!("{v:.2} dBFS"))
+            .unwrap_or_else(|| "—".into())
+    );
+    println!(
+        "回读: {:.2} s，RMS {}，峰值 {}",
+        report.loopback_seconds,
+        report
+            .loopback_rms_dbfs
+            .map(|v| format!("{v:.2} dBFS"))
+            .unwrap_or_else(|| "无样本".into()),
+        report
+            .loopback_peak_dbfs
+            .map(|v| format!("{v:.2} dBFS"))
+            .unwrap_or_else(|| "—".into())
+    );
+    println!("运行期欠载: {} 次", report.underruns);
+    println!();
+    println!("判定: {}", report.verdict_text());
+    match report.verdict {
+        apm_sink::SinkCheckVerdict::Pass => {
+            println!("下一步: 在会议软件里把麦克风选成这块设备的输入");
+        }
+        apm_sink::SinkCheckVerdict::LoopbackNoSamples => {
+            println!("提示: 这条命令要读输入设备，必须从 .app bundle 启动才有麦克风权限");
+            println!("      ./scripts/apmctl-macos.sh check-sink --device BlackHole");
+        }
+        _ => {
+            println!("排查: apmctl probe --device \"{}\" 只读电平，用来区分权限与直通",
+                report.device_name);
+        }
+    }
+    Ok(())
+}
+
+pub fn probe(name: &str, seconds: u64) -> Result<()> {    let p = apm_sink::Probe::open(name, AUDIO_SAMPLE_RATE).context("打开输入设备失败")?;
     println!("监听 \"{name}\" {} 秒...", seconds);
     std::thread::sleep(Duration::from_secs(seconds));
     println!(

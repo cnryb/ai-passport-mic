@@ -69,6 +69,64 @@ pub fn set_sink(state: State<'_, GuiState>, name: String) -> Result<(), AppError
     state.core.set_sink(name)
 }
 
+/// 一键验证虚拟声卡：写一段已知电平的正弦，再从输入端回读。
+///
+/// 阻塞 `seconds` 秒（默认 2 s，够 RMS 稳定），所以必须进 `spawn_blocking`——
+/// 直接在命令里跑会把 Tauri 的异步运行时堵住，界面在此期间完全不响应。
+#[tauri::command]
+pub async fn check_sink(
+    state: State<'_, GuiState>,
+    name: String,
+    seconds: Option<u64>,
+) -> Result<apm_app::SinkCheckReport, AppError> {
+    let core = state.core.clone();
+    let seconds = seconds.unwrap_or(2).clamp(1, 10);
+    tauri::async_runtime::spawn_blocking(move || core.check_sink(name, seconds))
+        .await
+        .map_err(|e| AppError::internal(format!("声卡验证任务失败：{e}")))?
+}
+
+/// 打开「系统设置 → 声音」，让用户自己确认输入输出。
+///
+/// 为什么不直接告诉用户"去系统设置里改"：路径会随 macOS 版本变，
+/// 一句 `open` 比一段文字描述可靠得多，而且用户点完就在那个面板里。
+#[tauri::command]
+pub fn open_sound_settings() -> Result<(), AppError> {
+    #[cfg(target_os = "macos")]
+    {
+        std::process::Command::new("open")
+            .arg("x-apple.systempreferences:com.apple.Sound-Settings.extension")
+            .spawn()
+            .map(|_| ())
+            .map_err(|e| AppError::internal(format!("打开系统设置失败：{e}")))
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        Err(AppError::internal("首发只支持 macOS"))
+    }
+}
+
+/// 在浏览器里打开虚拟声卡的官方下载页。
+///
+/// **不静默安装、不随包分发**：BlackHole 是 GPL-3.0，随包分发需要商业许可
+/// （见 `docs/ARCHITECTURE.md` 的「分发与安装成本」）。让用户自己去官网下，
+/// 它保持独立软件的身份，也就没有许可证问题。
+#[tauri::command]
+pub fn open_virtual_audio_download() -> Result<(), AppError> {
+    #[cfg(target_os = "macos")]
+    {
+        std::process::Command::new("open")
+            .arg("https://existential.audio/blackhole/")
+            .spawn()
+            .map(|_| ())
+            .map_err(|e| AppError::internal(format!("打开下载页失败：{e}")))
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        Err(AppError::internal("首发只支持 macOS"))
+    }
+}
+
 #[tauri::command]
 pub fn set_save_wav(state: State<'_, GuiState>, save: bool) -> Result<(), AppError> {
     state.core.set_save_wav(save)

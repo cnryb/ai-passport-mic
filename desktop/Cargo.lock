@@ -175,6 +175,7 @@ dependencies = [
  "anyhow",
  "apm-protocol",
  "cpal",
+ "serde",
 ]
 
 [[package]]

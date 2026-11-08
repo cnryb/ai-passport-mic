@@ -124,6 +124,15 @@ export interface AppSnapshot {
   log_dir: string
   settings: SettingsView
   last_session: SessionRecord | null
+  /**
+   * 这台机器上有没有一块"能当麦克风用"的输出设备（原生支持 16 kHz）。
+   *
+   * `false` 就是还没装虚拟声卡 —— 这是用户装完软件后最可能卡住的地方，
+   * 界面据此把安装指引顶到最前面，而不是让用户在下拉框里对着十几项猜。
+   */
+  sink_available: boolean
+  /** 内核自动挑中的那块声卡名（没有候选时为 null）。 */
+  sink_suggested: string | null
   /** 电量百分比（0..100）。`battery_known=false` 时无意义。 */
   battery_pct: number | null
   /**
@@ -215,6 +224,31 @@ export interface SinkView {
   max_rate: number
   supports_16k: boolean
 }
+
+/**
+ * 声卡自检结果。字段都是原始量，判定另给 `verdict` —— 让人可以不同意判定而自己看数字。
+ *
+ * 三层分别量：`written_rms_dbfs`（我们写进去的）、`underruns`（声卡有没有被喂空）、
+ * `loopback_rms_dbfs`（从输入端回读到的，这才是"能不能被听到"）。
+ */
+export interface SinkCheckReport {
+  device_name: string
+  requested_dbfs: number
+  seconds: number
+  pushed_frames: number
+  written_rms_dbfs: number | null
+  loopback_seconds: number
+  loopback_rms_dbfs: number | null
+  loopback_peak_dbfs: number | null
+  underruns: number
+  verdict: SinkCheckVerdict
+}
+
+export type SinkCheckVerdict =
+  | 'pass'
+  | 'loopback_silent'
+  | 'loopback_no_samples'
+  | 'sink_stalled'
 
 export interface ReportCheck {
   name: string

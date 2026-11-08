@@ -1,0 +1,10 @@
+First release: turn AI Passport into a pocket wireless microphone.
+
+- Tap OK to start and stop talking; your voice goes straight into your meeting app's mic input
+- The device screen shows battery, connection state and what each of the three buttons does;
+  hold UP/DOWN to turn the screen on or off
+- UP and DOWN can be mapped to any shortcut, so you can raise a hand or switch slides without
+  reaching for the keyboard
+- The companion app can verify your audio driver in one tap: it plays a test tone and reads it
+  back from the input side, and tells you whether the driver is missing or microphone permission
+  was denied

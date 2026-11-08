@@ -11,9 +11,11 @@
 #   v* tag 推送   -> gate + 固件 + 双架构打包 + 发 Release
 #   手动触发      -> gate + 固件 + 双架构打包（不发 Release）
 #
-# 这个 workflow 只产出 **ad-hoc 签名** 的 .app（G6 未做：没有 Developer ID、
-# 没有公证）。产物在别的机器上会被 Gatekeeper 拦：首次打开右键「打开」，
+# 这个 workflow 只产出 **ad-hoc 签名** 的 .app —— 这是既定口径，不是临时状态：
+# 没有 Developer ID 证书、也不采购（docs/PUBLISHING.md §3）。
+# 产物在别的机器上会被 Gatekeeper 拦：首次打开右键「打开」，
 # 或执行 xattr -dr com.apple.quarantine "/Applications/AI Passport Mic.app"。
+# 这条已写进发布文案（docs/publish/instructions-*.txt）的第一条步骤。
 
 name: macOS build
 
@@ -74,8 +76,8 @@ jobs:
             cargo-gate-${{ runner.arch }}-
 
       # 直接跑仓库既有的单一入口，不在这里另写一套编排（同 docs/GUI.md 决定 D1）。
-      # 它覆盖：目录结构、文档内链、脚本可执行位、固件主机侧单测（协议 44 + 省电 65）、
-      # 跨端向量新鲜度、cargo test。
+      # 它覆盖：目录结构、文档内链、脚本可执行位、固件主机侧单测（协议 + 省电 + 屏幕）、
+      # 点阵字库新鲜度、跨端向量、cargo test、发布文案与封面（长度 / 禁用词 / 3:4）。
       #
       # 它的「环境快照」段在这里必然 FAIL —— runner 上没装 ESP-IDF，而 ESP-IDF 只在
       # 下面的 firmware job 的容器里。verify.sh 非 --strict 时不因此退出非零，
@@ -229,12 +231,16 @@ jobs:
           [[ "$got" == "${{ matrix.arch }}" ]] || { echo "FAIL 架构不符"; exit 1; }
 
           codesign --verify --deep --strict --verbose=2 "$app"
-          # 如实标注：只做到 ad-hoc。G6（Developer ID + 公证）没做，
-          # 所以产物在别的机器上会被 Gatekeeper 拦，这不是 bug。
+          # 如实标注：这是**决定**，不是"还没做"。
+          # 没有 Developer ID 证书、也不采购（见 docs/PUBLISHING.md §3），
+          # 所以产物在别的机器上会被 Gatekeeper 拦，首次打开要右键「打开」
+          # 或 xattr -dr com.apple.quarantine。这条不是 bug。
           if codesign -dv "$app" 2>&1 | grep -q "Signature=adhoc"; then
-            echo "签名: ad-hoc（未公证，G6 未做）"
+            echo "签名: ad-hoc（无证书，符合当前分发口径；未公证）"
           else
             echo "FAIL 签名不是 ad-hoc，与 tauri.conf.json 的 signingIdentity 不一致"
+            echo "     如果这次是有意加了 Developer ID，请同步更新 docs/PUBLISHING.md §3"
+            echo "     与 docs/TODO.md 的 G6 条目，否则文档会与实际产物相反。"
             exit 1
           fi
 
@@ -302,6 +308,26 @@ jobs:
           sha256sum ./*.zip ./*.bin | sed 's|  \./|  |' > SHA256SUMS.txt
           cat SHA256SUMS.txt
 
+      # Release 说明引用仓库里的 docs/publish/release-notes.md，不在 workflow 里内联。
+      #
+      # 理由（实测过两次）：多行正文塞进 YAML 的 `run: |` 块标量，只要里面有一行
+      # 顶格（heredoc 正文就是顶格写的），YAML 会认为块结束并去解析那些中文字行，
+      # 直接报 `could not find expected ':'`。放进独立文件既避开这个坑，
+      # 也让"用户看到的首次打开步骤"能被 review 和 diff。
+      - name: 检查 Release 说明存在
+        run: |
+          set -euo pipefail
+          test -s docs/publish/release-notes.md || {
+            echo "FAIL 缺 docs/publish/release-notes.md"
+            echo "     它是用户看到「首次打开被 Gatekeeper 拦怎么办」的唯一说明。"
+            exit 1
+          }
+          # ad-hoc 分发的前提：说明里必须写了怎么绕过隔离属性。
+          grep -q 'xattr -dr com.apple.quarantine' docs/publish/release-notes.md || {
+            echo "FAIL release-notes.md 里没有 xattr 去隔离指引"
+            exit 1
+          }
+
       - name: 创建或补全 Release
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
@@ -312,9 +338,11 @@ jobs:
           if gh release view "$tag" >/dev/null 2>&1; then
             # 重跑：补传/覆盖资产，不重复建 Release。
             gh release upload "$tag" "${assets[@]}" --clobber
+            # 说明也要跟着更新：改了文案而 Release 页还留着旧口径比没有更糟。
+            gh release edit "$tag" --notes-file docs/publish/release-notes.md
           else
             gh release create "$tag" "${assets[@]}" \
               --title "AI Passport Mic $tag" \
-              --generate-notes \
-              --notes "ad-hoc 签名、未公证（G6 未做）。首次打开请右键「打开」，或执行：xattr -dr com.apple.quarantine \"/Applications/AI Passport Mic.app\"。"
+              --notes-file docs/publish/release-notes.md \
+              --generate-notes
           fi

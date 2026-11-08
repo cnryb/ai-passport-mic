@@ -25,7 +25,17 @@
 - **电源键不接 MCU**（硬件锁存：按住 0.5 s 开机、长按 2 s 关机），固件看不见它——
   **"按电源键亮屏"在这块板上做不到**，已用长按 UP/DOWN 替代。
 - **没有**：G3b 回环自动验收（`--verify` 仍在
-  `apmctl`）、G6 签名公证（只有 ad-hoc）、GUI 的 `run_selftest`、Windows 注入（SendInput）。
+  `apmctl`）、G6 签名公证（只有 ad-hoc，**且不打算做**，见下）、GUI 的 `run_selftest`、
+  Windows 注入（SendInput）。
+- **有**：虚拟声卡引导与一键验证——`apm_sink::check_sink` 往声卡写 -20 dBFS 正弦再从输入端
+  回读，三层（写入 / 欠载 / 回读）分开量；GUI 实时页在没有可用声卡时顶出安装指引，
+  底栏「验证声卡」跑同一条路径。**2026-11-08 真机实测**：写入 -20.00 / 回读 -20.24 dBFS、
+  0 欠载。**不随包分发 BlackHole**（GPL-3.0），只给下载链接。
+- **发布口径**：发到 FoloToy 玩法社区（`ai-passport.folotoy.cn`），形态是"玩法"——
+  一份从 0x0 可写的合并镜像 + play-first 文案 + 严格的 3:4 封面。**发布出去的桌面端
+  ad-hoc 签名、不公证**（没有 Developer ID 证书，也不买），首次打开要用户右键「打开」
+  或 `xattr -dr com.apple.quarantine`，这条必须写进文案。全部口径见
+  [`docs/PUBLISHING.md`](docs/PUBLISHING.md)。
 - **编排只有一份**：`detect_adapter` / `scan` / `connect` / `start_stream` / `stop_stream`
   / 采集解码写声卡全在 `apm-app`（`core` / `session` / `pipeline`）。`cli` 与 `gui` 都只调它，
   「录 WAV 并分析」用 `apmctl` 或界面都行，走的是同一条管线与同一份报告。
@@ -91,8 +101,9 @@ device/   固件（ESP-IDF 5.5.3、ESP32-C3）。落地后在此目录内自带 
 desktop/  PC 软件（Rust workspace：protocol / link / sink / app / cli / gui；
           GUI = Tauri 2 + Vue 3，G0–G6 已到 G5，G3b/G6 未做）。
 config/   按键映射 schema 与样例。
-docs/     产品、架构、环境、音质、路线图、参考实现、GUI 方案（含实施记录 GUI_IMPLEMENTATION_LOG.md）、
-          已知问题（KNOWN_ISSUES.md）。
+docs/     入口是 docs/README.md（索引）；产品、架构、环境、音质、路线图、参考实现、
+          GUI 方案（含实施记录 GUI_IMPLEMENTATION_LOG.md）、已知问题（KNOWN_ISSUES.md）、
+          待办（TODO.md）、发布到玩法社区（PUBLISHING.md）。
 scripts/  环境与校验入口。
 ```
 

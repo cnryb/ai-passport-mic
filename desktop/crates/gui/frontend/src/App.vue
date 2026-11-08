@@ -19,6 +19,7 @@ import {
   type QualityReport,
   type SessionRecord,
   type SessionSummary,
+  type SinkCheckReport,
   type SinkView,
   type Telemetry,
 } from './lib/types'
@@ -64,6 +65,13 @@ const groupsCollapsed = ref(false)
 
 const sinks = ref<SinkView[]>([])
 const sink = ref<string | null>(null)
+/** 这台机器上有没有能当麦克风用的输出设备（原生 16 kHz）。false = 还没装虚拟声卡。 */
+const sinkAvailable = ref(true)
+/** 内核自动挑中的那块声卡名，用于"一键选用"。 */
+const sinkSuggested = ref<string | null>(null)
+/** 声卡自检结果。null = 没跑过。 */
+const sinkCheck = ref<SinkCheckReport | null>(null)
+const sinkChecking = ref(false)
 const targetMs = ref(80)
 const saveWav = ref(false)
 const autoConnect = ref(false)
@@ -303,10 +311,13 @@ async function onAutoConnectChange() {
 async function refreshSinks() {
   await handle(async () => {
     sinks.value = await api.listSinks()
+    // 内核已经按"虚拟声卡优先 + 稳定排序"挑过一块（`apm_sink::pick_usable_sink`），
+    // 这里只跟着它的结论走：两份挑选逻辑各写一遍，就会在一台装了两块
+    // 虚拟声卡的机器上互相抢。
+    sinkAvailable.value = sinks.value.some((s) => s.supports_16k)
     if (!sink.value) {
-      // 默认优先选 BlackHole：这是 macOS 上最常见的虚拟声卡，且名字能认出来。
       const preferred =
-        sinks.value.find((s) => s.name.toLowerCase().includes('blackhole') && s.supports_16k) ??
+        (sinkSuggested.value && sinks.value.find((s) => s.name === sinkSuggested.value)) ||
         sinks.value.find((s) => s.supports_16k)
       if (preferred) {
         sink.value = preferred.name
@@ -315,6 +326,62 @@ async function refreshSinks() {
     }
   })
 }
+
+/**
+ * 一键验证当前选中的声卡：写一段已知电平的正弦，再从它的输入端回读。
+ *
+ * 为什么要给按钮而不是让用户"开个会试试"：会议软件里对方听不到，可能是
+ * 写入、声卡直通、系统音量、会议软件选错设备四件事之一。这个按钮把前两件
+ * 直接量出来，剩下的才轮到用户去查。
+ */
+async function runSinkCheck() {
+  const name = sink.value
+  if (!name || sinkChecking.value) return
+  sinkChecking.value = true
+  sinkCheck.value = null
+  try {
+    sinkCheck.value = await api.checkSink(name, 2)
+    if (sinkCheck.value.verdict === 'pass') {
+      flash('声卡直通正常，会议软件里把麦克风选成它即可')
+    }
+  } catch (err) {
+    pushError(asAppError(err))
+  } finally {
+    sinkChecking.value = false
+  }
+}
+
+/** 打开虚拟声卡下载页。不静默安装、不随包分发（BlackHole 是 GPL-3.0）。 */
+async function openVirtualAudioDownload() {
+  await handle(() => api.openVirtualAudioDownload())
+}
+
+/** 打开系统「声音」设置。路径由后端拼，前端只管点。 */
+async function openSoundSettings() {
+  await handle(() => api.openSoundSettings())
+}
+
+/** 声卡自检结论的界面文案。判定在后端做，这里只负责翻译。 */
+const sinkCheckText = computed(() => {
+  const r = sinkCheck.value
+  if (!r) return ''
+  const w = r.written_rms_dbfs === null ? '—' : `${r.written_rms_dbfs.toFixed(1)} dBFS`
+  const l = r.loopback_rms_dbfs === null ? '—' : `${r.loopback_rms_dbfs.toFixed(1)} dBFS`
+  switch (r.verdict) {
+    case 'pass':
+      return `直通正常：写入 ${w}，回读 ${l}`
+    case 'loopback_silent':
+      return `回读几乎静音（${l}）：要么这块声卡没有直通，要么本 App 没有麦克风权限`
+    case 'loopback_no_samples':
+      return '输入端一个样本都没读到：最可能是麦克风权限被拒绝'
+    case 'sink_stalled':
+      return `写入端自身有 ${r.underruns} 次欠载，回读结论不可采信（先解决喂入问题再验）`
+  }
+})
+
+/** 声卡自检是否需要显示"没装虚拟声卡"的安装引导。 */
+const sinkGuideOpen = ref(false)
+const needSinkInstall = computed(() => !sinkAvailable.value && !streaming.value)
 
 async function onSinkChange() {
   if (!sink.value) return
@@ -536,6 +603,8 @@ onMounted(async () => {
     // 只等事件会一直空白（顶栏的 v-if 要求 batteryKnown）。
     battery.value = snap.battery_pct
     batteryKnown.value = snap.battery_known
+    sinkAvailable.value = snap.sink_available
+    sinkSuggested.value = snap.sink_suggested
     // 没有上次连接记录 = 大概率是新装或新设备，直接落到烧写页，省掉"入口在哪"。
     // 已经连过设备的人不该被拽走，所以只在既没历史也没连接时切。
     if (
@@ -659,6 +728,47 @@ onUnmounted(() => {
     <main class="content scroll">
       <!-- ---------- 实时 ---------- -->
       <div v-if="tab === 'live'" class="page live">
+        <!-- 虚拟声卡引导：**必须顶在最前面**。macOS 自带扬声器不接受 16 kHz，
+             没有虚拟声卡时"开始"一定失败，而且失败信息（sink_missing）
+             对用户毫无指向性。这条卡片只在真的没有可用设备时出现。 -->
+        <section v-if="needSinkInstall" class="card sink-guide">
+          <div class="card-head">
+            <h2>还差一步：装一块虚拟声卡</h2>
+            <span class="spacer" />
+            <button class="sm ghost" @click="sinkGuideOpen = !sinkGuideOpen">
+              {{ sinkGuideOpen ? '收起' : '怎么做' }}
+            </button>
+          </div>
+          <p>
+            这台电脑上还没有能把音频"变成麦克风"的设备。会议软件只能选系统里已有的
+            输入设备，所以需要一个虚拟声卡当中转：
+            <b>本软件 → 虚拟声卡 → 会议软件</b>。
+          </p>
+          <p class="dim">
+            已装过但这里还是空白？点底栏的「重新枚举」，或确认它是原生支持 16 kHz 的
+            那一款（BlackHole 2ch 可以，16ch 也可以）。
+          </p>
+          <div v-if="sinkGuideOpen" class="sink-guide-body">
+            <ol>
+              <li>
+                打开
+                <button class="link" @click="openVirtualAudioDownload">BlackHole 下载页</button>
+                （免费，macOS 13+）。
+              </li>
+              <li>安装时选择 <code>2ch</code>；装完可能需要重启，或执行 <code>killall coreaudiod</code>。</li>
+              <li>回到本窗口点「重新枚举」，下拉框里选中新出现的 <code>BlackHole 2ch</code>。</li>
+              <li>
+                点底栏「验证声卡」跑一次自检——
+                <b>它会把"写进去"和"读回来"的电平都量出来</b>，通过再去开会。
+              </li>
+              <li>
+                最后在会议软件里把麦克风选成 <code>BlackHole 2ch</code> 的
+                <b>输入</b>。选错方向是这一步最常见的坑。
+              </li>
+            </ol>
+          </div>
+        </section>
+
         <section class="card meter grow-card">
           <div class="card-head">
             <h2>电平与指标</h2>
@@ -856,6 +966,18 @@ onUnmounted(() => {
       <button class="sm ghost" :disabled="streaming" title="装完虚拟声卡后点这里" @click="refreshSinks">
         重新枚举
       </button>
+      <button
+        class="sm ghost"
+        :disabled="streaming || !sink || sinkChecking"
+        :title="
+          sink
+            ? '往这块声卡写一段测试音，再从它的输入端回读，验证直通是否正常'
+            : '先选一块声卡'
+        "
+        @click="runSinkCheck"
+      >
+        {{ sinkChecking ? '验证中…' : '验证声卡' }}
+      </button>
 
       <span class="divider" />
 
@@ -883,6 +1005,18 @@ onUnmounted(() => {
       </button>
       <button v-else class="danger main" @click="stopStream">停止</button>
     </footer>
+
+    <!-- 声卡自检结果：显示在底栏上方，不挡住操作条。
+         用 `aria-live` 让读屏器念出来——这个结论只有视觉呈现的话，
+         盲用户完全拿不到"声卡到底通没通"。 -->
+    <div v-if="sinkCheck" class="sink-check" :class="sinkCheck.verdict" aria-live="polite">
+      <span class="verdict">{{ sinkCheck.verdict === 'pass' ? 'PASS' : 'FAIL' }}</span>
+      <span class="text">{{ sinkCheckText }}</span>
+      <span class="spacer" />
+      <span class="dim mono">{{ sinkCheck.device_name }}</span>
+      <button class="sm ghost" @click="openSoundSettings">系统声音设置</button>
+      <button class="sm ghost" @click="sinkCheck = null">关闭</button>
+    </div>
 
     <transition name="fade">
       <div v-if="toast" class="toast">{{ toast }}</div>
@@ -1434,6 +1568,95 @@ onUnmounted(() => {
   height: 32px;
   font-size: var(--fs-13);
   padding: 0 18px;
+}
+
+/* ---------- 虚拟声卡引导 ----------
+   这条卡片出现时用户一定还没装虚拟声卡，"开始"必然失败。
+   所以它必须有视觉重量（不跟普通卡片同色），否则会被当成提示语划过去。 */
+.sink-guide {
+  border-color: #4a6b8a;
+  background: linear-gradient(180deg, #16283a, #131a22);
+}
+
+.sink-guide .card-head h2 {
+  color: #ffd479;
+}
+
+.sink-guide p {
+  margin: 6px 0 0;
+  font-size: var(--fs-12);
+  line-height: 1.65;
+  color: var(--muted);
+}
+
+.sink-guide-body {
+  margin-top: var(--s3);
+  padding-top: var(--s3);
+  border-top: 1px solid var(--line-soft);
+}
+
+.sink-guide-body ol {
+  margin: 0;
+  padding-left: 20px;
+  font-size: var(--fs-12);
+  line-height: 1.9;
+  color: var(--muted);
+}
+
+.sink-guide-body code {
+  padding: 1px 5px;
+  border-radius: 3px;
+  background: #ffffff0e;
+  font-size: var(--fs-11);
+}
+
+/* 行内按钮：外观是链接，但用的是 button —— 它执行动作（打开浏览器），
+   不是跳转，用 <a> 会让键盘用户以为能用 Enter 在新标签打开。 */
+button.link {
+  display: inline;
+  padding: 0;
+  border: none;
+  background: none;
+  color: var(--accent);
+  font-size: inherit;
+  text-decoration: underline;
+  cursor: pointer;
+}
+
+/* ---------- 声卡自检结果条 ----------
+   放在底栏上方而不是内容区：验证时用户可能在任何 tab，
+   结论必须跟着走，且不能把底栏的"开始"挤偏。 */
+.sink-check {
+  flex: 0 0 auto;
+  display: flex;
+  align-items: center;
+  gap: var(--s2);
+  padding: 6px var(--s4);
+  font-size: var(--fs-12);
+  border-top: 1px solid var(--line-soft);
+}
+
+.sink-check.pass {
+  background: #16301f;
+  color: #b9e6c6;
+}
+
+.sink-check.fail {
+  background: #33201f;
+  color: #f0c0bc;
+}
+
+.sink-check .verdict {
+  font-weight: 700;
+  font-size: var(--fs-11);
+  letter-spacing: 0.04em;
+}
+
+.sink-check .text {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
 }
 
 /* ---------- toast ---------- */

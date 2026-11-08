@@ -16,6 +16,9 @@ pub mod settings;
 pub mod state;
 
 pub use core::{AppCore, AppSnapshot, SessionRecord, SinkView};
+// 声卡自检的报告类型从 apm-sink 转发出去：GUI 只依赖 apm-app（`docs/GUI.md` 决定 D1），
+// 不该为了一个返回类型再引一次 apm-sink。
+pub use apm_sink::{SinkCheckReport, SinkCheckVerdict};
 pub use events::{AppEvent, LogEntry, LogLevel};
 pub use firmware::{FirmwareImage, FlashReport, ImageInfo, PortView, ProbeResult};
 pub use pipeline::Pipeline;

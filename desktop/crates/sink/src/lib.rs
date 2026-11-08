@@ -14,11 +14,15 @@
 
 mod playout;
 
+pub mod check;
+pub mod tone;
+
+pub use check::{check as check_sink, SinkCheckReport, SinkCheckVerdict};
 pub use playout::{
     Playout, Stats, GAP_BUCKETS_MS, MAX_SLIP, TARGET_MAX_MS, TARGET_MIN_MS, UNDERFED_MS,
     UNDERRUN_LOG,
 };
-
+pub use tone::{rms_dbfs, ToneSource};
 use anyhow::{anyhow, Context, Result};
 use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -88,6 +92,34 @@ pub fn list_sinks() -> Result<Vec<SinkInfo>> {
     }
     out.sort_by_key(|s| s.name.to_lowercase());
     Ok(out)
+}
+
+impl SinkInfo {
+    /// 这块设备看起来是不是"虚拟声卡"（会议软件当麦克风用的那种）。
+    ///
+    /// 靠名字认，没有更可靠的办法：CoreAudio 的设备属性里没有"我是虚拟设备"这个位。
+    /// 认错的下场是界面给出错误的安装指引，所以这里只列**明确见过**的名字，
+    /// 不做模糊匹配（例如不能因为叫 "BlackHole 16ch" 就拒绝——那也是同一家的）。
+    pub fn looks_virtual(&self) -> bool {
+        let n = self.name.to_lowercase();
+        ["blackhole", "loopback", "soundflower", "vb-cable", "cable input", "virtual"]
+            .iter()
+            .any(|k| n.contains(k))
+    }
+}
+
+/// 在输出设备里挑一块"可以当虚拟声卡用"的：优先虚拟声卡，其次任何原生支持 16 kHz 的。
+///
+/// 返回 `None` 表示这台机器上**一块原生支持 16 kHz 的输出都没有**，
+/// 也就是用户还没装虚拟声卡（macOS 自带的扬声器通常只接受 44.1/48 kHz）。
+/// 界面据此决定要不要弹安装指引，而不是让用户在下拉框里对着十几项猜。
+pub fn pick_usable_sink(list: &[SinkInfo]) -> Option<&SinkInfo> {
+    list.iter()
+        .filter(|s| s.supports_16k)
+        .max_by_key(|s| {
+            // 虚拟声卡优先；同为虚拟声卡时按名字排序，保证多次启动选到的是同一块。
+            (s.looks_virtual() as u8, std::cmp::Reverse(s.name.clone()))
+        })
 }
 
 impl Sink {
@@ -473,6 +505,8 @@ where
 
 #[cfg(test)]
 mod tests {
+    use super::{pick_usable_sink, SinkInfo};
+
     /// `cpal::Stream` 必须是 `Send` —— 这是 KI-004 能否关闭的判据。
     ///
     /// 0.15 里它是 `!Send`，所以声卡对象**只能**在创建它的线程里活一辈子，
@@ -483,5 +517,50 @@ mod tests {
     fn cpal_stream_is_send() {
         fn assert_send<T: Send>() {}
         assert_send::<cpal::Stream>();
+    }
+
+    fn sink(name: &str, supports_16k: bool) -> SinkInfo {
+        SinkInfo {
+            name: name.into(),
+            min_rate: 44_100,
+            max_rate: 48_000,
+            supports_16k,
+        }
+    }
+
+    #[test]
+    fn picks_virtual_sink_over_builtin_speakers() {
+        // 典型 macOS 机器：内置扬声器 44.1/48k（不支持 16k）+ 装了 BlackHole。
+        let list = vec![sink("Mac mini 扬声器", false), sink("BlackHole 2ch", true)];
+        assert_eq!(pick_usable_sink(&list).map(|s| s.name.as_str()), Some("BlackHole 2ch"));
+    }
+
+    #[test]
+    fn returns_none_when_nothing_supports_16k() {
+        // 这就是"还没装虚拟声卡"的机器：界面必须据此给安装指引，不能让用户自己猜。
+        let list = vec![sink("Mac mini 扬声器", false), sink("耳机", false)];
+        assert!(pick_usable_sink(&list).is_none());
+    }
+
+    #[test]
+    fn prefers_virtual_over_other_16k_devices() {
+        // 某些声卡（如音频接口）也支持 16 kHz，但它们不是会议软件要选的麦克风。
+        let list = vec![sink("USB Audio Interface", true), sink("BlackHole 16ch", true)];
+        assert_eq!(
+            pick_usable_sink(&list).map(|s| s.name.as_str()),
+            Some("BlackHole 16ch")
+        );
+    }
+
+    #[test]
+    fn choice_is_stable_across_runs() {
+        // 枚举顺序由 CoreAudio 决定、每次可能不同；同样的设备集合必须选到同一块，
+        // 否则用户每次启动都被换声卡。
+        let a = vec![sink("BlackHole 2ch", true), sink("BlackHole 16ch", true)];
+        let b = vec![sink("BlackHole 16ch", true), sink("BlackHole 2ch", true)];
+        assert_eq!(
+            pick_usable_sink(&a).map(|s| s.name.clone()),
+            pick_usable_sink(&b).map(|s| s.name.clone())
+        );
     }
 }
