@@ -10,6 +10,13 @@
 #      起播阶段的 CPU 峰值不代表稳态。
 #   3. **判据怎么算**：CPU / 内存按 RSS 与 %CPU 的**采样均值**，不是某一瞬间的截图。
 #
+# **口径边界（别混用）**：这里量的是**全进程**的 CPU% 与 RSS，包含 WebKit helper，
+# 是 G2 判据本身。开发时为了比对两个实现，也可以用 Chrome DevTools Protocol 的
+# `Performance.getMetrics` 量渲染进程的主线程时间（TaskDuration / ScriptDuration），
+# 那个数字更细但**不是同一个口径**，不能拿来判 G2 过没过。
+# 2026-11-07 的电平表改造就是这么比的（见 GUI_IMPLEMENTATION_LOG.md §14.26）：
+# 主线程 ScriptDuration −42%，但 G2 的 CPU/内存仍需用本脚本重测。
+#
 # 用法:
 #   ./scripts/test-gui-perf.sh                  # 60 s 采样
 #   ./scripts/test-gui-perf.sh --seconds 180
@@ -325,8 +332,10 @@ if [[ "$cpu_v" == FAIL || "$mem_v" == FAIL || "$fps_v" == FAIL ]]; then
   if [[ "$cpu_v" == FAIL || "$mem_v" == FAIL ]]; then
     echo "      占用结构见上面的明细：主进程只是小头，大头在 WebKit 的"
     echo "      WebContent（渲染电平表 canvas）与 GPU helper。"
-    echo "      首要可优化点（`GUI_IMPLEMENTATION_LOG.md` §14.10 已指出）：电平表 60 fps 全速渲染，"
-    echo "      无论窗口是否可见都在画。改成「不可见时降到 5 fps、甚至暂停」应能显著下降。"
+    echo "      电平表的每帧成本已于 2026-11-07 优化（静态层/动态层拆成两张 canvas，"
+    echo "      主线程 ScriptDuration -42%，见 GUI_IMPLEMENTATION_LOG.md §14.26）。"
+    echo "      若这项仍超标，说明瓶颈不在每帧绘制：下一步查主进程那 86 MB，"
+    echo "      以及 WebContent 里 canvas 位图之外的部分。"
   fi
   if [[ "$fps_v" == FAIL ]]; then
     echo "      前端帧率 ${fps} < ${FPS_MIN} fps —— 电平表掉帧会影响实时观感。"
