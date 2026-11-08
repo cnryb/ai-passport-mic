@@ -59,6 +59,18 @@ pub const MAX_SLIP: f64 = 0.01;
 /// 宁可报 0 也不要给一个假数字 —— 这个值会被写进验收报告。
 pub const DRIFT_MIN_SAMPLE_SEC: f64 = 10.0;
 
+/// 判定"推入速率是否已稳定"的观察窗口（秒）。
+///
+/// 攒批交付的突发通常几十到几百毫秒，1 秒窗口足够把它摊平；
+/// 又短到不至于让漂移估计晚太久才有读数。
+const DRIFT_ARM_WINDOW_SEC: f64 = 1.0;
+
+/// 窗口内平均推入速率与名义值的允许偏差，超过就认为"突发还没过去"、重新攒窗口。
+///
+/// 取 2%：真实时钟差典型 <0.5%（实测 4200 ppm 已属极端），而开场攒批的伪影
+/// 实测在 2500 ppm 以上、甚至上万 ppm，两者分得很开。
+const DRIFT_ARM_TOLERANCE: f64 = 0.02;
+
 /// 延迟守卫：存量超过"目标 + 这个余量(ms)"时，一次性丢最旧的数据回到
 /// "目标 + `TRIM_BACK_MS`"，保证延迟不会因为回调停摆而永久抬高。
 ///
@@ -259,6 +271,11 @@ pub struct Playout {
     /// 播起来的那一刻记一次，之后不再重置 —— 用长时间窗换准确度。
     /// 见 [`Self::ppm`] 为什么必须用墙钟而不是 `frames_consumed`。
     drift_base: Option<Arrival>,
+    /// 等推入速率稳定后再起算漂移用的中间状态：`(采样起点时刻, 起点已推入帧数)`。
+    ///
+    /// 见 `arm_drift_base()` 的注释：开播瞬间主机攒批交付会让 `frames_pushed`
+    /// 瞬间超前墙钟，从那里起算会把"攒批"读成"设备时钟快"，进而删真实音频。
+    drift_arm: Option<Arrival>,
     /// 秒表。生产环境就是 `Instant::now()` 的封装；测试里可以喂假时间，
     /// 否则"用墙钟估漂移"这个算法在单测里根本跑不出来（循环几毫秒就跑完 60 秒仿真）。
     clock: Clock,
@@ -326,6 +343,7 @@ impl Playout {
             last: 0,
             slip: 0.0,
             drift_base: None,
+            drift_arm: None,
             clock: Clock::new(),
             last_callback: None,
             first_callback: None,
@@ -364,6 +382,64 @@ impl Playout {
     /// 墙钟分母是与消费端完全无关的量：`pushed` 来自 BLE 推送（设备时钟），
     /// `elapsed` 来自系统时钟。两者都不受回调停摆影响，所以停摆期间读数纹丝不动
     /// （仿真验证：每 3 秒停 1/2/5 拍，读数分别 +0 / +0 / +0）。
+    /// 等推入速率稳定后，才记下漂移估计的起算点。
+    ///
+    /// **为什么需要这一步**（2026-11-08 真机 + 仿真定位）：
+    ///
+    /// 主机是攒批交付（CoreBluetooth，相邻块 <5 ms 占 42%）。开播那一刻手上
+    /// 已经攒了一批，它们在头几十毫秒内集中 `push` 进来，`frames_pushed` 于是
+    /// 瞬间超前于墙钟。从那一刻起算，`ppm()` 会把"攒批"读成"设备时钟快"：
+    ///
+    /// ```text
+    /// 仿真（真漂移 0，开场 300 ms 攒批）：ppm = +2501
+    /// 真机（欠载多的那轮，60 s 时）：      ppm = +2484
+    /// ```
+    ///
+    /// 补偿器随即按这个假读数**删样本**去"纠正"——删掉的是真实音频。
+    /// 真机那轮因此删了 9406 个样本、欠载从 20 抬到 96，而收尾仍报"漂移 0 ppm"
+    /// （因为把起点挪到突发之后，读数自然回到 0）。**读数和控制互相污染**，
+    /// 这与 2026-11-06 那次修复的是同一类错误，只是入口换成了"开场突发"。
+    ///
+    /// 判据用"最近这段窗口的推入量接近名义值"而不是固定等待：
+    /// 攒批突发总会过去，而固定时长在慢主机上可能还没过去。
+    fn arm_drift_base(&mut self) {
+        if self.drift_base.is_some() {
+            return;
+        }
+        let now = self.clock.now();
+        let Some(arm) = self.drift_arm else {
+            // 第一次进来：记一个采样起点，下一轮再判。
+            self.drift_arm = Some(Arrival {
+                at: now,
+                pushed: self.stats.frames_pushed,
+            });
+            return;
+        };
+
+        let secs = now.saturating_duration_since(arm.at).as_secs_f64();
+        if secs < DRIFT_ARM_WINDOW_SEC {
+            return;   // 窗口还没够，继续攒样本
+        }
+        let pushed = (self.stats.frames_pushed - arm.pushed) as f64;
+        let ratio = pushed / (self.rate as f64 * secs);
+
+        // 窗口内的平均速率接近 1.0 才算"攒批已过去"。
+        // 容差给 2%：既容忍真实的时钟差（典型 <0.5%），也挡住开场那种 10%+ 的突发。
+        if (ratio - 1.0).abs() <= DRIFT_ARM_TOLERANCE {
+            self.drift_base = Some(Arrival {
+                at: now,
+                pushed: self.stats.frames_pushed,
+            });
+            self.drift_arm = None;
+        } else {
+            // 还不稳（突发还没消化完）：把窗口起点往后挪，重新攒。
+            self.drift_arm = Some(Arrival {
+                at: now,
+                pushed: self.stats.frames_pushed,
+            });
+        }
+    }
+
     pub fn ppm(&self) -> f64 {
         let Some(base) = self.drift_base else {
             return 0.0;
@@ -436,6 +512,7 @@ impl Playout {
         self.slip = 0.0;
         self.stable_frames = 0;
         self.drift_base = None;
+        self.drift_arm = None;
         // 下一次 `push` 之前不该被当成"断供"：清空后 `last_push_at` 是过去时刻，
         // 但此刻会话已经结束，`fill` 不会再被调用。
         self.last_push_at = None;
@@ -484,17 +561,29 @@ impl Playout {
         if !self.playing {
             if self.buf.len() >= self.target_frames {
                 self.playing = true;
-                // 播起来的那一刻记下漂移估计的起算点（墙钟 + 已推入帧数）。
-                self.drift_base = Some(Arrival {
-                    at: self.clock.now(),
-                    pushed: self.stats.frames_pushed,
-                });
+                // 漂移估计的起算点**先不记**，见下（`drift_arm`）。
+                self.drift_arm = None;
             } else {
                 // 预填阶段不出声，但这不算欠载：还没有开始播
                 out.fill(0);
                 return;
             }
         }
+
+        // ---- 漂移估计的起算点：等推入速率稳定后才记 ----
+        //
+        // 为什么不能一开播就记（2026-11-08 真机 + 仿真定位）：
+        // 主机是**攒批交付**（相邻块 <5 ms 占 42%）。开播那一刻手上已经攒了一批，
+        // 它们在头几十毫秒内一起 `push` 进来，于是 `frames_pushed` 瞬间超前于墙钟。
+        // 从这个点起算，`ppm()` 会把"攒批"读成"设备时钟快"：
+        //   · 仿真（真漂移 0、开场 300 ms 攒批）：ppm = **+2501**
+        //   · 真机（欠载多的那轮）：60 s 时 ppm = **+2484**
+        // 补偿器随即按这个假读数**删样本**去"纠正"，删的却是真实音频 ——
+        // 真机那轮删了 9406 个样本、欠载从 20 抬到 96，而收尾报"漂移 0 ppm"。
+        //
+        // 判据用"最近一秒的推入量接近名义值"而不是固定等待：攒批的突发总会过去，
+        // 而固定时长在慢主机上可能还没过去。
+        self.arm_drift_base();
 
         // 延迟守卫：停摆会把存量堆高，靠 ±1% 消化要几十秒，期间延迟一直偏大
         // （仿真里会永久卡在 230 ms）。超过上限就一次性丢最旧的数据，
@@ -664,6 +753,55 @@ mod tests {
             max_fill,
             s.p.ppm(),
         )
+    }
+
+    /// **2026-11-08 复现真机现象：开场 ppm 虚高 → 补偿器删样本 → 欠载计数被抬高。**
+    ///
+    /// 真机数据（同设备同固件，相隔 30 分钟的两次 600 s 长测）：
+    ///   · 欠载少的那轮（20 次）：60 s 时 ppm=+272，全程删 233 样本
+    ///   · 欠载多的那轮（96 次）：60 s 时 ppm=**+2484**，全程删 **9406** 样本
+    /// 两轮收尾都报 `漂移: 0 ppm`，链接指标（RTT 59 ms、clumped 42%）几乎相同。
+    ///
+    /// 差别只在**开场那一分钟的 ppm 估计**。这条测试问的是：
+    /// 当生产端在开头有一次性突发（预填期攒的块集中到达）时，
+    /// `ppm()` 会不会把这段突发误读成"设备时钟快"，从而用删样本的方式纠正？
+    #[test]
+    fn opening_burst_must_not_be_read_as_clock_drift() {
+        // 参数取自真机量级：真机欠载多的那轮开场 ppm=+2484、全程删 9406 样本。
+        // 这里用"预填期攒了 300 ms 的音频、在 50 ms 内集中到达"模拟攒批交付
+        // （macOS CoreBluetooth 的 clumped 交付，相邻块 <5 ms 占 42%）。
+        let mut p = Playout::new(RATE, 80);
+        let mut out = vec![0i16; 160];
+        let step = 160usize;                            // 每 10 ms 一拍
+        let burst_frames = RATE as usize * 300 / 1000;  // 300 ms 的音频
+        let burst_per_tick = burst_frames / 5;
+
+        // **每个回调都采样一次 ppm**，取峰值。
+        // 只看收尾值是不够的：真机的伤害发生在**运行中**——补偿器按虚高的 ppm
+        // 删样本，等 60 秒后 ppm 被平均回去，删掉的音频却回不来了。
+        // 第一版测试只断言收尾 ppm，变异（把"等稳定"改成"立刻起算"）仍然 PASS，
+        // 等于没守住这个修复。
+        let mut peak_ppm: f64 = 0.0;
+        for tick in 0..6000 {
+            let push_n = if tick < 5 { burst_per_tick } else { step };
+            p.push(&vec![100i16; push_n]);
+            p.clock.advance(std::time::Duration::from_millis(10));
+            p.fill(&mut out);
+            peak_ppm = peak_ppm.max(p.ppm().abs());
+        }
+
+        let skipped = p.stats().frames_skipped;
+        // 真漂移 0：运行期任何时刻都不该读到几千 ppm 的时钟差。
+        assert!(
+            peak_ppm < 500.0,
+            "开场突发被读成时钟差了：运行期峰值 ppm={peak_ppm:+.0}（真值 0）"
+        );
+        // 更关键：不能因此删掉成批的样本。删样本 = 丢音频 = 抬欠载计数。
+        let skipped_ms = skipped as f64 / RATE as f64 * 1000.0;
+        assert!(
+            skipped_ms < 5.0,
+            "开场突发导致删了 {skipped_ms:.1} ms 音频（真漂移 0，不该删）"
+        );
     }
 
     /// 生产与消费同速率：不应该有任何插删，也不应该欠载。
