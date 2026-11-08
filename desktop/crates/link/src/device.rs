@@ -46,6 +46,20 @@ pub struct DeviceInfo {
     pub connected: bool,
 }
 
+/// 事件（按键 / PONG 之外的那一类）通知，带**真到达时刻**。
+///
+/// 为什么需要时间戳：`ARCHITECTURE.md` 的延迟预算里有一条
+/// 「OK 按下到首块音频 p95 ≤ 250 ms」，而测它必须让**按下事件**与**首块音频**
+/// 落在同一个时钟上。两者都在 `next_notification()` 里同源打点，才谈得上比较；
+/// 若在调用方各取一次 `Instant::now()`，排队与处理时间就会混进去
+/// （这正是 KI-006 在音频侧踩过的坑，见 `AudioBlock` 的注释）。
+#[derive(Debug, Clone)]
+pub struct EventAt {
+    pub event: Event,
+    /// 通知真正到达 PC 的时刻（btleplug 交出即打点）。
+    pub received_at: Instant,
+}
+
 /// 一条音频通知，带**真到达时刻**与**等待时长**。
 ///
 /// `received_at` 是 btleplug 把这条通知交出来的那一刻，在 `next_notification` 里
@@ -77,7 +91,7 @@ pub struct AudioBlock {
 pub enum Notification {
     Audio(AudioBlock),
     Status(Status),
-    Event(Event),
+    Event(EventAt),
     /// PONG 回显的 seq。PONG 与 EVENT 共用特征值，靠 `frame.msg` 区分。
     Pong(u32),
     /// 标准 Battery Service（0x2A19）的电量百分比。旧固件没有该服务时不出现。
@@ -482,6 +496,7 @@ impl Link {
             self.status.uuid,
             self.event.uuid,
             self.battery.as_ref().map(|c| c.uuid),
+            received_at,
         );
         Ok(parsed)
     }
@@ -537,6 +552,7 @@ fn classify_frame_notification(
     status_uuid: Uuid,
     event_uuid: Uuid,
     battery_uuid: Option<Uuid>,
+    received_at: Instant,
 ) -> Option<Notification> {
     let malformed = |reason: String| {
         Some(Notification::Malformed {
@@ -570,7 +586,7 @@ fn classify_frame_notification(
         };
         return match f.msg {
             msg::EVENT => match Event::decode(f.payload) {
-                Some(event) => Some(Notification::Event(event)),
+                Some(event) => Some(Notification::Event(EventAt { event, received_at })),
                 None => malformed(format!("EVENT 载荷 {} 字节，不足 3", f.payload.len())),
             },
             msg::PONG => match pong_seq(f.payload) {
@@ -680,7 +696,14 @@ mod tests {
         let event = Uuid::parse_str(EVENT_UUID).unwrap();
         let battery = Uuid::parse_str(BATTERY_LEVEL_UUID).unwrap();
         let parse = |uuid: Uuid, value: &[u8]| {
-            classify_frame_notification(&uuid, value, status, event, Some(battery))
+            classify_frame_notification(
+                &uuid,
+                value,
+                status,
+                event,
+                Some(battery),
+                Instant::now(),
+            )
         };
 
         // ① CRC 错的 STATUS：改一个字节即可（帧层会报 CRC）。

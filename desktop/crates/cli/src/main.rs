@@ -94,6 +94,20 @@ enum Command {
         #[arg(long)]
         device: Option<String>,
     },
+    /// 测「OK 按下 → 首块音频」延迟（需人工按设备上的 OK 键）
+    PttLatency {
+        /// 需要的样本数（每按一次 OK 计一条）
+        #[arg(long, default_value_t = 20)]
+        count: usize,
+        /// 整体超时（秒）
+        #[arg(long, default_value_t = 120)]
+        timeout: u64,
+        /// 打印每条 press / 音频块的原始信息与跳过原因（排查误配用）
+        #[arg(long)]
+        diagnose: bool,
+        #[arg(long)]
+        device: Option<String>,
+    },
     /// 分析 WAV 的音质客观指标
     Analyze {
         /// 输入 WAV（PCM 16-bit）
@@ -180,6 +194,9 @@ fn main() -> anyhow::Result<()> {
                     }
                     Command::Ping { device, count, interval_ms, timeout_ms, json } => {
                         cmd::ping(device.as_deref(), count, interval_ms, timeout_ms, json).await
+                    }
+                    Command::PttLatency { count, timeout, diagnose, device } => {
+                        cmd::ptt_latency(device.as_deref(), count, timeout, diagnose).await
                     }
                     Command::Sink { to, seconds, target_ms, verify, tone, rtt, device } => {
                         cmd::sink(

@@ -12,7 +12,7 @@ use apm_protocol::frame;
 use apm_protocol::AUDIO_SAMPLE_RATE;
 use serde_json::{json, Value};
 use std::path::{Path, PathBuf};
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 fn session_id(prefix: &str) -> String {
     let ms = SystemTime::now()
@@ -443,7 +443,8 @@ pub async fn status(device: Option<&str>, timeout_s: u64) -> Result<()> {
                     s.sent
                 );
             }
-            Ok(Some(Notification::Event(ev))) => {
+            Ok(Some(Notification::Event(ev_at))) => {
+                let ev = ev_at.event;
                 println!(
                     "按键: {}.{}（flags=0x{:02X}）",
                     ev.button_name(),
@@ -477,6 +478,228 @@ pub async fn status(device: Option<&str>, timeout_s: u64) -> Result<()> {
     Ok(())
 }
 
+/// 测「OK 按下 → 首块音频」延迟。
+///
+/// **设计教训（2026-11-07 真机）**：早先的版本在一个长驻循环里连续收多条样本，
+/// 结果 70% 的配对是错的 —— 因为「哪一块是本次按下的首块」在 PC 端**无法可靠判定**：
+///   - `seq` 是设备全局递增的（跨会话不清零，这是协议约定，PC 端靠它判丢块），
+///     所以 seq==某个值不代表"本会话首块"；
+///   - STATUS 1 s 才一条，靠它判断"设备已静止"会有秒级空窗，快速连按必然错位；
+///   - 音频块是**成批交付**的（KI-006），"距上条 0 ms"很正常，不能当异常信号。
+///
+/// 所以现在改成**一次只测一条**：强制 STOP → 等设备确认静止 → 等你按一次 → 记一条 → 退出。
+/// 多次运行即可积累样本（`--repeat` 会在每次之间重新做一遍 STOP + 静置）。
+///
+/// 计时口径：两端通知都在 `next_notification()` 里同源打点（`received_at`），
+/// 不在调用方各取一次 `Instant::now()` —— 否则消费循环的排队时间会混进结果
+/// （KI-006 在音频侧就是被这个坑骗过一轮）。
+///
+/// 固件已配合改动：进采集时**丢掉手上那一块**，所以首块内容全是按下之后的采样，
+/// 单块理论下限 20 ms（320 样本 @16 kHz）。
+pub async fn ptt_latency(
+    device: Option<&str>,
+    count: usize,
+    timeout_s: u64,
+    diagnose: bool,
+) -> Result<()> {
+    let link = apm_link::connect(device, Duration::from_secs(15))
+        .await
+        .map_err(|e| anyhow!("{e}\n提示: {}", apm_link::device::hint_for_error(&e)))?;
+
+    println!("已连接。需要 {count} 条样本，超时 {timeout_s} 秒。");
+    println!("每次只测一条：我会先让设备停采并静置，然后提示你按一次 OK 键。");
+    println!();
+
+    /// 真机上「按下 → 首块」不可能小于一块的时间（320 样本 @16 kHz = 20 ms）。
+    /// 低于这个下限说明配对到了按下之前就在队列里的块，不能计入统计。
+    const IMPOSSIBLE_MS: f64 = 15.0;
+
+    let mut samples: Vec<f64> = Vec::new();
+    let mut rejected = 0usize;
+    let overall_deadline = tokio::time::Instant::now() + Duration::from_secs(timeout_s);
+
+    for round in 1..=count {
+        if tokio::time::Instant::now() >= overall_deadline {
+            println!("总超时，提前结束（已收 {} 条）", samples.len());
+            break;
+        }
+
+        // 每一轮都重新 STOP + 静置，并**排到真的静默**。
+        //
+        // 2026-11-07 真机定位（诊断数据）：按下之前的块不是设备在发，而是
+        // **PC 端通知队列里积压的**。证据是「首块在 STOP 后 7.542µs 到达」——
+        // 7 微秒内不可能走完 BLE，那是早就躺在本地缓冲里的；而且一次涌进 4 块、
+        // 之后才按 20–25 ms 的节奏稀疏收尾，正是"批量交付 + 队列排空"的形状。
+        // 所以**改固件没用**，必须在这里把队列排空到真的没东西。
+        reset_capture_state(&link).await;
+
+        // 排空判据：连续 QUIET_ROUNDS 次超时都没收到任何通知，才算真的静了。
+        // 只等固定时长不够 —— 积压可能在 300 ms 后才被吐出来。
+        const QUIET_ROUNDS: u32 = 3;
+        const POLL_MS: u64 = 60;
+        const MAX_DRAIN_MS: u64 = 3000;
+        let drain_start = tokio::time::Instant::now();
+        let mut quiet = 0u32;
+        let mut leftover = 0u32;
+        while quiet < QUIET_ROUNDS && drain_start.elapsed().as_millis() < MAX_DRAIN_MS as u128 {
+            match link.next_notification(Duration::from_millis(POLL_MS)).await {
+                Ok(Some(Notification::Audio(_))) => {
+                    leftover += 1;
+                    quiet = 0; // 还在吐，重新计静默轮次
+                }
+                Ok(Some(_)) => {
+                    // STATUS / 事件不算噪音，但也不该重置静默计数。
+                }
+                Ok(None) => quiet += 1,
+                Err(e) => bail!("排空时通知流出错: {e}"),
+            }
+        }
+        if diagnose {
+            println!(
+                "    [排空] 丢弃积压 {leftover} 块，用时 {}ms，静默 {} 轮",
+                drain_start.elapsed().as_millis(),
+                quiet
+            );
+        }
+        if quiet < QUIET_ROUNDS {
+            bail!(
+                "排空超时（{}ms 内始终有音频块），设备可能真的还在推流。\
+                 测量前提不成立，已停止",
+                MAX_DRAIN_MS
+            );
+        }
+        if leftover > 20 {
+            // 20 块 = 400 ms 的音频。超过这个量说明 STOP 没生效，
+            // 后面的配对一定是错的 —— 直接停下，别产出假数据。
+            bail!(
+                "设备在 STOP 之后仍然持续推流（静置窗口内收到 {leftover} 块）。\
+                 测量前提不成立，已停止。可能是设备停在采集态，请重试或重启设备"
+            );
+        }
+
+        println!("[{round}/{count}] 请按一次 OK 键（开麦）…");
+
+        // 只等这一次按下 + 它的首块。窗口 20 s：留足人手反应时间。
+        let wait_until = tokio::time::Instant::now() + Duration::from_secs(20);
+        let mut pending: Option<Instant> = None;
+        let mut got: Option<f64> = None;
+        // 按下前最后一块的到达时刻。首块必须**明显晚于**它 —— 这是区分
+        // "真正的首块"与"积压块"最可靠的依据（2026-11-07 真机定位）。
+        let mut last_before_press: Option<Instant> = None;
+
+        while got.is_none() && tokio::time::Instant::now() < wait_until {
+            match link.next_notification(Duration::from_millis(200)).await {
+                Ok(Some(Notification::Event(ev_at))) => {
+                    if ev_at.event.event == apm_protocol::frame::msg::EVENT_PRESS
+                        && pending.is_none()
+                    {
+                        pending = Some(ev_at.received_at);
+                        if diagnose {
+                            println!("    [press] 开始计时");
+                        }
+                    }
+                }
+                Ok(Some(Notification::Audio(block))) => {
+                    let Some(p) = pending else {
+                        // 还没按：这是排空遗漏的积压块，只更新"最后一块"时刻。
+                        last_before_press = Some(block.received_at);
+                        if diagnose {
+                            let seq =
+                                apm_protocol::adpcm::block_header(&block.data).map(|(s, _)| s);
+                            println!("    [按下前的块] seq={seq:?}（已忽略）");
+                        }
+                        continue;
+                    };
+                    let ms = block.received_at.saturating_duration_since(p).as_secs_f64() * 1000.0;
+                    let seq = apm_protocol::adpcm::block_header(&block.data).map(|(s, _)| s);
+                    // 双重校验：时间上必须够一块（≥15 ms），且必须晚于按下时刻。
+                    // 只有这两条都过，才认为它真的是"按下之后采到并发出的第一块"。
+                    if ms < IMPOSSIBLE_MS {
+                        if diagnose {
+                            println!(
+                                "    [积压块] seq={seq:?} 在按下后 {ms:.1} ms 到达，\
+                                 说明它早就在队列里（按前最后一块 {:?}）",
+                                last_before_press.map(|t| t.elapsed().as_millis())
+                            );
+                        }
+                        // 继续等真正的那一块：不要把 pending 清掉。
+                        continue;
+                    }
+                    if diagnose {
+                        println!("    [配对] seq={seq:?}");
+                    }
+                    got = Some(ms);
+                }
+                Ok(Some(_)) | Ok(None) => {}
+                Err(e) => {
+                    println!("通知流出错: {e}");
+                    break;
+                }
+            }
+        }
+
+        match got {
+            Some(ms) => {
+                samples.push(ms);
+                println!("     → {ms:.1} ms");
+            }
+            None => {
+                rejected += 1;
+                println!("     → 20 s 内没等到有效首块（跳过这条）");
+            }
+        }
+    }
+
+    link.disconnect().await.ok();
+
+    if samples.is_empty() {
+        bail!(
+            "一条样本都没收到。确认：① 按的是 OK 键（开麦键）；② 按下时设备处于未采集状态；\
+             ③ 设备在广播但没在采集"
+        );
+    }
+
+    let mut sorted = samples.clone();
+    sorted.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+    let median = percentile(&sorted, 50.0);
+    let p95 = percentile(&sorted, 95.0);
+    let max = sorted.last().copied().unwrap_or(0.0);
+    let min = sorted.first().copied().unwrap_or(0.0);
+
+    println!();
+    println!(
+        "样本 {} 条{}",
+        samples.len(),
+        if rejected > 0 {
+            format!("（另有 {rejected} 条被剔除：<{IMPOSSIBLE_MS:.0} ms，配到了按下前的块）")
+        } else {
+            String::new()
+        }
+    );
+    if samples.is_empty() {
+        bail!(
+            "没有有效样本（{rejected} 条都小于 {IMPOSSIBLE_MS:.0} ms）。\
+             确认固件已更新到「进采集时丢掉手上那一块」的版本"
+        );
+    }
+    println!("最小 / 中位 / p95 / 最大 = {min:.1} / {median:.1} / {p95:.1} / {max:.1} ms");
+    if sorted.len() < 20 {
+        println!("⚠ 样本少于 20，p95 接近次大值，只能当量级参考");
+    }
+    if p95 <= 250.0 {
+        println!("判定: PASS（预算 p95 ≤ 250 ms）");
+    } else {
+        println!("判定: FAIL（超出预算 p95 ≤ 250 ms）");
+    }
+    println!();
+    println!("口径: 「OK 按下到达 PC → 首块音频到达 PC」。固件已改成进采集时丢掉手上");
+    println!("      那一块，所以首块内容全是按下之后的采样，不再含 0–20 ms 按下前音频。");
+    println!("      仍不含 codec 采集前的声学延迟与声卡播放，不要当端到端延迟引用（KI-003）。");
+    println!("      单块理论下限 20 ms；实测值 = 该下限 + 编码 + 链路 + 连接间隔等待。");
+
+    Ok(())
+}
+
 /// 读一次电量。连接后主动读（固件只在 SOC 变化时通知，光等通知拿不到初值）。
 pub async fn battery(device: Option<&str>) -> Result<()> {
     let link = apm_link::connect(device, Duration::from_secs(15))
@@ -505,6 +728,24 @@ async fn reset_capture_state(link: &apm_link::Link) {
     // STOP 对没在采集的设备是幂等的，失败也不阻塞。
     link.stop_capture().await.ok();
     tokio::time::sleep(std::time::Duration::from_millis(120)).await;
+}
+
+/// 升序切片的分位数（最近秩法）。`pct` 取 0–100。
+///
+/// 与下面 `sink` 里的写法同源：`ceil(n * pct/100) - 1`，样本少时 p95 会等于次大值，
+/// 这是"最近秩"的固有性质，调用方要自己提醒样本量。
+fn percentile(sorted: &[f64], pct: f64) -> f64 {
+    if sorted.is_empty() {
+        return 0.0;
+    }
+    let n = sorted.len();
+    if (pct - 50.0).abs() < f64::EPSILON && n.is_multiple_of(2) {
+        return (sorted[n / 2 - 1] + sorted[n / 2]) / 2.0;
+    }
+    let idx = ((n as f64 * pct / 100.0).ceil() as usize)
+        .saturating_sub(1)
+        .min(n - 1);
+    sorted[idx]
 }
 
 fn yes_no(v: bool) -> &'static str {

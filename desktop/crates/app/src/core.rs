@@ -1890,7 +1890,8 @@ impl AppCore {
                     );
                 }
             }
-            Notification::Event(event) => {
+            Notification::Event(ev_at) => {
+                let event = ev_at.event;
                 self.record(
                     LogLevel::Info,
                     "button",
