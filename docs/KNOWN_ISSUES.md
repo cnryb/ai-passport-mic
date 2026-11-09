@@ -13,6 +13,7 @@
 | [KI-007](#ki-007电量计读到-soc0--vcell0插着-usb-也不涨) | 电量计读到 `SOC=0xFF`（无效） | 界面显示「电量不可用」而不是百分比；**电池本身是满的（4113 mV）** | **已解决（2026-11-06 17:58 真机）**：根因是 CW2017 的 BATINFO 全 0（没写电池 profile）；已随固件写入官方 UTL 520 mAh profile，SOC 实测 77–79% |
 | [KI-008](#ki-008gui-连接卡在连接中电量特征值回-att-错误把-read-挂住) | GUI 连接卡在「连接中」，设备侧却显示已连接、已订阅 | 界面永远连不上；设备实际被占住，扫码/CLI 也看不到广播 | **已修并真机验证**：设备对电量特征值回 ATT 错误时 macOS 的 btleplug `read()` 不返回；已改成返回 `0xFF` + PC 端 2 s 超时 |
 | [KI-009](#ki-009自动连接时顶栏永远没有电量事件早于监听注册) | 自动连接时顶栏**一个字都没有**（不是「电量不可用」，是空白） | 让人以为电量功能没做；实际是事件丢了 | **已修，2026-11-06 真机复验 PASS（后端口径）**：自动连接 1.47 s，电量与 `ready` 同毫秒落地；顶栏像素未截图，见下 |
+| [KI-010](#ki-010单按修饰键ralt-lalt注入对-cgeventtap-类热键完全无效) | **单按修饰键（`ralt`/`lalt`）注入对"监听 flagsChanged"的热键应用完全无效** | 开麦/关麦的钩子配成"单按右 Option"（OpenLess、各类语音输入/启动器）时，注入看似成功、目标应用一个事件都收不到 | **已修并真机自证（2026-11-08）**：改用 `kCGEventFlagsChanged` 发送；tap 实测 `FlagsChanged=2 / KeyDown=0`。**注意 `capture.start`/`stop` 仍配 `ralt` 时，OpenLess 侧还要求系统麦克风接到设备音频**，见下 |
 
 ---
 
@@ -1674,3 +1675,85 @@ if (s_battery_pct > 100) return BLE_ATT_ERR_UNLIKELY;   // 0xFF 占位 → 回�
   固件版本……）都要能被快照读到；事件只该承载"变化"。
 - 前端注册监听晚于后端动作，是桌面壳里的常见时序，不是偶发竞态。
 - 写验收记录时别把"日志里看到了"写成"界面上看到了"——这次差点又骗过自己。
+
+## KI-010：单按修饰键（`ralt` / `lalt`）注入对 CGEventTap 类热键完全无效
+
+> 状态：**已修并真机自证（2026-11-08 20:28）。** 现场：界面显示「注入可用」，设备已连上，
+> 按 OK 键却什么都没发生。
+
+### 现象
+
+按键映射里 `capture.start` / `capture.stop` 配成 `ralt`（想用它触发 OpenLess 的听写），
+辅助功能权限已给（界面横幅显示「辅助功能权限已就绪，注入可用」），设备也连着。
+按 OK 后**日志明确写着「capture.start 已注入 ralt」**，但 OpenLess 毫无反应——
+既没开始听写，也没有任何提示。
+
+### 根因：事件类型不对，不是权限、不是蓝牙、不是配置
+
+`apm_app::inject` 的 `tap()` 用 `CGEvent::new_keyboard_event` 造事件，
+它固定产生 **`kCGEventKeyDown` / `kCGEventKeyUp`（type 10 / 11）**。
+旧实现给 `lalt` / `ralt` 额外 `set_flags(CGEventFlagAlternate)`，注释里以为这就够了。
+
+但 macOS 上**修饰键的按下/抬起从来不是键盘事件**：WindowServer 把它们作为
+**`kCGEventFlagsChanged`（type 12）** 投递（`NSEvent` 层是 `flagsChanged:`）。
+「单按右 Option」这类热键（OpenLess 的听写、大量语音输入/启动器/输入法切换）
+挂在 flagsChanged 上，**收不到 type 10 的事件**——把 flags 塞进 keyDown 也变不出 type 12。
+
+三条现场证据：
+
+| 证据 | 内容 |
+| --- | --- |
+| OpenLess 配置 | `~/Library/Application Support/OpenLess/preferences.json`：`.hotkey.trigger = rightOption`、`.hotkey.mode = toggle`、`.dictationHotkey.primary = RightOption` |
+| OpenLess 实现 | `strings /Applications/OpenLess.app/Contents/MacOS/openless` 含 `[hotkey] CGEventTap`、`CGEventTapCreate`、`flagsChanged:`、`openless_lib::hotkey::platform` |
+| 我方实现 | `CGEvent::new_keyboard_event` → type 10/11；`CGEventPost` **不返回错误**，所以日志照写「已注入」 |
+
+`CGEventPost` 的成功返回只代表"事件进了系统队列"，**不代表目标应用认得它**。
+这是本条最容易误判的地方：日志是绿的，链路是通的，权限是有的，就是没有效果。
+
+### 为什么之前验收是 PASS
+
+[`GUI_IMPLEMENTATION_LOG.md`](GUI_IMPLEMENTATION_LOG.md) §14.16 验的是 `up→a`、`down→b`，
+**普通字母键**——它们本来就该走 keyDown，写法完全正确。`ralt` 这条路径从没上过真机。
+
+### 修法
+
+修饰键目标（`lalt` / `ralt` / `capslock`，判据是 `own_flag()` 非空）改走
+`tap_modifier()`：造 keyDown/keyUp 后用 `set_type(CGEventType::FlagsChanged)` **改写事件类型**，
+按下带目标修饰键自己的 flag、抬起清空；keycode 保留（接收方靠 58 / 61 区分左右 Option）。
+普通键维持原样。
+
+### 验证（真机自证，不是"看一眼"）
+
+测试 `real_ralt_arrives_as_flags_changed` 装一个 listen-only 的 `CGEventTap`
+（只收 FlagsChanged / KeyDown / KeyUp），调 `tap("ralt")`，断言两者：
+
+```text
+cargo test -p apm-app -- --ignored real_ralt --nocapture
+ralt 注入结果：Ok(())
+收到 FlagsChanged=2，KeyDown/KeyUp=0
+test result: ok. 1 passed
+```
+
+`FlagsChanged=2`（按下+抬起）、`KeyDown/KeyUp=0` —— 既证明新写法生效，
+也钉住"不许退回 keyDown"这条回归。
+
+单测 `modifier_targets_use_flags_changed` 钉住哪些键必须特殊处理、哪些不许。
+
+### 残留：光有热键还不够
+
+OpenLess 的输入是**系统默认麦克风**（`.microphoneDeviceName` 为空 = 跟随系统）。
+本项目的音频进的是 `BlackHole 2ch`（虚拟声卡）。所以"热键触发了"与"录到设备的声音"
+是两件事，需要分别配：
+
+- 只想让 OK 键**触发**听写、继续用物理麦克风 → 本修复即可；
+- 想让 OpenLess 录**设备麦克风** → 还要把系统输入切到 BlackHole（或聚合设备）。
+
+这条没有代码可改，属于使用口径，写在这里防止下次又当成 bug 查。
+
+### 教训
+
+- **"已注入"不等于"已送达"。** 注入类日志必须能区分"调用了 API"和"对方收到了"；
+  能自证的测试（自装 tap 回声）比读日志可靠得多。
+- 验收覆盖面要按**键的种类**检查，而不是"注入功能测过了"。普通键 PASS
+  不能推出修饰键 PASS——它们的系统事件类型根本不同。
+- 依赖第三方应用的行为时，先去读它的配置与二进制字符串，不要猜。

@@ -304,7 +304,8 @@ function doImport() {
           <p class="hint">
             注入是<strong>点按</strong>（按下 + 弹起），不是按住不放。
             键名 <code>ralt</code> / <code>lalt</code> 是单独点按右 / 左 Alt（macOS 上即 Option），
-            适合「单按右 Alt」这类热键。
+            适合「单按右 Alt」这类热键——它按系统的修饰键事件（<code>flagsChanged</code>）发出，
+            所以监听这类热键的软件（语音输入、启动器）能收到。
           </p>
         </div>
       </section>

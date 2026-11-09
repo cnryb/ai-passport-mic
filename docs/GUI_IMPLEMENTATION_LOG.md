@@ -1270,3 +1270,47 @@ green rows(device outline): 266..267
 
 要关掉这一条，下一步就是：接上设备跑
 `./scripts/test-gui-perf.sh --seconds 90`，把 CPU/内存/帧率三项重新报一遍。
+
+### 14.27 修饰键注入改用 flagsChanged：`ralt` 对 OpenLess 终于有效（2026-11-08）
+
+**现场**：按键映射页显示「注入可用」，设备已连上，按 OK 键 OpenLess 毫无反应。
+诊断日志里却是绿的：`capture.start 已注入 ralt`。
+
+**根因**（详见 [`KNOWN_ISSUES.md`](KNOWN_ISSUES.md) KI-010）：`inject::tap()` 用
+`CGEvent::new_keyboard_event` 造的是 `kCGEventKeyDown`（type 10）。而 macOS 上修饰键
+按下/抬起只有 **`kCGEventFlagsChanged`（type 12）** 一种形态。OpenLess 用
+`CGEventTap` 监听 flagsChanged（`preferences.json` 里 `.hotkey.trigger = rightOption`），
+type 10 的事件它根本不看。旧实现把 `CGEventFlagAlternate` 塞进 keyDown，方向错了。
+
+**改动**（`desktop/crates/app/src/inject.rs`）：
+
+| 层 | 改动 |
+| --- | --- |
+| `imp::tap_modifier()`（新） | 造 keyDown/keyUp → `set_type(CGEventType::FlagsChanged)` 改写类型 → 按下带修饰键自己的 flag、抬起清空 → `post` |
+| `imp::tap()` | 修饰键目标（`lalt`/`ralt`/`capslock`，判据 `own_flag()` 非空）走 `tap_modifier`，普通键路径不变 |
+| `imp::is_modifier_target()`（新） | 唯一判据，`pub(crate)` 供测试钉契约 |
+| 模块文档 | 重写"修饰键必须发 complete 事件"那条：说明修饰键走 flagsChanged 的原因 |
+
+**验证（真机自证，不是读日志）**：新增 `real_ralt_arrives_as_flags_changed`，
+装 listen-only 的 `CGEventTap` 只收 FlagsChanged / KeyDown / KeyUp，然后注入 `ralt`：
+
+```text
+cargo test -p apm-app -- --ignored real_ralt --nocapture
+ralt 注入结果：Ok(())
+收到 FlagsChanged=2，KeyDown/KeyUp=0
+test result: ok. 1 passed
+```
+
+`FlagsChanged=2` 证明按下+抬起两笔都以正确类型送达；`KeyDown/KeyUp=0` 钉住"不许退回
+keyDown"这条回归（如果以后有人改回去，这条测试立刻红）。
+
+**门禁**：`cargo test`（workspace）**191 passed / 0 failed / 3 ignored**；
+`cargo test -p apm-app` 94 passed；`cargo clippy -p apm-app --all-targets` 0 警告。
+
+**没验的**：OpenLess 端到端"按 OK → 出现听写浮窗"没做（需要人在场点按设备，
+并在 OpenLess 侧确认）。本轮证明的是**事件以正确类型送达系统事件流**，
+这是原先缺的那一环；剩下的是 OpenLess 自己的热键判定。
+
+**顺带说明一个不是 bug 的使用前提**：OpenLess 用系统默认麦克风，本项目的音频进
+`BlackHole 2ch`。"热键能触发"和"OpenLess 能录到设备的声音"是两件事，后者要把系统
+输入切到 BlackHole（或聚合设备），不在本仓库代码范围内。

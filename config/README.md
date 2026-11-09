@@ -50,6 +50,13 @@
   修饰键，左右语义只在目标键 `lalt` / `ralt` 上体现；
 - 仅 macOS 注入层实现（CGEvent）；Windows 侧 SendInput 未实现时同样报"平台未实现"。
 
+**实现要点（2026-11-08 修，见 [`KNOWN_ISSUES.md`](../docs/KNOWN_ISSUES.md) KI-010）**：
+修饰键目标发的**不是 keyDown/keyUp，而是 `kCGEventFlagsChanged`（type 12）**。
+macOS 上修饰键的按下/抬起本来就只有 flagsChanged 这一种事件形态，"单按右 Option"
+这类热键（OpenLess、语音输入、启动器）挂的都是 `CGEventTap` 的 flagsChanged 回调，
+收不到 type 10——旧写法把 `CGEventFlagAlternate` 塞进 keyDown，日志写「已注入」
+但对方一个事件都收不到。
+
 ## 设备屏幕上显示什么
 
 映射会**同步到设备屏幕上**（`SET_KEY_LABELS`，`0x05`）：PC 连上设备后推一次，

@@ -9,8 +9,15 @@
 //! 两条硬规则（`config/README.md`）：
 //!
 //! 1. **不管成功还是异常，按下过的修饰键必须释放。** 这里用"一次性发 complete 事件"
-//!    的做法：按下 + 弹起成对出现。修饰键作为目标键（`lalt` / `ralt`）时 keyDown
-//!    带上自己的修饰键 flag、keyUp 清掉——不存在"按下去没松开"的状态。
+//!    的做法：按下 + 弹起成对出现，不存在"按下去没松开"的状态。
+//!
+//!    **修饰键作为目标键（`lalt` / `ralt` / `capslock`）时发的不是 keyDown/keyUp，
+//!    而是 `kCGEventFlagsChanged`。** macOS 上修饰键按下的真实事件类型就是
+//!    flagsChanged（type 12），WindowServer 从不把 Option/Command/Shift 发成 keyDown。
+//!    用 `CGEventTap` 监听热键的应用（OpenLess、各类语音输入/启动器）只认 flagsChanged
+//!    回调，收到 keyDown 一律忽略——即使往 keyDown 里塞了 CGEventFlagAlternate 也没用，
+//!    因为事件类型本身就不对。2026-11-08 真机复现：注入 `ralt` 后日志报"已注入"，
+//!    OpenLess 毫无反应。
 //! 2. 注入失败要能被看见。macOS 上最常见的原因是**没给辅助功能权限**，
 //!    系统不会报错，只是把事件丢掉——所以发送前先探一次权限，没权限直接报错并给出指引。
 //!
@@ -62,7 +69,7 @@ pub fn tap(binding: &Binding) -> Result<(), InjectError> {
 #[cfg(target_os = "macos")]
 mod imp {
     use super::*;
-    use core_graphics::event::{CGEvent, CGEventFlags, CGEventTapLocation};
+    use core_graphics::event::{CGEvent, CGEventFlags, CGEventTapLocation, CGEventType};
     use core_graphics::event_source::{CGEventSource, CGEventSourceStateID};
 
     // AXIsProcessTrusted 在 ApplicationServices 里，返回 Boolean（u8）。
@@ -146,17 +153,49 @@ mod imp {
         Some(code)
     }
 
-    /// 修饰键作为目标键时，keyDown 事件必须带上它自己的修饰键 flag。
+    /// 修饰键作为目标键时，按下事件必须带上它自己的修饰键 flag。
     ///
-    /// macOS 上修饰键不是普通按键：应用识别"单按右 Option"靠的是 `flagsChanged`
-    /// 事件里的修饰键标志位。如果 keyDown 只带键码不带 flag，收方看到的是
-    /// "keycode 61 但 flags 没变化"——等于什么都没发生，事件被静默忽略。
-    fn own_flag(key: &str) -> CGEventFlags {
+    /// macOS 上应用识别"单按右 Option"靠的是 `flagsChanged` 事件里的修饰键标志位。
+    pub(crate) fn own_flag(key: &str) -> CGEventFlags {
         match key {
             "lalt" | "ralt" => CGEventFlags::CGEventFlagAlternate,
             "capslock" => CGEventFlags::CGEventFlagAlphaShift,
             _ => CGEventFlags::empty(),
         }
+    }
+
+    /// 这个键名是不是"修饰键本身"——决定发 keyDown 还是 flagsChanged。
+    ///
+    /// 只有这三类在 macOS 上必须走 flagsChanged：Option（左右）、CapsLock。
+    /// 其他键（含方向、功能键）都是普通的 keyDown/keyUp。
+    ///
+    /// `pub(crate)` 只为让同文件的测试能钉住这条契约；对外仍是注入层内部细节。
+    pub(crate) fn is_modifier_target(key: &str) -> bool {
+        !own_flag(key).is_empty()
+    }
+
+    /// 敲一个**修饰键**：发一对 `kCGEventFlagsChanged`（按下带 flag / 抬起清空）。
+    ///
+    /// 为什么不能用 keyDown：macOS 上修饰键的按下/抬起从来不是键盘事件。WindowServer
+    /// 把 Option/Command/Shift 的变化作为 flagsChanged（type 12）投递，`NSEvent` 层是
+    /// `flagsChanged:`，`CGEventTap` 层是 `CGEventType::FlagsChanged`。绝大多数"单按
+    /// 某个修饰键"的热键（语音输入听写、启动器、输入法切换）都挂在这个回调上，
+    /// 收不到 keyDown —— 那正是 2026-11-08 注入 `ralt` 对 OpenLess 无效的原因。
+    ///
+    /// 形态要与真实按键一致：按下时 flags 里**只多出**目标修饰键那一位，抬起时把它去掉。
+    /// 事件里仍然带 keycode，因为接收方要靠它区分左右 Option（58 / 61）。
+    fn tap_modifier(source: &CGEventSource, key: &str, code: u16) -> Result<(), InjectError> {
+        let own = own_flag(key);
+        // 按下 / 抬起两笔：按下的 flags 含 own，抬起的 flags 不含。
+        for down in [true, false] {
+            let ev = CGEvent::new_keyboard_event(source.clone(), code, down)
+                .map_err(|_| InjectError::System("构造修饰键事件失败".into()))?;
+            // 关键一步：把 keyDown/keyUp 改写成 flagsChanged。
+            ev.set_type(CGEventType::FlagsChanged);
+            ev.set_flags(if down { own } else { CGEventFlags::empty() });
+            ev.post(CGEventTapLocation::HID);
+        }
+        Ok(())
     }
 
     pub fn tap(binding: &Binding) -> Result<(), InjectError> {
@@ -171,16 +210,24 @@ mod imp {
         // core-graphics 0.25 这里返回 `Result<_, ()>`，没有错误详情可用。
         let source = CGEventSource::new(CGEventSourceStateID::HIDSystemState)
             .map_err(|_| InjectError::System("创建 CGEventSource 失败".into()))?;
-        let base = flags_of(&binding.modifiers);
-        // keyDown：目标键自身的修饰键 flag 必须在（见 own_flag 的注释）。
-        let down_flags = base | own_flag(&binding.key);
-        // keyUp：修饰键本身弹起，恢复到 binding 修饰键描述的状态。
-        let up_flags = base;
+
+        // 修饰键目标走 flagsChanged，语义与真实按键一致；见 tap_modifier 的注释。
+        if is_modifier_target(&binding.key) {
+            for _ in 0..binding.repeat.clamp(1, 4) {
+                tap_modifier(&source, &binding.key, code)?;
+                std::thread::sleep(std::time::Duration::from_millis(20));
+            }
+            return Ok(());
+        }
+
+        // 普通键：按下与弹起带同一组修饰键 flags（binding 里配的组合键）。
+        // 目标键本身不是修饰键，所以没有"它自己的 flag"要补。
+        let flags = flags_of(&binding.modifiers);
 
         for _ in 0..binding.repeat.clamp(1, 4) {
             let down = CGEvent::new_keyboard_event(source.clone(), code, true)
                 .map_err(|_| InjectError::System("构造 keyDown 事件失败".into()))?;
-            down.set_flags(down_flags);
+            down.set_flags(flags);
             down.post(CGEventTapLocation::HID);
 
             // 真实敲键按下到弹起至少几十毫秒；零间隔连发可能被有事件合并逻辑的
@@ -189,7 +236,7 @@ mod imp {
 
             let up = CGEvent::new_keyboard_event(source.clone(), code, false)
                 .map_err(|_| InjectError::System("构造 keyUp 事件失败".into()))?;
-            up.set_flags(up_flags);
+            up.set_flags(flags);
             up.post(CGEventTapLocation::HID);
         }
         Ok(())
@@ -240,6 +287,33 @@ mod tests {
         assert_eq!(imp::keycode_for("ralt"), Some(61)); // kVK_RightOption
     }
 
+    /// 修饰键目标必须走 flagsChanged，而不是 keyDown/keyUp。
+    ///
+    /// 这是 2026-11-08 真机踩过的坑：往 OpenLess（听写热键 = 单按右 Option，
+    /// 用 CGEventTap 监听 `CGEventType::FlagsChanged`）注入 `ralt` 时，旧的 keyDown
+    /// 写法日志照样写「已注入」，但对方一个事件都收不到——事件类型不对，
+    /// 塞 flags 也救不回来。这条测试把"哪些键必须特殊处理"钉死。
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn modifier_targets_use_flags_changed() {
+        for key in ["lalt", "ralt", "capslock"] {
+            assert!(imp::is_modifier_target(key), "{key} 是修饰键，必须走 flagsChanged");
+        }
+        // 普通键（含方向键与功能键）必须是 false，否则会被错发成 flagsChanged，
+        // 前台应用就再也收不到 enter / a / f5 这些真实按键了。
+        for key in ["a", "enter", "esc", "f5", "up", "down", "space", "tab"] {
+            assert!(!imp::is_modifier_target(key), "{key} 不是修饰键，不该走 flagsChanged");
+        }
+        // own_flag 与 is_modifier_target 必须一致：有 flag 的才走特殊路径。
+        for key in ["lalt", "ralt", "capslock", "a", "enter", "f1"] {
+            assert_eq!(
+                imp::is_modifier_target(key),
+                !imp::own_flag(key).is_empty(),
+                "{key} 的判定与 own_flag 不一致"
+            );
+        }
+    }
+
     /// 真机验收用：向前台应用真的发一次右 Alt 点按。默认 `#[ignore]`，手动跑：
     ///
     /// ```text
@@ -254,6 +328,78 @@ mod tests {
         let result = tap(&binding("ralt", vec![], 1));
         println!("real ralt tap: {result:?}");
         assert!(result.is_ok(), "注入失败：{result:?}");
+    }
+
+    /// 真机自证：注入的 `ralt` 确实是以 **flagsChanged** 形式出现在事件流里。
+    ///
+    /// 这条测试直接回答"OpenLess 为什么收不到"：它装一个 listen-only 的 CGEventTap，
+    /// 只看 FlagsChanged / KeyDown / KeyUp 三种，然后调 `tap("ralt")`，断言
+    /// ① 收到了 FlagsChanged；② **没有**收到 keyDown/keyUp（否则说明我们又退回了旧写法，
+    /// 或者普通键被误发成了修饰键）。
+    ///
+    /// ```text
+    /// cargo test -p apm-app -- --ignored real_ralt --nocapture
+    /// ```
+    ///
+    /// 需要宿主有辅助功能权限，并且会真的往前台应用发一次右 Option。
+    #[cfg(target_os = "macos")]
+    #[test]
+    #[ignore = "真机验收：装事件 tap 并真发按键，需要宿主有辅助功能权限"]
+    fn real_ralt_arrives_as_flags_changed() {
+        use core_foundation::runloop::CFRunLoop;
+        use core_graphics::event::{
+            CGEventTap, CGEventTapLocation, CGEventTapOptions, CGEventTapPlacement, CGEventType,
+            CallbackResult,
+        };
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use std::sync::Arc;
+
+        let flags_changed = Arc::new(AtomicUsize::new(0));
+        let key_events = Arc::new(AtomicUsize::new(0));
+        let (fc, ke) = (flags_changed.clone(), key_events.clone());
+
+        CGEventTap::with_enabled(
+            CGEventTapLocation::Session,
+            CGEventTapPlacement::HeadInsertEventTap,
+            CGEventTapOptions::ListenOnly,
+            vec![CGEventType::FlagsChanged, CGEventType::KeyDown, CGEventType::KeyUp],
+            move |_proxy, etype, _event| {
+                match etype {
+                    CGEventType::FlagsChanged => fc.fetch_add(1, Ordering::Relaxed),
+                    CGEventType::KeyDown | CGEventType::KeyUp => {
+                        ke.fetch_add(1, Ordering::Relaxed)
+                    }
+                    _ => 0,
+                };
+                CallbackResult::Keep
+            },
+            || {
+                // tap 只在本线程 runloop 里投递，所以注入与排水都在同一个 runloop 上做。
+                let result = tap(&binding("ralt", vec![], 1));
+                println!("ralt 注入结果：{result:?}");
+                let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+                while std::time::Instant::now() < deadline {
+                    // 注意：`run_in_mode` 要的是**具体 mode 名**（string），
+                    // 不能传 `kCFRunLoopCommonModes` 那个集合——传错会直接报
+                    // "invalid mode" 并立刻返回，事件一条都排不出来。
+                    CFRunLoop::run_in_mode(
+                        unsafe { core_foundation::runloop::kCFRunLoopDefaultMode },
+                        std::time::Duration::from_millis(20),
+                        false,
+                    );
+                    if flags_changed.load(Ordering::Relaxed) >= 2 {
+                        break; // 按下 + 抬起，够了
+                    }
+                }
+            },
+        )
+        .expect("装不上事件 tap：宿主缺辅助功能权限，或 listen-only tap 被系统拒绝");
+
+        let f = flags_changed.load(Ordering::Relaxed);
+        let k = key_events.load(Ordering::Relaxed);
+        println!("收到 FlagsChanged={f}，KeyDown/KeyUp={k}");
+        assert!(f >= 2, "ralt 必须产生至少 2 个 flagsChanged（按下+抬起），实际 {f}");
+        assert_eq!(k, 0, "ralt 不该产生任何 keyDown/keyUp，实际 {k}");
     }
 
     #[test]
