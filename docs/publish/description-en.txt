@@ -3,9 +3,12 @@ device is your mic: tap OK to start talking, tap again to stop, and your voice g
 your meeting app's microphone input. No headset cable, no leaning into the laptop. UP and DOWN
 can be remapped to any shortcut — raise a hand, switch slides, mute.
 
-Requires a Mac and a small companion desktop app (one right-click Open the first time).
+Two steps: install the free companion desktop app for Mac first (download it here:
+https://github.com/cnryb/ai-passport-mic/releases/latest ), then write this play onto the device.
+Full walkthrough is in "How to use" below.
 
+Note: this play needs a computer — the firmware alone produces no audio. macOS only for now.
 The device screen shows battery, connection state and what each button does; it dims after
-30 seconds of inactivity to save power.
+30 seconds of inactivity.
 
 Good for remote meetings, online classes, quick podcast takes and livestream audio.

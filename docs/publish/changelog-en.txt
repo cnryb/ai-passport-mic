@@ -1,10 +1,9 @@
-First release: turn AI Passport into a pocket wireless microphone.
+Instructions now explain where to get the desktop app and how to install it.
 
-- Tap OK to start and stop talking; your voice goes straight into your meeting app's mic input
-- The device screen shows battery, connection state and what each of the three buttons does;
-  hold UP/DOWN to turn the screen on or off
-- UP and DOWN can be mapped to any shortcut, so you can raise a hand or switch slides without
-  reaching for the keyboard
-- The companion app can verify your audio driver in one tap: it plays a test tone and reads it
-  back from the input side, and tells you whether the driver is missing or microphone permission
-  was denied
+- Added "Step 1 — Download and install the desktop app" with the full download link,
+  which zip to pick for Apple silicon vs Intel, and both ways to get past the first-launch
+  system warning
+- The description now includes the download link and states plainly that this play needs a
+  computer and that the firmware alone produces no audio
+- Instructions are split into three steps (install the app, write the firmware, connect and
+  verify), and troubleshooting gained an "app will not open / is damaged" entry

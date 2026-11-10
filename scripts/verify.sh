@@ -264,6 +264,31 @@ else
     pub_problems=1
   fi
 
+  # 7) 依赖外部软件的玩法：使用方法里必须有**完整可点的下载 URL**，
+  #    并且要说清"只装固件不出声"。
+  #
+  #    2026-11-10 的真实事故：第一版写的是"软件里点「怎么做」会打开下载页"——
+  #    用户得先有软件才能看到指引，是个死循环，上线一天后才发现。这条检查就是为了
+  #    让同类洞在 verify 阶段就红，而不是等用户下载完发现用不了。
+  if [[ -f "$pub_dir/instructions-zh.txt" ]]; then
+    if ! grep -Eq 'https://[^[:space:]]+/releases' "$pub_dir/instructions-zh.txt"; then
+      echo "FAIL 使用方法（中文）里没有软件下载 URL"
+      echo "     本玩法依赖桌面端软件，用户必须先能拿到它。完整 URL 要写在正文里"
+      echo "     （平台会把 https:// 自动转成可点链接），不能写成\"软件里点某按钮\"。"
+      pub_problems=1
+    fi
+    if ! grep -q '只装固件不出声\|只负责采集' "$pub_dir/instructions-zh.txt"; then
+      echo "WARN 使用方法没有明确说明"固件本身不出声"（用户会以为装完就能用）"
+    fi
+    # 架构要分开给：只说"下最新版"用户不知道自己是 Intel 还是 Apple 芯片。
+    for kw in arm64 x86_64; do
+      grep -q "$kw" "$pub_dir/instructions-zh.txt" || {
+        echo "FAIL 使用方法没提 $kw 安装包（Apple 芯片与 Intel 是两个包，必须分开说）"
+        pub_problems=1
+      }
+    done
+  fi
+
   if (( pub_problems == 0 )); then
     echo "OK   文案与封面满足平台硬规则（长度 / 禁用词 / 纯文本 / 3:4）"
   fi

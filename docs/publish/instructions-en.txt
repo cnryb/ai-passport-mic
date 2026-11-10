@@ -2,27 +2,43 @@ AI Passport Mic · Pocket Wireless Microphone
 Turn AI Passport into a pocket wireless microphone. In meetings, recordings or livestreams,
 the device itself is your mic — no headset cable, no leaning into the laptop.
 
-Before you start
-1. A Mac (macOS 11 or later; Intel and Apple silicon both work).
-2. One free virtual audio driver, which is what lets meeting apps pick the device up as a
-   microphone. Tap "How" in the app and it opens the download page: install the 2ch version,
-   then tap "Rescan".
-3. A USB-C cable that carries data (charge-only cables will not work).
+Step 1 — Download and install the desktop app (do this first)
+The firmware only captures and transmits audio. Getting that audio into your meeting app is
+done by a companion desktop app. Without it the play will not work.
 
-First run
+1. Open this download page on your Mac (macOS only; Intel and Apple silicon both work):
+   https://github.com/cnryb/ai-passport-mic/releases/latest
+2. Under Assets, pick the zip that matches your Mac:
+   - Apple silicon (M1/M2/M3/M4): AI-Passport-Mic-0.1.0-macos-arm64.zip
+   - Intel: AI-Passport-Mic-0.1.0-macos-x86_64.zip
+   Not sure which one? Apple menu → About This Mac, look at the "Chip" line.
+3. Unzip it and drag AI Passport Mic into your Applications folder.
+4. The first launch is blocked with "Apple cannot check it for malicious software". That is
+   expected: the app is not signed with a paid Apple Developer certificate. Either:
+   - Right-click the icon, choose Open, then click Open again. After that a double-click works.
+   - Or open Terminal and run:
+     xattr -dr com.apple.quarantine "/Applications/AI Passport Mic.app"
+5. The app also needs one free virtual audio driver (BlackHole), which is what lets meeting
+   apps pick the device up as a microphone. The app checks for it: when it is missing, the Live
+   tab shows "One more step: install a virtual audio driver". Tap "How" and it opens the
+   download page — install the 2ch version.
+
+Step 2 — Put the play on the device
 1. Hold the power button on the left edge for about half a second. The screen lights up.
-2. Connect the device to your Mac with the USB-C cable and open AI Passport Mic.
-   - The first launch may say Apple cannot check the app for malicious software. Right-click
-     the icon, choose Open, then Open again. After that a normal double-click works.
-3. Open the "Device flashing" tab. The device shows up as a serial port once it is plugged in;
-   tap "Check version" first, then "Write firmware". It takes about five seconds — do not
-   unplug during the write. The device restarts and starts advertising.
-4. Open the "Live" tab, tap "Scan for devices", pick AI Passport Mic and tap "Connect".
-5. Approve the Bluetooth prompt the first time. That is a system prompt; the app cannot do it
+2. Connect the device to your Mac with a USB-C cable that carries data, then open the app.
+3. Open the "Device flashing" tab. The device shows up as a serial port; tap "Check version",
+   then "Write firmware". It takes about five seconds — do not unplug during the write. The
+   device restarts and starts advertising.
+   No serial port listed? The cable or port is the usual cause: try a data cable and plug
+   directly into the Mac (no hub or dongle).
+
+Step 3 — Connect and confirm it works
+1. Open the "Live" tab, tap "Scan for devices", pick AI Passport Mic and tap "Connect".
+2. Approve the Bluetooth prompt the first time. That is a system prompt; the app cannot do it
    for you.
-6. Choose your audio driver in the bottom bar and tap "Verify audio driver". It plays a short
-   test tone into the driver and reads it back from the input side. PASS means the path works.
-7. In your meeting app (Zoom, Teams, Meet…), set the microphone to that virtual driver's
+3. Choose your audio driver in the bottom bar and tap "Verify audio driver". It plays a short
+   test tone and reads it back from the input side. PASS means the path works.
+4. In your meeting app (Zoom, Teams, Meet…), set the microphone to that virtual driver's
    input. Picking the output instead of the input is the single most common mistake here.
 
 Everyday use
@@ -35,15 +51,17 @@ Everyday use
 - Below 20% battery, pressing a button flashes the backlight three times.
 
 Troubleshooting
+- The app will not open, or says it is damaged / cannot be verified: use one of the two fixes
+  in Step 1 item 4. If it still fails, check that you are on macOS 11 or later.
 - Nobody hears you: tap "Verify audio driver" first. "Loopback almost silent" means the driver
   is missing or not passing audio through. "No samples read" means microphone permission was
   denied — open System Settings → Privacy & Security → Microphone and enable the app.
 - Device not found: make sure it is powered on (hold the power button for half a second;
   plugging in the cable alone does not boot it) and that the WeChat mini program on your phone
   is not holding the connection.
-- To go back to the factory play: scan the QR code on the back of the device, open the
-  device page in Chrome on your computer, and follow "Restore default firmware". This works
-  after installing any play.
+- To go back to the factory play: scan the QR code on the back of the device, open the device
+  page in Chrome on your computer, and follow "Restore default firmware". This works after
+  installing any play.
 
 Notes
 This play needs the companion desktop app; the firmware only captures and transmits.
